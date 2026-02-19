@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────
-# OrionTranslator — Windows 构建脚本 (交叉编译 / 原生均可)
-# 构建 Release 二进制，打包为 zip (主程序 + ner_model)
+# OrionTranslator — Windows 构建脚本 (原生 Windows 环境)
+# 构建 Release 二进制，打包为两个 zip：
+#   *-Full.zip   : 主程序 + ner_model (首次安装)
+#   *-Update.zip : 仅主程序 (覆盖更新)
 # 用法: ./scripts/build_windows.sh
 # ─────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -56,29 +58,32 @@ if [ ! -f "${BINARY_SRC}" ]; then
     exit 1
 fi
 
-# ── 组装打包目录 ──────────────────────────────────────────────
-echo "📦 组装打包目录…"
-STAGE_DIR="${BUILD_DIR}/${APP_NAME}"
-mkdir -p "${STAGE_DIR}"
+# ── 组装并打包 ────────────────────────────────────────────────
+echo "📦 打包完整版 (含 NER 模型)…"
+BASE_NAME="${ZIP_NAME}"
 
-# 拷贝二进制
-cp "${BINARY_SRC}" "${STAGE_DIR}/${BINARY_NAME}${EXE_SUFFIX}"
-
-# 拷贝 NER 模型
+# ── 完整版 (含 NER 模型) ──────────────────────────────────────
+FULL_STAGE="${BUILD_DIR}/full/${APP_NAME}"
+mkdir -p "${FULL_STAGE}"
+cp "${BINARY_SRC}" "${FULL_STAGE}/${BINARY_NAME}${EXE_SUFFIX}"
 if [ -d "${NER_MODEL_SRC}" ]; then
     echo "📂 拷贝 NER 模型…"
-    cp -R "${NER_MODEL_SRC}" "${STAGE_DIR}/ner_model"
+    cp -R "${NER_MODEL_SRC}" "${FULL_STAGE}/ner_model"
 else
-    echo "⚠️  警告: 找不到 NER 模型目录 ${NER_MODEL_SRC}，跳过"
+    echo "⚠️  警告: 找不到 NER 模型目录 ${NER_MODEL_SRC}"
 fi
+FULL_ZIP="${DIST_DIR}/${BASE_NAME}-Full.zip"
+(cd "${BUILD_DIR}/full" && zip -r -9 "${FULL_ZIP}" "${APP_NAME}/")
+echo "✅ 完整版: ${FULL_ZIP} ($(du -h "${FULL_ZIP}" | cut -f1))"
 
-# ── 创建 ZIP ──────────────────────────────────────────────────
-echo "📦 创建 ZIP 压缩包…"
-ZIP_PATH="${DIST_DIR}/${ZIP_NAME}.zip"
-rm -f "${ZIP_PATH}"
-
-cd "${BUILD_DIR}"
-zip -r -9 "${ZIP_PATH}" "${APP_NAME}/"
+# ── 更新版 (仅主程序) ─────────────────────────────────────────
+echo "📦 打包更新版 (仅主程序)…"
+LITE_STAGE="${BUILD_DIR}/lite/${APP_NAME}"
+mkdir -p "${LITE_STAGE}"
+cp "${BINARY_SRC}" "${LITE_STAGE}/${BINARY_NAME}${EXE_SUFFIX}"
+LITE_ZIP="${DIST_DIR}/${BASE_NAME}-Update.zip"
+(cd "${BUILD_DIR}/lite" && zip -r -9 "${LITE_ZIP}" "${APP_NAME}/")
+echo "✅ 更新版: ${LITE_ZIP} ($(du -h "${LITE_ZIP}" | cut -f1))"
 
 # ── 清理临时文件 ──────────────────────────────────────────────
 rm -rf "${BUILD_DIR}"
@@ -86,5 +91,5 @@ rm -rf "${BUILD_DIR}"
 # ── 完成 ──────────────────────────────────────────────────────
 echo ""
 echo "✅ 构建完成！"
-echo "   ZIP: ${ZIP_PATH}"
-echo "   大小: $(du -h "${ZIP_PATH}" | cut -f1)"
+echo "   完整版: ${FULL_ZIP}"
+echo "   更新版: ${LITE_ZIP}"

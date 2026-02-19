@@ -1,6 +1,7 @@
 # ─────────────────────────────────────────────────────────────
 # OrionTranslator — CI/CD 构建工作流
-# macOS: .app → .dmg    Windows: .exe + ner_model → .zip
+# macOS Intel (x86_64) / ARM (arm64): .app → .dmg
+# Windows x64: .exe + ner_model → .zip  &  .exe-only → .zip
 # ─────────────────────────────────────────────────────────────
 name: Build & Package
 
@@ -17,35 +18,49 @@ env:
 
 jobs:
   # ════════════════════════════════════════════════════════════
-  # macOS — 构建 .app 并打包 .dmg
+  # macOS — 矩阵构建 (Intel x86_64 / Apple Silicon arm64)
   # ════════════════════════════════════════════════════════════
   build-macos:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-13          # Intel runner
+            rust_target: x86_64-apple-darwin
+            suffix: macOS-x86_64
+          - arch: arm64
+            runner: macos-latest      # Apple Silicon runner (macos-14+)
+            rust_target: aarch64-apple-darwin
+            suffix: macOS-arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust_target }}
 
       - name: Download NER model
         run: |
           mkdir -p alnilam/ner_model
-          NER_FILES="model.safetensors config.json vocab.txt system.dic.zst"
-          for f in $NER_FILES; do
-            echo "⬇️  Downloading ${f}…"
+          for f in model.safetensors config.json vocab.txt system.dic.zst; do
+            echo "Downloading ${f}..."
             curl -fSL \
               "https://huggingface.co/${NER_MODEL_REPO}/resolve/main/${f}" \
               -o "alnilam/ner_model/${f}"
           done
-          echo "✅ NER model files:"
           ls -lh alnilam/ner_model/
 
       - name: Build release binary
-        run: cargo build --release -p alnitak
+        run: cargo build --release -p alnitak --target ${{ matrix.rust_target }}
 
       - name: Package .app & .dmg
         run: |
@@ -53,11 +68,12 @@ jobs:
 
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION:-0.1.0}"
-          DMG_NAME="${APP_NAME}-${VERSION}-macOS"
+          DMG_NAME="${APP_NAME}-${VERSION}-${{ matrix.suffix }}"
+          RUST_TARGET="${{ matrix.rust_target }}"
 
-          BUILD_DIR="dist/.build_macos"
+          BUILD_DIR="dist/.build_${{ matrix.arch }}"
           APP_DIR="${BUILD_DIR}/${APP_NAME}.app"
-          mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+          mkdir -p dist "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
 
           # ── 图标 ──
           ICONSET="${BUILD_DIR}/AppIcon.iconset"
@@ -79,46 +95,30 @@ jobs:
           iconutil -c icns "${ICONSET}" -o "${BUILD_DIR}/AppIcon.icns"
 
           # ── 填充 .app ──
-          cp target/release/${BINARY_NAME} "${APP_DIR}/Contents/MacOS/${BINARY_NAME}"
-          cp "${BUILD_DIR}/AppIcon.icns"   "${APP_DIR}/Contents/Resources/AppIcon.icns"
-          cp -R alnilam/ner_model          "${APP_DIR}/Contents/Resources/ner_model"
+          cp "target/${RUST_TARGET}/release/${BINARY_NAME}" \
+             "${APP_DIR}/Contents/MacOS/${BINARY_NAME}"
+          cp "${BUILD_DIR}/AppIcon.icns" \
+             "${APP_DIR}/Contents/Resources/AppIcon.icns"
+          cp -R alnilam/ner_model \
+             "${APP_DIR}/Contents/Resources/ner_model"
 
-          # ── Info.plist ──
-          cat > "${APP_DIR}/Contents/Info.plist" << EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleName</key>
-              <string>${APP_NAME}</string>
-              <key>CFBundleDisplayName</key>
-              <string>Orion 翻译器</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.orion.translator</string>
-              <key>CFBundleVersion</key>
-              <string>${VERSION}</string>
-              <key>CFBundleShortVersionString</key>
-              <string>${VERSION}</string>
-              <key>CFBundleExecutable</key>
-              <string>${BINARY_NAME}</string>
-              <key>CFBundleIconFile</key>
-              <string>AppIcon</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>CFBundleSignature</key>
-              <string>????</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>13.0</string>
-              <key>NSHighResolutionCapable</key>
-              <true/>
-              <key>CFBundleInfoDictionaryVersion</key>
-              <string>6.0</string>
-              <key>NSSupportsAutomaticGraphicsSwitching</key>
-              <true/>
-          </dict>
-          </plist>
-          EOF
+          # ── Info.plist (PlistBuddy 避免 heredoc 破坏 YAML 理解) ──
+          PB=/usr/libexec/PlistBuddy
+          PFILE="${APP_DIR}/Contents/Info.plist"
+          $PB -c "Clear dict"                                                      "$PFILE"
+          $PB -c "Add :CFBundleName              string ${APP_NAME}"               "$PFILE"
+          $PB -c "Add :CFBundleDisplayName       string Orion 翻译器"            "$PFILE"
+          $PB -c "Add :CFBundleIdentifier        string com.orion.translator"       "$PFILE"
+          $PB -c "Add :CFBundleVersion           string ${VERSION}"                 "$PFILE"
+          $PB -c "Add :CFBundleShortVersionString string ${VERSION}"                "$PFILE"
+          $PB -c "Add :CFBundleExecutable        string ${BINARY_NAME}"             "$PFILE"
+          $PB -c "Add :CFBundleIconFile          string AppIcon"                    "$PFILE"
+          $PB -c "Add :CFBundlePackageType       string APPL"                       "$PFILE"
+          $PB -c "Add :CFBundleSignature         string ????"                       "$PFILE"
+          $PB -c "Add :LSMinimumSystemVersion    string 13.0"                       "$PFILE"
+          $PB -c "Add :NSHighResolutionCapable   bool   true"                       "$PFILE"
+          $PB -c "Add :CFBundleInfoDictionaryVersion string 6.0"                   "$PFILE"
+          $PB -c "Add :NSSupportsAutomaticGraphicsSwitching bool true"              "$PFILE"
 
           # ── 签名 ──
           codesign --force --deep --sign - "${APP_DIR}" || true
@@ -135,14 +135,14 @@ jobs:
             "dist/${DMG_NAME}.dmg"
           rm -rf "${BUILD_DIR}"
 
-      - name: Upload macOS artifact
+      - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_NAME }}-macOS-dmg
+          name: ${{ env.APP_NAME }}-${{ matrix.suffix }}-dmg
           path: dist/*.dmg
 
   # ════════════════════════════════════════════════════════════
-  # Windows — 构建 .exe 并打包 .zip
+  # Windows x64 — 双包：完整版 (含模型) + 轻量版 (不含模型)
   # ════════════════════════════════════════════════════════════
   build-windows:
     runs-on: windows-latest
@@ -152,9 +152,13 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
 
       - name: Download NER model
         shell: pwsh
@@ -162,42 +166,45 @@ jobs:
           New-Item -ItemType Directory -Force -Path alnilam/ner_model | Out-Null
           $files = @("model.safetensors", "config.json", "vocab.txt", "system.dic.zst")
           foreach ($f in $files) {
-            Write-Host "Downloading ${f}..."
-            $url = "https://huggingface.co/${{ env.NER_MODEL_REPO }}/resolve/main/${f}"
-            Invoke-WebRequest -Uri $url -OutFile "alnilam/ner_model/${f}" -MaximumRetryCount 3
+            Write-Host "Downloading $f ..."
+            $url = "https://huggingface.co/${{ env.NER_MODEL_REPO }}/resolve/main/$f"
+            Invoke-WebRequest -Uri $url -OutFile "alnilam/ner_model/$f" -MaximumRetryCount 3
           }
           Get-ChildItem alnilam/ner_model/
 
       - name: Build release binary
-        run: cargo build --release -p alnitak
+        run: cargo build --release -p alnitak --target x86_64-pc-windows-msvc
 
-      - name: Package ZIP
+      - name: Package ZIP (完整版 + 轻量版)
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
-          if (-not $version) { $version = "0.1.0" }
-          $zipName = "${{ env.APP_NAME }}-${version}-Windows-x86_64"
-          $stageDir = "dist/.build_windows/${{ env.APP_NAME }}"
+          if (-not $version -or $version -eq "") { $version = "0.1.0" }
+          $baseName = "${{ env.APP_NAME }}-$version-Windows-x86_64"
+          $exeSrc   = "target/x86_64-pc-windows-msvc/release/${{ env.BINARY_NAME }}.exe"
 
-          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
-          # Copy binary
-          Copy-Item "target/release/${{ env.BINARY_NAME }}.exe" "$stageDir/${{ env.BINARY_NAME }}.exe"
+          # ── 完整版 (含 NER 模型) ──
+          $fullDir = "dist/.stage_full/${{ env.APP_NAME }}"
+          New-Item -ItemType Directory -Force -Path $fullDir | Out-Null
+          Copy-Item $exeSrc "$fullDir/${{ env.BINARY_NAME }}.exe"
+          Copy-Item -Recurse "alnilam/ner_model" "$fullDir/ner_model"
+          Compress-Archive -Path $fullDir -DestinationPath "dist/${baseName}-Full.zip" -Force
+          Remove-Item -Recurse -Force "dist/.stage_full"
+          Write-Host "Created dist/${baseName}-Full.zip"
 
-          # Copy NER model
-          Copy-Item -Recurse "alnilam/ner_model" "$stageDir/ner_model"
+          # ── 轻量版 (不含 NER 模型，用于覆盖更新) ──
+          $liteDir = "dist/.stage_lite/${{ env.APP_NAME }}"
+          New-Item -ItemType Directory -Force -Path $liteDir | Out-Null
+          Copy-Item $exeSrc "$liteDir/${{ env.BINARY_NAME }}.exe"
+          Compress-Archive -Path $liteDir -DestinationPath "dist/${baseName}-Update.zip" -Force
+          Remove-Item -Recurse -Force "dist/.stage_lite"
+          Write-Host "Created dist/${baseName}-Update.zip"
 
-          # Create ZIP
-          Compress-Archive -Path "$stageDir" -DestinationPath "dist/${zipName}.zip" -Force
-
-          # Cleanup
-          Remove-Item -Recurse -Force "dist/.build_windows"
-
-          Write-Host "Created dist/${zipName}.zip"
           Get-ChildItem dist/
 
-      - name: Upload Windows artifact
+      - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-Windows-zip

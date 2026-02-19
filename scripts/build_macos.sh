@@ -78,41 +78,22 @@ else
 fi
 
 # ── 写入 Info.plist ───────────────────────────────────────────
-cat > "${APP_DIR}/Contents/Info.plist" << PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleDisplayName</key>
-    <string>Orion 翻译器</string>
-    <key>CFBundleIdentifier</key>
-    <string>${IDENTIFIER}</string>
-    <key>CFBundleVersion</key>
-    <string>${VERSION}</string>
-    <key>CFBundleShortVersionString</key>
-    <string>${VERSION}</string>
-    <key>CFBundleExecutable</key>
-    <string>${BINARY_NAME}</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleSignature</key>
-    <string>????</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>NSSupportsAutomaticGraphicsSwitching</key>
-    <true/>
-</dict>
-</plist>
-PLIST
+PB=/usr/libexec/PlistBuddy
+PFILE="${APP_DIR}/Contents/Info.plist"
+$PB -c "Clear dict"                                                  "$PFILE"
+$PB -c "Add :CFBundleName              string ${APP_NAME}"           "$PFILE"
+$PB -c "Add :CFBundleDisplayName       string Orion 翻译器"         "$PFILE"
+$PB -c "Add :CFBundleIdentifier        string ${IDENTIFIER}"         "$PFILE"
+$PB -c "Add :CFBundleVersion           string ${VERSION}"             "$PFILE"
+$PB -c "Add :CFBundleShortVersionString string ${VERSION}"            "$PFILE"
+$PB -c "Add :CFBundleExecutable        string ${BINARY_NAME}"         "$PFILE"
+$PB -c "Add :CFBundleIconFile          string AppIcon"                "$PFILE"
+$PB -c "Add :CFBundlePackageType       string APPL"                   "$PFILE"
+$PB -c "Add :CFBundleSignature         string ????"                   "$PFILE"
+$PB -c "Add :LSMinimumSystemVersion    string 13.0"                   "$PFILE"
+$PB -c "Add :NSHighResolutionCapable   bool   true"                   "$PFILE"
+$PB -c "Add :CFBundleInfoDictionaryVersion string 6.0"               "$PFILE"
+$PB -c "Add :NSSupportsAutomaticGraphicsSwitching bool true"          "$PFILE"
 
 # ── ad-hoc 签名 ───────────────────────────────────────────────
 echo "🔏 对 .app 进行 ad-hoc 签名…"
