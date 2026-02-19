@@ -1,0 +1,35 @@
+[package]
+name = "mintaka"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP client
+reqwest = { version = "0.13.2", features = ["json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Load .env
+dotenvy = "0.15"
+
+# EPUB/TXT text extraction
+betelgeuse = { path = "../betelgeuse" }
+
+# Progress bar
+indicatif = "0.18.4"
+
+# Logging
+env_logger = "0.11"
+log = "0.4"

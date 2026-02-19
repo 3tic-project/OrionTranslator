@@ -1,0 +1,42 @@
+# Build output
+target/
+
+*.lock
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# EPUB files (large binary test files)
+*.epub
+
+# gpui / burn vendored sources (large, cloned separately)
+gpui-component/
+burn/
+
+# Local library path (private, not for distribution)
+lib/
+
+# API key config (never commit credentials)
+LLM_endpoint.json
+.env
+*.env
+.env.*
+
+# Test EPUB corpus and output files
+TEST_files/
+
+# NER model weights (large binaries, distribute separately)
+ner_model/
+alnilam/ner_model/
+*.safetensors
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Development utility files
+name-map.txt
+
+# Build distribution output
+dist/

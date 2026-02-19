@@ -1,0 +1,228 @@
+# ─────────────────────────────────────────────────────────────
+# OrionTranslator — CI/CD 构建工作流
+# macOS: .app → .dmg    Windows: .exe + ner_model → .zip
+# ─────────────────────────────────────────────────────────────
+name: Build & Package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  APP_NAME: OrionTranslator
+  BINARY_NAME: alnitak
+  NER_MODEL_REPO: 3tic/Orion-NER-110M-v1
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  # macOS — 构建 .app 并打包 .dmg
+  # ════════════════════════════════════════════════════════════
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download NER model
+        run: |
+          mkdir -p alnilam/ner_model
+          NER_FILES="model.safetensors config.json vocab.txt system.dic.zst"
+          for f in $NER_FILES; do
+            echo "⬇️  Downloading ${f}…"
+            curl -fSL \
+              "https://huggingface.co/${NER_MODEL_REPO}/resolve/main/${f}" \
+              -o "alnilam/ner_model/${f}"
+          done
+          echo "✅ NER model files:"
+          ls -lh alnilam/ner_model/
+
+      - name: Build release binary
+        run: cargo build --release -p alnitak
+
+      - name: Package .app & .dmg
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION:-0.1.0}"
+          DMG_NAME="${APP_NAME}-${VERSION}-macOS"
+
+          BUILD_DIR="dist/.build_macos"
+          APP_DIR="${BUILD_DIR}/${APP_NAME}.app"
+          mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+
+          # ── 图标 ──
+          ICONSET="${BUILD_DIR}/AppIcon.iconset"
+          mkdir -p "${ICONSET}"
+          for sz in 16 32 64 128 256 512 1024; do
+            sips -z $sz $sz assets/logo.png --out "${ICONSET}/tmp_${sz}.png" > /dev/null 2>&1
+          done
+          cp "${ICONSET}/tmp_16.png"   "${ICONSET}/icon_16x16.png"
+          cp "${ICONSET}/tmp_32.png"   "${ICONSET}/icon_16x16@2x.png"
+          cp "${ICONSET}/tmp_32.png"   "${ICONSET}/icon_32x32.png"
+          cp "${ICONSET}/tmp_64.png"   "${ICONSET}/icon_32x32@2x.png"
+          cp "${ICONSET}/tmp_128.png"  "${ICONSET}/icon_128x128.png"
+          cp "${ICONSET}/tmp_256.png"  "${ICONSET}/icon_128x128@2x.png"
+          cp "${ICONSET}/tmp_256.png"  "${ICONSET}/icon_256x256.png"
+          cp "${ICONSET}/tmp_512.png"  "${ICONSET}/icon_256x256@2x.png"
+          cp "${ICONSET}/tmp_512.png"  "${ICONSET}/icon_512x512.png"
+          cp "${ICONSET}/tmp_1024.png" "${ICONSET}/icon_512x512@2x.png"
+          rm -f "${ICONSET}"/tmp_*.png
+          iconutil -c icns "${ICONSET}" -o "${BUILD_DIR}/AppIcon.icns"
+
+          # ── 填充 .app ──
+          cp target/release/${BINARY_NAME} "${APP_DIR}/Contents/MacOS/${BINARY_NAME}"
+          cp "${BUILD_DIR}/AppIcon.icns"   "${APP_DIR}/Contents/Resources/AppIcon.icns"
+          cp -R alnilam/ner_model          "${APP_DIR}/Contents/Resources/ner_model"
+
+          # ── Info.plist ──
+          cat > "${APP_DIR}/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>${APP_NAME}</string>
+              <key>CFBundleDisplayName</key>
+              <string>Orion 翻译器</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.orion.translator</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleExecutable</key>
+              <string>${BINARY_NAME}</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleSignature</key>
+              <string>????</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>13.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>NSSupportsAutomaticGraphicsSwitching</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # ── 签名 ──
+          codesign --force --deep --sign - "${APP_DIR}" || true
+
+          # ── DMG ──
+          DMG_STAGE="${BUILD_DIR}/dmg_stage"
+          mkdir -p "${DMG_STAGE}"
+          cp -R "${APP_DIR}" "${DMG_STAGE}/"
+          ln -s /Applications "${DMG_STAGE}/Applications"
+          hdiutil create \
+            -volname "${APP_NAME}" \
+            -srcfolder "${DMG_STAGE}" \
+            -ov -format UDZO \
+            "dist/${DMG_NAME}.dmg"
+          rm -rf "${BUILD_DIR}"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-macOS-dmg
+          path: dist/*.dmg
+
+  # ════════════════════════════════════════════════════════════
+  # Windows — 构建 .exe 并打包 .zip
+  # ════════════════════════════════════════════════════════════
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download NER model
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path alnilam/ner_model | Out-Null
+          $files = @("model.safetensors", "config.json", "vocab.txt", "system.dic.zst")
+          foreach ($f in $files) {
+            Write-Host "Downloading ${f}..."
+            $url = "https://huggingface.co/${{ env.NER_MODEL_REPO }}/resolve/main/${f}"
+            Invoke-WebRequest -Uri $url -OutFile "alnilam/ner_model/${f}" -MaximumRetryCount 3
+          }
+          Get-ChildItem alnilam/ner_model/
+
+      - name: Build release binary
+        run: cargo build --release -p alnitak
+
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          if (-not $version) { $version = "0.1.0" }
+          $zipName = "${{ env.APP_NAME }}-${version}-Windows-x86_64"
+          $stageDir = "dist/.build_windows/${{ env.APP_NAME }}"
+
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          # Copy binary
+          Copy-Item "target/release/${{ env.BINARY_NAME }}.exe" "$stageDir/${{ env.BINARY_NAME }}.exe"
+
+          # Copy NER model
+          Copy-Item -Recurse "alnilam/ner_model" "$stageDir/ner_model"
+
+          # Create ZIP
+          Compress-Archive -Path "$stageDir" -DestinationPath "dist/${zipName}.zip" -Force
+
+          # Cleanup
+          Remove-Item -Recurse -Force "dist/.build_windows"
+
+          Write-Host "Created dist/${zipName}.zip"
+          Get-ChildItem dist/
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-Windows-zip
+          path: dist/*.zip
+
+  # ════════════════════════════════════════════════════════════
+  # Release — 在 tag 推送时自动创建 GitHub Release
+  # ════════════════════════════════════════════════════════════
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.zip

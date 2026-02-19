@@ -1,0 +1,13 @@
+[package]
+name = "betelgeuse"
+version = "0.1.0"
+edition = "2021"
+description = "Shared EPUB/TXT text extraction library"
+
+[dependencies]
+anyhow = "1.0"
+regex = "1"
+scraper = "0.25"
+zip = { version = "8", default-features = false, features = ["deflate", "bzip2", "zstd", "time", "lzma"] }
+log = "0.4"
+ego-tree = "0.10"

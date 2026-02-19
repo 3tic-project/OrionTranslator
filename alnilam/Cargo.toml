@@ -1,0 +1,70 @@
+[package]
+name = "alnilam"
+version = "0.1.0"
+edition = "2021"
+description = "EPUB/TXT Japanese-to-Chinese translation pipeline"
+build = "build.rs"
+
+[lib]
+name = "alnilam"
+path = "src/lib.rs"
+
+[[bin]]
+name = "alnilam"
+path = "src/main.rs"
+
+[features]
+## Embed the context rules JSON into the binary at compile time (always-on by default).
+## This ensures context-aware translation works without any external files.
+## Override with --no-default-features to produce a smaller binary without rules.
+default = ["embed-rules"]
+embed-rules = []
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# NER + glossary generation
+bellatrix = { path = "../bellatrix" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.13.2", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# EPUB handling
+zip = { version = "8", default-features = false, features = [
+    "deflate",
+    "bzip2",
+    "zstd",
+    "time",
+    "lzma",
+] }
+betelgeuse = { path = "../betelgeuse" }
+
+# HTML/XML parsing
+scraper = "0.25"
+ego-tree = "0.10"
+
+# Regex
+regex = "1"
+fancy-regex = "0.17"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Progress bar
+indicatif = "0.18.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Unicode
+unicode-width = "0.2"

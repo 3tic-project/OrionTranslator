@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "betelgeuse",   # EPUB/TXT text extraction library
+    "rigel",        # NER HTTP API server (standalone deploy)
+    "bellatrix",    # Embedded NER inference library
+    "mintaka",      # NER CLI tool (HTTP client mode)
+    "alnilam",      # Translation pipeline — CLI binary + core library
+    "alnitak",      # Translation GUI (GPUI desktop app)
+]
+resolver = "2"
+
+# ── Shared profiles ──────────────────────────────────────────────
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package]
+gpui = { opt-level = 3 }
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+smol = { opt-level = 3 }
