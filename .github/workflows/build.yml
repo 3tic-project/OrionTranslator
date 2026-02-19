@@ -26,7 +26,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: macos-13          # Intel runner
+            runner: macos-15-intel          # Intel runner
             rust_target: x86_64-apple-darwin
             suffix: macOS-x86_64
           - arch: arm64
