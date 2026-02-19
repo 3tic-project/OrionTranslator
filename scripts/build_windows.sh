@@ -81,7 +81,7 @@ echo "📦 打包完整版 (含 NER 模型)…"
 BASE_NAME="${ZIP_NAME}"
 
 # ── 完整版 (含 NER 模型) ──────────────────────────────────────
-FULL_STAGE="${BUILD_DIR}/full/${APP_NAME}"
+FULL_STAGE="${BUILD_DIR}/full"
 mkdir -p "${FULL_STAGE}"
 cp "${BINARY_SRC}" "${FULL_STAGE}/${BINARY_NAME}${EXE_SUFFIX}"
 if [ -d "${NER_MODEL_SRC}" ]; then
@@ -91,16 +91,16 @@ else
     echo "⚠️  警告: 找不到 NER 模型目录 ${NER_MODEL_SRC}"
 fi
 FULL_ZIP="${DIST_DIR}/${BASE_NAME}-Full.zip"
-(cd "${BUILD_DIR}/full" && zip -r -9 "${FULL_ZIP}" "${APP_NAME}/")
+(cd "${FULL_STAGE}" && zip -r -9 "${FULL_ZIP}" .)
 echo "✅ 完整版: ${FULL_ZIP} ($(du -h "${FULL_ZIP}" | cut -f1))"
 
 # ── 更新版 (仅主程序) ─────────────────────────────────────────
 echo "📦 打包更新版 (仅主程序)…"
-LITE_STAGE="${BUILD_DIR}/lite/${APP_NAME}"
+LITE_STAGE="${BUILD_DIR}/lite"
 mkdir -p "${LITE_STAGE}"
 cp "${BINARY_SRC}" "${LITE_STAGE}/${BINARY_NAME}${EXE_SUFFIX}"
 LITE_ZIP="${DIST_DIR}/${BASE_NAME}-Update.zip"
-(cd "${BUILD_DIR}/lite" && zip -r -9 "${LITE_ZIP}" "${APP_NAME}/")
+(cd "${LITE_STAGE}" && zip -r -9 "${LITE_ZIP}" .)
 echo "✅ 更新版: ${LITE_ZIP} ($(du -h "${LITE_ZIP}" | cut -f1))"
 
 # ── 清理临时文件 ──────────────────────────────────────────────
