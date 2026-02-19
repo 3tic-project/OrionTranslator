@@ -4,10 +4,10 @@
   <img src="assets/logo.png" alt="OrionTranslator" width="180">
 </p>
 
-<p align="center">日译中轻小说翻译工具，集成 NER 人物识别、LLM 翻译、术语表生成、EPUB/TXT 格式处理与桌面 GUI。</p>
+<p align="center">日译中轻小说翻译工具，集成 NER 人物识别、LLM 翻译、术语表生成、EPUB/TXT 格式处理与桌面 GUI，全部使用Rust代码编写。</p>
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="截图" width="860">
+  <video src="assets/demo.mp4" width="860" controls muted></video>
 </p>
 
 ## 快速开始
@@ -59,7 +59,7 @@ cargo build --release -p alnitak
 **4. 加载术语表（可选）**
 
 若已有 `*_glossary.json`，可在「术语表路径」填入文件路径以提升人名一致性。
-若无术语表，可先点击 **生成术语表** 自动识别并翻译人名，完成后路径会自动填入。
+若无术语表，可先点击 **生成术语表** 自动识别并翻译人名，完成后路径会自动填入。（需要GPU支持vulkan/metal）
 
 **5. 开始翻译**
 
@@ -75,6 +75,12 @@ novel_error_report.json           # 错误报告
 ```
 
 > **断点续翻**：中途中止后，下次翻译同一文件时若检测到 `*_translation_data.json`，已完成的段落会自动跳过。
+
+### 关于本地模型
+
+本项目针对轻小说翻译场景开发了精简的专用模型格式，详见 https://huggingface.co/3tic ，现在已经发布了测试模型 https://huggingface.co/3tic/Orion-HYMT1.5-7B-SFT-v2601 和 https://huggingface.co/3tic/Orion-Qwen3-1.7B-SFT-v2601 ，目前是概念验证阶段，欢迎测试反馈，不建议直接使用，后续将训练更完善的版本。
+
+我们也针对上述模型开发了优化的推理引擎 https://github.com/3tic-project/HunyuanMT-Crane ，支持 CPU/Metal/CUDA 多种后端，在单卡4090上最高吞吐量可达2500 tokens/s，一分钟即可翻译完一本书，正在研发测试中，也欢迎参与测试和反馈。
 
 ## 架构
 
