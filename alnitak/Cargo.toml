@@ -20,6 +20,10 @@ tokio = { version = "1", features = ["full"] }
 smol = "2"
 naga = { version = "26.0.0", default-features = false, features = ["termcolor"] }
 
+[target.'cfg(windows)'.build-dependencies]
+# Embeds logo.ico as a Windows PE resource (exe icon + taskbar icon)
+winresource = "0.1"
+
 [lints.clippy]
 dbg_macro = "allow"
 todo = "allow"

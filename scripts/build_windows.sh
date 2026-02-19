@@ -41,6 +41,24 @@ echo "🧹 清理旧构建产物…"
 rm -rf "${BUILD_DIR}"
 mkdir -p "${DIST_DIR}" "${BUILD_DIR}"
 
+# ── 生成 logo.ico (Windows 图标) ─────────────────────────────
+echo "🎨 生成 logo.ico…"
+ICO_PATH="${PROJECT_ROOT}/assets/logo.ico"
+if command -v magick &>/dev/null; then
+    magick "${PROJECT_ROOT}/assets/logo.png" \
+        -define "icon:auto-resize=256,128,64,48,32,16" \
+        "${ICO_PATH}"
+    echo "   生成: ${ICO_PATH}"
+elif command -v convert &>/dev/null; then
+    convert "${PROJECT_ROOT}/assets/logo.png" \
+        -define "icon:auto-resize=256,128,64,48,32,16" \
+        "${ICO_PATH}"
+    echo "   生成: ${ICO_PATH}"
+else
+    echo "⚠️  未找到 ImageMagick (magick/convert)，跳过 .ico 生成"
+    echo "   exe 将使用默认图标。安装 ImageMagick 后重试，或手动放置 assets/logo.ico"
+fi
+
 # ── 编译 Release ──────────────────────────────────────────────
 echo "🔨 编译 Release 二进制 (${BINARY_NAME})…"
 cd "${PROJECT_ROOT}"
