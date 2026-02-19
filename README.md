@@ -6,9 +6,11 @@
 
 <p align="center">日译中轻小说翻译工具，集成 NER 人物识别、LLM 翻译、术语表生成、EPUB/TXT 格式处理与桌面 GUI，全部使用Rust代码编写。</p>
 
-<p align="center">
-  <video src="assets/demo.mp4" width="860" controls muted></video>
+
+<p align="center" width="100%">
+<video src="https://github.com/user-attachments/assets/c0e3d34c-a724-4c28-9aa4-98a389bbe824" width="80%" controls></video>
 </p>
+
 
 ## 快速开始
 
