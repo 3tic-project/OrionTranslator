@@ -8,8 +8,19 @@ use std::sync::OnceLock;
 
 /// Block-level HTML tags that contain translatable text
 const BLOCK_TAGS: &[&str] = &[
-    "p", "h1", "h2", "h3", "h4", "h5", "h6",
-    "li", "blockquote", "div", "caption", "td", "th",
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "li",
+    "blockquote",
+    "div",
+    "caption",
+    "td",
+    "th",
 ];
 
 /// Extract text lines from an EPUB file.
@@ -20,8 +31,7 @@ const BLOCK_TAGS: &[&str] = &[
 pub fn extract_epub_lines(epub_path: &Path) -> Result<Vec<String>> {
     let file = std::fs::File::open(epub_path)
         .with_context(|| format!("EPUB文件不存在: {}", epub_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| "Failed to read EPUB as ZIP")?;
+    let mut archive = zip::ZipArchive::new(file).with_context(|| "Failed to read EPUB as ZIP")?;
 
     // Step 1: Read all files into memory
     let mut raw_items: HashMap<String, Vec<u8>> = HashMap::new();
@@ -29,7 +39,8 @@ pub fn extract_epub_lines(epub_path: &Path) -> Result<Vec<String>> {
         let mut entry = archive.by_index(i).context("Failed to read ZIP entry")?;
         let name = entry.name().to_string();
         let mut content = Vec::new();
-        entry.read_to_end(&mut content)
+        entry
+            .read_to_end(&mut content)
             .with_context(|| format!("Failed to read: {}", name))?;
         raw_items.insert(name, content);
     }
@@ -105,10 +116,7 @@ fn find_opf_path(raw_items: &HashMap<String, Vec<u8>>) -> Result<String> {
 }
 
 /// Parse OPF manifest and spine using regex (handles namespaced XML correctly)
-fn parse_opf(
-    opf_str: &str,
-    opf_dir: &str,
-) -> Result<(HashMap<String, String>, Vec<String>)> {
+fn parse_opf(opf_str: &str, opf_dir: &str) -> Result<(HashMap<String, String>, Vec<String>)> {
     // Manifest: <item id="..." href="..." media-type="..." />
     let item_tag_re = Regex::new(r#"<item\s+([^>]*)/?>"#)?;
     let id_re = Regex::new(r#"id="([^"]*)""#)?;
@@ -119,8 +127,12 @@ fn parse_opf(
 
     for caps in item_tag_re.captures_iter(opf_str) {
         let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let id = id_re.captures(attrs).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-        let href = href_re.captures(attrs).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+        let id = id_re
+            .captures(attrs)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+        let href = href_re
+            .captures(attrs)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
         let media_type = media_type_re
             .captures(attrs)
             .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
@@ -169,7 +181,10 @@ fn resolve_spine_order(
     ordered
 }
 
-fn find_item_content<'a>(raw_items: &'a HashMap<String, Vec<u8>>, name: &str) -> Option<&'a Vec<u8>> {
+fn find_item_content<'a>(
+    raw_items: &'a HashMap<String, Vec<u8>>,
+    name: &str,
+) -> Option<&'a Vec<u8>> {
     // Exact match
     if let Some(content) = raw_items.get(name) {
         return Some(content);
@@ -264,17 +279,15 @@ fn get_clean_text(element: &scraper::ElementRef) -> String {
 
     for edge in element.traverse() {
         match edge {
-            Edge::Open(node) => {
-                match node.value() {
-                    Node::Element(elem) if elem.name() == "rt" => {
-                        rt_depth += 1;
-                    }
-                    Node::Text(t) if rt_depth == 0 => {
-                        text.push_str(t);
-                    }
-                    _ => {}
+            Edge::Open(node) => match node.value() {
+                Node::Element(elem) if elem.name() == "rt" => {
+                    rt_depth += 1;
                 }
-            }
+                Node::Text(t) if rt_depth == 0 => {
+                    text.push_str(t);
+                }
+                _ => {}
+            },
             Edge::Close(node) => {
                 if let Node::Element(elem) = node.value() {
                     if elem.name() == "rt" && rt_depth > 0 {

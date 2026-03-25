@@ -45,10 +45,7 @@ impl TrieMatcher {
         for ch in keyword.chars() {
             node = node.children.entry(ch).or_default();
         }
-        node.outputs.push((
-            category_id.to_string(),
-            weight,
-        ));
+        node.outputs.push((category_id.to_string(), weight));
     }
 
     pub fn find(&self, text: &str) -> Vec<KeywordMatch> {
@@ -103,10 +100,8 @@ impl TrieMatcher {
             }
 
             // Also emit shorter matches that belong to DIFFERENT categories
-            let longest_cat_ids: std::collections::HashSet<&str> = longest_outputs
-                .iter()
-                .map(|(id, _)| id.as_str())
-                .collect();
+            let longest_cat_ids: std::collections::HashSet<&str> =
+                longest_outputs.iter().map(|(id, _)| id.as_str()).collect();
 
             for (end_j, outputs) in &all_outputs[..all_outputs.len() - 1] {
                 for (cat_id, weight) in outputs {

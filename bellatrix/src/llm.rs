@@ -1,5 +1,5 @@
 use crate::detector::{CharacterInfo, Mention};
-use crate::{GlossaryProgressCallback, GlossaryProgressEvent, emit};
+use crate::{emit, GlossaryProgressCallback, GlossaryProgressEvent};
 use anyhow::Result;
 use log::warn;
 use reqwest::Client;
@@ -24,16 +24,55 @@ const MAX_CONTEXT_ITEMS: usize = 10;
 const MAX_CONTEXT_CHARS_PER_ITEM: usize = 220;
 
 const HONORIFIC_SUFFIXES: &[&str] = &[
-    "さん", "ちゃん", "くん", "君", "様", "さま", "殿", "どの", "先輩", "先生", "部長", "会長",
-    "委員長", "店長", "課長", "社長", "監督", "姉", "兄", "妹", "弟", "姉さん", "兄さん",
-    "姉ちゃん", "兄ちゃん",
+    "さん",
+    "ちゃん",
+    "くん",
+    "君",
+    "様",
+    "さま",
+    "殿",
+    "どの",
+    "先輩",
+    "先生",
+    "部長",
+    "会長",
+    "委員長",
+    "店長",
+    "課長",
+    "社長",
+    "監督",
+    "姉",
+    "兄",
+    "妹",
+    "弟",
+    "姉さん",
+    "兄さん",
+    "姉ちゃん",
+    "兄ちゃん",
 ];
 
 const HONORIFIC_PREFIXES: &[&str] = &["お", "ご"];
 
 const PURE_TITLE_CORES: &[&str] = &[
-    "先生", "部長", "先輩", "会長", "委員長", "店長", "課長", "社長", "監督", "校長", "副会長",
-    "副部長", "王様", "お兄様", "お姉様", "お兄さん", "お姉さん", "お兄ちゃん", "お姉ちゃん",
+    "先生",
+    "部長",
+    "先輩",
+    "会長",
+    "委員長",
+    "店長",
+    "課長",
+    "社長",
+    "監督",
+    "校長",
+    "副会長",
+    "副部長",
+    "王様",
+    "お兄様",
+    "お姉様",
+    "お兄さん",
+    "お姉さん",
+    "お兄ちゃん",
+    "お姉ちゃん",
 ];
 
 #[derive(Debug, Serialize)]
@@ -110,7 +149,7 @@ impl LlmClient {
 
         Self {
             client,
-            api_url: api_url.to_string(),
+            api_url: normalize_chat_completions_endpoint(api_url),
             api_key: api_key.to_string(),
             model: model.to_string(),
         }
@@ -147,10 +186,13 @@ impl LlmClient {
                 let _permit = sem.acquire().await.unwrap();
                 let result = translate_cluster(&client, &api_url, &api_key, &model, cluster).await;
                 let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                emit(&progress, GlossaryProgressEvent::LlmProgress {
-                    completed: done,
-                    total,
-                });
+                emit(
+                    &progress,
+                    GlossaryProgressEvent::LlmProgress {
+                        completed: done,
+                        total,
+                    },
+                );
                 result
             });
             handles.push(handle);
@@ -170,7 +212,7 @@ impl LlmClient {
 }
 
 fn parse_json_from_llm(content: &str) -> Result<LlmResult> {
-    let content = content.trim();
+    let content = strip_leading_thinking_content(content);
 
     if let Ok(result) = serde_json::from_str::<LlmResult>(content) {
         return Ok(result);
@@ -184,11 +226,7 @@ fn parse_json_from_llm(content: &str) -> Result<LlmResult> {
             .unwrap_or(content)
             .trim()
     } else if content.contains("```") {
-        content
-            .split("```")
-            .nth(1)
-            .unwrap_or(content)
-            .trim()
+        content.split("```").nth(1).unwrap_or(content).trim()
     } else {
         content
     };
@@ -205,14 +243,60 @@ fn parse_json_from_llm(content: &str) -> Result<LlmResult> {
     anyhow::bail!("Failed to parse LLM response as JSON: {}", content)
 }
 
-fn build_name_clusters(
-    characters: &HashMap<String, CharacterInfo>,
-) -> Vec<NameCluster> {
+fn normalize_chat_completions_endpoint(raw_url: &str) -> String {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if trimmed.ends_with("/chat/completions") {
+        return trimmed.to_string();
+    }
+
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        let path = url.path().trim_matches('/');
+        if path.is_empty() {
+            return format!("{}/v1/chat/completions", trimmed);
+        }
+    }
+
+    format!("{}/chat/completions", trimmed)
+}
+
+fn strip_leading_thinking_content(content: &str) -> &str {
+    let mut remaining = content.trim_start();
+
+    loop {
+        if let Some(rest) = remaining.strip_prefix("<think>") {
+            if let Some(end) = rest.find("</think>") {
+                remaining = rest[end + "</think>".len()..].trim_start();
+                continue;
+            }
+        }
+
+        if let Some(rest) = remaining.strip_prefix("<thinking>") {
+            if let Some(end) = rest.find("</thinking>") {
+                remaining = rest[end + "</thinking>".len()..].trim_start();
+                continue;
+            }
+        }
+
+        break;
+    }
+
+    remaining
+}
+
+fn build_name_clusters(characters: &HashMap<String, CharacterInfo>) -> Vec<NameCluster> {
     let mut grouped: HashMap<String, Vec<AliasInfo>> = HashMap::new();
 
     for (name, info) in characters {
         let key = canonical_key(name);
-        let key = if key.is_empty() { name.trim().to_string() } else { key };
+        let key = if key.is_empty() {
+            name.trim().to_string()
+        } else {
+            key
+        };
 
         let alias = AliasInfo {
             name: name.clone(),
@@ -275,7 +359,12 @@ fn pick_primary_alias(key: &str, aliases: &[AliasInfo]) -> String {
 fn hinted_primary_score(a: &AliasInfo) -> i32 {
     let (m_hint, f_hint) = gender_hint_from_alias_name(&a.name);
     let hint = m_hint.max(f_hint);
-    let max_mention = a.mentions.iter().map(|m| mention_score(m)).max().unwrap_or(0);
+    let max_mention = a
+        .mentions
+        .iter()
+        .map(|m| mention_score(m))
+        .max()
+        .unwrap_or(0);
     hint * 100 + max_mention + (a.count.min(999) as i32)
 }
 
@@ -286,7 +375,12 @@ fn alias_primary_score(a: &AliasInfo) -> i32 {
     let (m_hint, f_hint) = gender_hint_from_alias_name(&a.name);
     score += (m_hint + f_hint) * 4;
 
-    let max_mention = a.mentions.iter().map(|m| mention_score(m)).max().unwrap_or(0);
+    let max_mention = a
+        .mentions
+        .iter()
+        .map(|m| mention_score(m))
+        .max()
+        .unwrap_or(0);
     score += max_mention;
 
     let mut m = 0i32;
@@ -368,10 +462,14 @@ fn gender_evidence_score(t: &str) -> (i32, i32) {
     let female_keys = [("女性", 6), ("女子", 4), ("彼女", 2), ("女", 1)];
 
     for (k, w) in male_keys {
-        if t.contains(k) { male += w; }
+        if t.contains(k) {
+            male += w;
+        }
     }
     for (k, w) in female_keys {
-        if t.contains(k) { female += w; }
+        if t.contains(k) {
+            female += w;
+        }
     }
 
     (male, female)
@@ -411,10 +509,12 @@ fn gender_hint_from_alias_name(name: &str) -> (i32, i32) {
     if s.ends_with("君") || s.ends_with("くん") || s.ends_with("クン") {
         male += 4;
     }
-    if s.contains("姉") || s.contains("お姉") || s.contains("姉さん") || s.contains("姉ちゃん") {
+    if s.contains("姉") || s.contains("お姉") || s.contains("姉さん") || s.contains("姉ちゃん")
+    {
         female += 4;
     }
-    if s.contains("兄") || s.contains("お兄") || s.contains("兄さん") || s.contains("兄ちゃん") {
+    if s.contains("兄") || s.contains("お兄") || s.contains("兄さん") || s.contains("兄ちゃん")
+    {
         male += 2;
     }
 
@@ -437,9 +537,16 @@ async fn translate_cluster(
 
     let context = build_context_for_cluster(&cluster);
     let inferred = match infer_base_name(
-        client, api_url, api_key, model,
-        &cluster.key, cluster.primary.as_str(), &context,
-    ).await {
+        client,
+        api_url,
+        api_key,
+        model,
+        &cluster.key,
+        cluster.primary.as_str(),
+        &context,
+    )
+    .await
+    {
         Ok(Some(v)) => v,
         Ok(None) => return vec![],
         Err(e) => {
@@ -450,8 +557,12 @@ async fn translate_cluster(
 
     let mut out = Vec::new();
     for alias in &cluster.aliases {
-        if is_pure_title(&alias.name) { continue; }
-        if alias.count == 0 { continue; }
+        if is_pure_title(&alias.name) {
+            continue;
+        }
+        if alias.count == 0 {
+            continue;
+        }
         let dst = build_alias_dst(&cluster.key, &inferred.base_dst, &alias.name);
         if contains_kana(&dst) || dst.contains(' ') {
             warn!("dst含假名或空格，跳过: {} -> {}", alias.name, dst);
@@ -502,8 +613,14 @@ async fn infer_base_name(
         let request = ChatRequest {
             model: model.to_string(),
             messages: vec![
-                Message { role: "system".to_string(), content: SYSTEM_PROMPT.to_string() },
-                Message { role: "user".to_string(), content: user_content },
+                Message {
+                    role: "system".to_string(),
+                    content: SYSTEM_PROMPT.to_string(),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: user_content,
+                },
             ],
             temperature: 0.0,
         };
@@ -555,23 +672,33 @@ async fn infer_base_name(
 
         if let Some(g) = &gender {
             let (m_score, f_score) = gender_evidence_score_from_context(context, hint_name);
-            let min_score = if (m_hint >= 4 && f_hint == 0) || (f_hint >= 4 && m_hint == 0) { 4 } else { 6 };
+            let min_score = if (m_hint >= 4 && f_hint == 0) || (f_hint >= 4 && m_hint == 0) {
+                4
+            } else {
+                6
+            };
             let min_gap = if min_score == 4 { 2 } else { 3 };
             let ok = match g.as_str() {
                 "男性" => m_score >= min_score && m_score >= f_score + min_gap,
                 "女性" => f_score >= min_score && f_score >= m_score + min_gap,
                 _ => true,
             };
-            if !ok { gender = None; }
+            if !ok {
+                gender = None;
+            }
         }
 
         if translated.contains(' ') || contains_kana(&translated) {
-            if attempt < 3 { continue; }
+            if attempt < 3 {
+                continue;
+            }
             return Ok(None);
         }
 
         if contains_traditional_hint(&translated) {
-            if attempt < 3 { continue; }
+            if attempt < 3 {
+                continue;
+            }
         }
 
         return Ok(Some(InferredBase {
@@ -584,7 +711,11 @@ async fn infer_base_name(
 
 fn normalize_text(s: &str) -> Option<String> {
     let t = s.replace('\u{3000}', "").trim().to_string();
-    if t.is_empty() || t.eq_ignore_ascii_case("null") { None } else { Some(t) }
+    if t.is_empty() || t.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(t)
+    }
 }
 
 fn normalize_gender(g: Option<String>) -> Option<String> {
@@ -627,7 +758,9 @@ pub fn strip_affixes(name: &str) -> String {
                 break;
             }
         }
-        if !changed { break; }
+        if !changed {
+            break;
+        }
     }
 
     s.trim().to_string()
@@ -635,10 +768,16 @@ pub fn strip_affixes(name: &str) -> String {
 
 pub fn is_pure_title(name: &str) -> bool {
     let raw = name.replace('\u{3000}', "").trim().to_string();
-    if raw.is_empty() { return true; }
-    if PURE_TITLE_CORES.contains(&raw.as_str()) { return true; }
+    if raw.is_empty() {
+        return true;
+    }
+    if PURE_TITLE_CORES.contains(&raw.as_str()) {
+        return true;
+    }
     let core = strip_affixes(&raw);
-    if core.is_empty() { return true; }
+    if core.is_empty() {
+        return true;
+    }
     PURE_TITLE_CORES.contains(&core.as_str())
 }
 
@@ -658,13 +797,16 @@ fn build_context_for_cluster(cluster: &NameCluster) -> serde_json::Value {
         .iter()
         .find(|a| a.name == primary_name)
         .unwrap_or_else(|| {
-            cluster.aliases.iter()
+            cluster
+                .aliases
+                .iter()
                 .max_by(|a, b| a.count.cmp(&b.count).then(a.name.cmp(&b.name)))
                 .expect("cluster.aliases is empty")
         });
 
     let mut scored: Vec<(i32, &Mention)> = primary
-        .mentions.iter()
+        .mentions
+        .iter()
         .map(|m| (mention_score(m), m))
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.line.cmp(&b.1.line)));
@@ -683,13 +825,24 @@ fn build_context_for_cluster(cluster: &NameCluster) -> serde_json::Value {
 
 fn context_item_text(m: &Mention) -> String {
     let mut parts = Vec::new();
-    let above: Vec<String> = m.above.iter()
+    let above: Vec<String> = m
+        .above
+        .iter()
         .filter(|s| !s.trim().is_empty())
-        .rev().take(2).cloned().collect::<Vec<_>>()
-        .into_iter().rev().collect();
-    let follow: Vec<String> = m.follow.iter()
+        .rev()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let follow: Vec<String> = m
+        .follow
+        .iter()
         .filter(|s| !s.trim().is_empty())
-        .take(2).cloned().collect();
+        .take(2)
+        .cloned()
+        .collect();
     parts.extend(above);
     parts.push(m.line_text.trim().to_string());
     parts.extend(follow);
@@ -702,7 +855,9 @@ fn is_family_like(name: &str) -> bool {
 }
 
 fn truncate_context_item(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars { return s.to_string(); }
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
     s.chars().take(max_chars).collect()
 }
 
@@ -711,21 +866,39 @@ fn mention_score(m: &Mention) -> i32 {
     let mut score = 0i32;
 
     let strong = [
-        ("と呼ばれ", 40), ("呼ばれた", 25), ("本名", 25), ("フルネーム", 25), ("──", 10),
+        ("と呼ばれ", 40),
+        ("呼ばれた", 25),
+        ("本名", 25),
+        ("フルネーム", 25),
+        ("──", 10),
     ];
     for (k, w) in strong {
-        if t.contains(k) { score += w; }
+        if t.contains(k) {
+            score += w;
+        }
     }
 
     let gender_keys = [
-        ("女性", 25), ("男子", 18), ("女子", 18), ("彼女", 12), ("彼", 10), ("男", 6), ("女", 6),
+        ("女性", 25),
+        ("男子", 18),
+        ("女子", 18),
+        ("彼女", 12),
+        ("彼", 10),
+        ("男", 6),
+        ("女", 6),
     ];
     for (k, w) in gender_keys {
-        if t.contains(k) { score += w; }
+        if t.contains(k) {
+            score += w;
+        }
     }
 
-    if t.contains("「") || t.contains("『") { score += 4; }
-    if t.contains("こと") { score += 2; }
+    if t.contains("「") || t.contains("『") {
+        score += 4;
+    }
+    if t.contains("こと") {
+        score += 2;
+    }
 
     let line_bonus = (1_000i32 - (m.line as i32).min(1_000)) / 100;
     score + line_bonus
@@ -738,9 +911,13 @@ fn build_alias_dst(cluster_key: &str, base_dst: &str, alias: &str) -> String {
 
     if let Some(rest) = alias.strip_prefix(cluster_key) {
         let suffix = rest.replace('\u{3000}', "").trim().to_string();
-        if suffix.is_empty() { return base_dst.to_string(); }
+        if suffix.is_empty() {
+            return base_dst.to_string();
+        }
         let mapped = map_suffix(&suffix);
-        if mapped.is_empty() { return base_dst.to_string(); }
+        if mapped.is_empty() {
+            return base_dst.to_string();
+        }
         return format!("{}{}", base_dst, mapped);
     }
 
@@ -784,7 +961,9 @@ fn propagate_gender_within_canonical(entries: &mut [TranslationEntry]) {
     let mut genders_by_key: HashMap<String, String> = HashMap::new();
     for e in entries.iter() {
         let key = canonical_key(&e.src);
-        if key.trim().is_empty() { continue; }
+        if key.trim().is_empty() {
+            continue;
+        }
         if let Some((_full, gender)) = parse_info(&e.info) {
             if let Some(g) = gender {
                 genders_by_key.entry(key).or_insert(g);
@@ -805,12 +984,18 @@ fn propagate_gender_within_canonical(entries: &mut [TranslationEntry]) {
 
 fn parse_info(info: &str) -> Option<(Option<String>, Option<String>)> {
     let s = info.trim();
-    if s.is_empty() { return Some((None, None)); }
+    if s.is_empty() {
+        return Some((None, None));
+    }
     if let Some((a, b)) = s.split_once(',') {
         let a = a.trim();
         let b = b.trim();
         if b == "男性" || b == "女性" || b == "动物" {
-            let full = if a.is_empty() { None } else { Some(a.to_string()) };
+            let full = if a.is_empty() {
+                None
+            } else {
+                Some(a.to_string())
+            };
             return Some((full, Some(b.to_string())));
         }
     }

@@ -34,10 +34,7 @@ pub enum ModelPreset {
 }
 
 impl ModelPreset {
-    pub const ALL: [ModelPreset; 2] = [
-        ModelPreset::DeepSeek,
-        ModelPreset::Orion,
-    ];
+    pub const ALL: [ModelPreset; 2] = [ModelPreset::DeepSeek, ModelPreset::Orion];
 
     pub fn index(self) -> usize {
         match self {
@@ -62,8 +59,8 @@ impl ModelPreset {
 
     pub fn llm_url(self) -> &'static str {
         match self {
-            ModelPreset::DeepSeek => "https://api.deepseek.com",
-            ModelPreset::Orion => "http://127.0.0.1:9633",
+            ModelPreset::DeepSeek => "https://api.deepseek.com/v1",
+            ModelPreset::Orion => "http://127.0.0.1:9633/v1",
         }
     }
 

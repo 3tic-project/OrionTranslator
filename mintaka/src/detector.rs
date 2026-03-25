@@ -88,9 +88,7 @@ fn process_batch_results(
         let line_text = &batch_texts[text_idx];
 
         for entity in entities {
-            let is_person = PERSON_TYPES
-                .iter()
-                .any(|t| entity.entity_type.contains(t));
+            let is_person = PERSON_TYPES.iter().any(|t| entity.entity_type.contains(t));
             if !is_person || entity.score < MIN_SCORE {
                 continue;
             }
@@ -165,7 +163,9 @@ pub async fn detect_characters(
     let pb = ProgressBar::new(total_batches as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
             .unwrap()
             .progress_chars("█▉▊▋▌▍▎▏  "),
     );
@@ -194,9 +194,12 @@ pub async fn detect_characters(
             pb_ref.inc(1);
 
             match result {
-                Ok(entities) => {
-                    Ok(process_batch_results(&entities, &batch_texts, &batch_indices, &lines_ref))
-                }
+                Ok(entities) => Ok(process_batch_results(
+                    &entities,
+                    &batch_texts,
+                    &batch_indices,
+                    &lines_ref,
+                )),
                 Err(e) => {
                     warn!("批次处理失败: {}", e);
                     Err(e)
@@ -215,10 +218,7 @@ pub async fn detect_characters(
         match handle.await {
             Ok(Ok(batch_mentions)) => {
                 for (name, mentions) in batch_mentions {
-                    character_mentions
-                        .entry(name)
-                        .or_default()
-                        .extend(mentions);
+                    character_mentions.entry(name).or_default().extend(mentions);
                 }
                 completed += 1;
             }
@@ -251,6 +251,10 @@ pub async fn detect_characters(
         }
     }
 
-    println!("🎯 识别到 {} 个人物 (出现≥{}次)", characters.len(), min_count);
+    println!(
+        "🎯 识别到 {} 个人物 (出现≥{}次)",
+        characters.len(),
+        min_count
+    );
     Ok(characters)
 }

@@ -1,12 +1,12 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use gpui::*;
 use gpui_component::input::InputState;
 
-use crate::types::{TranslationStatus, GlossaryGenStatus, ModelPreset};
+use crate::types::{GlossaryGenStatus, ModelPreset, TranslationStatus};
 
 // ============================================================================
 // Main Application State
@@ -72,7 +72,7 @@ impl OrionApp {
 
         let llm_url_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("LLM API 地址")
+                .placeholder("LLM API BASE_URL")
                 .default_value(DEFAULT_LLM_URL)
         });
         let model_input = cx.new(|cx| {

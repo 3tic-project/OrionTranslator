@@ -1,5 +1,5 @@
-pub mod glossary;
 mod client;
+pub mod glossary;
 mod parser;
 mod prompt;
 

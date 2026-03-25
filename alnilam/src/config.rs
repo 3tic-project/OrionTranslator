@@ -4,7 +4,7 @@ use std::path::PathBuf;
 // Default Configuration Values
 // ============================================================================
 
-pub const DEFAULT_LLM_URL: &str = "https://api.deepseek.com";
+pub const DEFAULT_LLM_URL: &str = "https://api.deepseek.com/v1";
 pub const DEFAULT_MODEL: &str = "deepseek-chat";
 pub const DEFAULT_BATCH_SIZE: usize = 20;
 pub const DEFAULT_CONTEXT_LINES: usize = 10;
@@ -65,4 +65,66 @@ pub struct PipelineConfig {
     pub glossary_path: Option<PathBuf>,
     /// API 密钥（用于需要鉴权的 LLM 服务）
     pub api_key: Option<String>,
+}
+
+/// 将用户输入的 LLM 地址解析为最终的 chat completions endpoint。
+///
+/// 新格式推荐直接填写 BASE_URL，例如：
+/// - https://api.deepseek.com/v1
+/// - https://ark.cn-beijing.volces.com/api/v3
+///
+/// 同时保留对旧格式域名前缀和完整 endpoint 的兼容：
+/// - https://api.deepseek.com               -> https://api.deepseek.com/v1/chat/completions
+/// - https://api.deepseek.com/v1/chat/completions -> 原样返回
+pub fn resolve_chat_completions_endpoint(raw_url: &str) -> String {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return format!("{}/chat/completions", DEFAULT_LLM_URL);
+    }
+
+    if trimmed.ends_with("/chat/completions") {
+        return trimmed.to_string();
+    }
+
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        let path = url.path().trim_matches('/');
+        if path.is_empty() {
+            return format!("{}/v1/chat/completions", trimmed);
+        }
+    }
+
+    format!("{}/chat/completions", trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_chat_completions_endpoint;
+
+    #[test]
+    fn resolves_base_url_to_chat_endpoint() {
+        assert_eq!(
+            resolve_chat_completions_endpoint("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            resolve_chat_completions_endpoint("https://ark.cn-beijing.volces.com/api/v3"),
+            "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        );
+    }
+
+    #[test]
+    fn keeps_full_chat_endpoint_unchanged() {
+        assert_eq!(
+            resolve_chat_completions_endpoint("https://api.deepseek.com/v1/chat/completions"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn keeps_legacy_host_prefix_compatible() {
+        assert_eq!(
+            resolve_chat_completions_endpoint("https://api.deepseek.com"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+    }
 }

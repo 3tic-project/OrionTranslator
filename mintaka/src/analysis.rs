@@ -36,8 +36,26 @@ fn print_cluster_variants(
 fn normalize_dst_base(dst: &str) -> String {
     let mut s = dst.replace('\u{3000}', "").trim().to_string();
     let suffixes = [
-        "酱", "君", "前辈", "老师", "小姐", "先生", "学姐", "学长", "姐", "哥", "妹妹", "弟弟", "部长", "会长", "委员长",
-        "店长", "课长", "社长", "监督", "大人",
+        "酱",
+        "君",
+        "前辈",
+        "老师",
+        "小姐",
+        "先生",
+        "学姐",
+        "学长",
+        "姐",
+        "哥",
+        "妹妹",
+        "弟弟",
+        "部长",
+        "会长",
+        "委员长",
+        "店长",
+        "课长",
+        "社长",
+        "监督",
+        "大人",
     ];
     loop {
         let mut changed = false;
@@ -57,7 +75,8 @@ fn normalize_dst_base(dst: &str) -> String {
 
 pub fn analyze_characters_json(path: &Path) -> Result<()> {
     let content = std::fs::read_to_string(path)?;
-    let characters: HashMap<String, crate::detector::CharacterInfo> = serde_json::from_str(&content)?;
+    let characters: HashMap<String, crate::detector::CharacterInfo> =
+        serde_json::from_str(&content)?;
     analyze_characters(&characters, Some(path.display().to_string()));
     Ok(())
 }
@@ -79,7 +98,10 @@ pub fn analyze_output_dir(dir: &Path) -> Result<()> {
     files.sort();
 
     if files.is_empty() {
-        println!("未在目录中找到 *_output.json 或 *_glossary.json: {}", dir.display());
+        println!(
+            "未在目录中找到 *_output.json 或 *_glossary.json: {}",
+            dir.display()
+        );
         return Ok(());
     }
 
@@ -199,7 +221,10 @@ fn analyze_entries(entries: &[TranslationEntry], label: Option<String>) {
     println!("src为纯称谓: {}", src_titles.len());
     println!("src重复且冲突: {}", dup_src.len());
     println!("canonical簇内冲突: {}", cluster_conflicts.len());
-    println!("canonical簇内别名变体（同base dst且info一致）: {}", cluster_variants.len());
+    println!(
+        "canonical簇内别名变体（同base dst且info一致）: {}",
+        cluster_variants.len()
+    );
 
     print_samples("dst含假名", &dst_kana, 12);
     print_samples("dst含空格", &dst_space, 12);
@@ -291,11 +316,7 @@ fn print_name_count_samples(title: &str, items: &[(&str, usize)], limit: usize) 
     }
 }
 
-fn print_samples(
-    title: &str,
-    items: &[(&str, &str, &str)],
-    limit: usize,
-) {
+fn print_samples(title: &str, items: &[(&str, &str, &str)], limit: usize) {
     if items.is_empty() {
         return;
     }
@@ -305,11 +326,7 @@ fn print_samples(
     }
 }
 
-fn print_dup_samples(
-    dup_src: &[(&str, usize, usize)],
-    entries: &[TranslationEntry],
-    limit: usize,
-) {
+fn print_dup_samples(dup_src: &[(&str, usize, usize)], entries: &[TranslationEntry], limit: usize) {
     if dup_src.is_empty() {
         return;
     }
@@ -341,7 +358,10 @@ fn print_cluster_conflicts(
     }
     println!("\n[canonical簇内冲突] 样例（最多{}组）", limit);
     for (key, count, dstn, infon) in cluster_conflicts.iter().take(limit) {
-        println!("  {}: {}条（dst {}种 / info {}种）", key, count, dstn, infon);
+        println!(
+            "  {}: {}条（dst {}种 / info {}种）",
+            key, count, dstn, infon
+        );
         if let Some(list) = clusters.get(*key) {
             let mut uniq = HashSet::new();
             for x in list {

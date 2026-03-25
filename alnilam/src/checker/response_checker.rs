@@ -86,7 +86,12 @@ fn fullwidth_to_halfwidth(s: &str) -> String {
 // ── Lazy regex patterns ──────────────────────────────────────────────────
 
 /// Check for repeated substrings (replacement for backreference-based regex)
-fn has_repeated_substring(text: &str, min_pattern_len: usize, max_pattern_len: usize, min_repeats: usize) -> bool {
+fn has_repeated_substring(
+    text: &str,
+    min_pattern_len: usize,
+    max_pattern_len: usize,
+    min_repeats: usize,
+) -> bool {
     let chars: Vec<char> = text.chars().collect();
     for pat_len in min_pattern_len..=max_pattern_len.min(chars.len() / min_repeats) {
         for start in 0..chars.len().saturating_sub(pat_len * min_repeats) {
@@ -149,12 +154,7 @@ impl ResponseChecker {
         }
     }
 
-    pub fn check(
-        &self,
-        srcs: &[String],
-        dsts: &[String],
-        retry_count: usize,
-    ) -> Vec<CheckResult> {
+    pub fn check(&self, srcs: &[String], dsts: &[String], retry_count: usize) -> Vec<CheckResult> {
         // 1. Data parse failure
         if dsts.is_empty() || dsts.iter().all(|d| d.trim().is_empty()) {
             return srcs
@@ -172,11 +172,7 @@ impl ResponseChecker {
                 .iter()
                 .map(|_| CheckResult {
                     error: ErrorType::FailLineCount,
-                    details: format!(
-                        "行数不匹配: 原文{}行, 译文{}行",
-                        srcs.len(),
-                        dsts.len()
-                    ),
+                    details: format!("行数不匹配: 原文{}行, 译文{}行", srcs.len(), dsts.len()),
                 })
                 .collect();
         }
@@ -337,7 +333,6 @@ impl ResponseChecker {
         }
         jaccard_similarity(src, dst) > self.similarity_threshold
     }
-
 }
 
 #[cfg(test)]

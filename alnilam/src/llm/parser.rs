@@ -5,6 +5,7 @@ use regex::Regex;
 /// Parse JSONL response from LLM into {index -> translated_text}
 pub fn parse_jsonl_response(response: &str, _expected_count: usize) -> HashMap<usize, String> {
     let mut results = HashMap::new();
+    let response = strip_leading_thinking_content(response);
 
     for line in response.trim().lines() {
         let line = line.trim();
@@ -48,11 +49,34 @@ pub fn parse_jsonl_response(response: &str, _expected_count: usize) -> HashMap<u
     results
 }
 
+fn strip_leading_thinking_content(response: &str) -> &str {
+    let mut remaining = response.trim_start();
+
+    loop {
+        if let Some(rest) = remaining.strip_prefix("<think>") {
+            if let Some(end) = rest.find("</think>") {
+                remaining = rest[end + "</think>".len()..].trim_start();
+                continue;
+            }
+        }
+
+        if let Some(rest) = remaining.strip_prefix("<thinking>") {
+            if let Some(end) = rest.find("</thinking>") {
+                remaining = rest[end + "</thinking>".len()..].trim_start();
+                continue;
+            }
+        }
+
+        break;
+    }
+
+    remaining
+}
+
 fn re_jsonl_fallback() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"\{["\']?(\d+)["\']?\s*:\s*["\'](.+?)["\']\}"#)
-            .expect("jsonl fallback regex")
+        Regex::new(r#"\{["\']?(\d+)["\']?\s*:\s*["\'](.+?)["\']\}"#).expect("jsonl fallback regex")
     })
 }
 
@@ -74,6 +98,16 @@ mod tests {
         let response = r#"{"1":"你好"}
 {2:"谢谢"}"#;
         let results = parse_jsonl_response(response, 2);
+        assert_eq!(results.get(&1).map(|s| s.as_str()), Some("你好"));
+    }
+
+    #[test]
+    fn test_parse_jsonl_with_thinking_block() {
+        let response = r#"<think>
+先分析一下
+</think>
+{"1":"你好"}"#;
+        let results = parse_jsonl_response(response, 1);
         assert_eq!(results.get(&1).map(|s| s.as_str()), Some("你好"));
     }
 }

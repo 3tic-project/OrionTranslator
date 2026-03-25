@@ -1,5 +1,5 @@
-use crate::ner::{NerPipeline, NerEntity};
-use crate::{GlossaryProgressCallback, GlossaryProgressEvent, emit};
+use crate::ner::{NerEntity, NerPipeline};
+use crate::{emit, GlossaryProgressCallback, GlossaryProgressEvent};
 use anyhow::Result;
 use burn::tensor::backend::Backend;
 use serde::{Deserialize, Serialize};
@@ -79,15 +79,15 @@ fn process_batch_entities(
 ) -> HashMap<String, Vec<Mention>> {
     let mut mentions: HashMap<String, Vec<Mention>> = HashMap::new();
 
-    for (text_idx, (entities, &line_idx)) in
-        entities_per_text.iter().zip(batch_indices.iter()).enumerate()
+    for (text_idx, (entities, &line_idx)) in entities_per_text
+        .iter()
+        .zip(batch_indices.iter())
+        .enumerate()
     {
         let line_text = &batch_texts[text_idx];
 
         for entity in entities {
-            let is_person = PERSON_TYPES
-                .iter()
-                .any(|t| entity.label.contains(t));
+            let is_person = PERSON_TYPES.iter().any(|t| entity.label.contains(t));
             if !is_person || entity.score < MIN_SCORE {
                 continue;
             }
@@ -133,13 +133,16 @@ pub async fn detect_characters_embedded<B: Backend + 'static>(
         }
     }
 
-    emit(&progress, GlossaryProgressEvent::Log {
-        message: format!(
-            "有效文本行数: {} (跳过了 {} 行)",
-            valid_lines.len(),
-            lines.len() - valid_lines.len()
-        ),
-    });
+    emit(
+        &progress,
+        GlossaryProgressEvent::Log {
+            message: format!(
+                "有效文本行数: {} (跳过了 {} 行)",
+                valid_lines.len(),
+                lines.len() - valid_lines.len()
+            ),
+        },
+    );
 
     if valid_lines.is_empty() {
         return Ok(HashMap::new());
@@ -155,12 +158,15 @@ pub async fn detect_characters_embedded<B: Backend + 'static>(
     }
 
     let total_batches = batches.len();
-    emit(&progress, GlossaryProgressEvent::Log {
-        message: format!(
-            "开始NER批量处理 ({} 个批次，每批 {} 行)",
-            total_batches, batch_size
-        ),
-    });
+    emit(
+        &progress,
+        GlossaryProgressEvent::Log {
+            message: format!(
+                "开始NER批量处理 ({} 个批次，每批 {} 行)",
+                total_batches, batch_size
+            ),
+        },
+    );
 
     let mut character_mentions: HashMap<String, Vec<Mention>> = HashMap::new();
 
@@ -173,29 +179,23 @@ pub async fn detect_characters_embedded<B: Backend + 'static>(
         };
 
         // Convert NerResult → entities per text
-        let entities_per_text: Vec<Vec<NerEntity>> = results
-            .into_iter()
-            .map(|r| r.entities)
-            .collect();
+        let entities_per_text: Vec<Vec<NerEntity>> =
+            results.into_iter().map(|r| r.entities).collect();
 
-        let batch_mentions = process_batch_entities(
-            &entities_per_text,
-            &batch_texts,
-            &batch_idx_list,
-            lines,
-        );
+        let batch_mentions =
+            process_batch_entities(&entities_per_text, &batch_texts, &batch_idx_list, lines);
 
         for (name, mentions) in batch_mentions {
-            character_mentions
-                .entry(name)
-                .or_default()
-                .extend(mentions);
+            character_mentions.entry(name).or_default().extend(mentions);
         }
 
-        emit(&progress, GlossaryProgressEvent::NerProgress {
-            completed: batch_idx + 1,
-            total: total_batches,
-        });
+        emit(
+            &progress,
+            GlossaryProgressEvent::NerProgress {
+                completed: batch_idx + 1,
+                total: total_batches,
+            },
+        );
     }
 
     // Filter by min_count
@@ -214,9 +214,12 @@ pub async fn detect_characters_embedded<B: Backend + 'static>(
         }
     }
 
-    emit(&progress, GlossaryProgressEvent::Log {
-        message: format!("识别到 {} 个人物 (出现≥{}次)", characters.len(), min_count),
-    });
+    emit(
+        &progress,
+        GlossaryProgressEvent::Log {
+            message: format!("识别到 {} 个人物 (出现≥{}次)", characters.len(), min_count),
+        },
+    );
 
     Ok(characters)
 }

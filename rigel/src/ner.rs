@@ -204,8 +204,7 @@ impl<B: Backend> NerPipeline<B> {
             let predictions_vec = tensor_to_vec_usize::<B>(pred_slice);
             let max_probs_vec = tensor_to_vec_f32::<B>(prob_slice);
 
-            let entities =
-                self.extract_entities(encoded, &predictions_vec, &max_probs_vec, text);
+            let entities = self.extract_entities(encoded, &predictions_vec, &max_probs_vec, text);
 
             results.push(NerResult {
                 text: text.to_string(),
@@ -262,8 +261,14 @@ impl<B: Backend> NerPipeline<B> {
                         });
                     }
                     let entity_type = label[2..].to_string();
-                    current_entity =
-                        Some((ch.to_string(), entity_type, *orig_pos, *orig_pos + 1, score, 1));
+                    current_entity = Some((
+                        ch.to_string(),
+                        entity_type,
+                        *orig_pos,
+                        *orig_pos + 1,
+                        score,
+                        1,
+                    ));
                 } else if label.starts_with("I-") {
                     if let Some((
                         ref mut text,

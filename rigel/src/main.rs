@@ -158,7 +158,7 @@ fn main() -> Result<()> {
 
     #[cfg(all(feature = "cuda", not(feature = "wgpu")))]
     {
-        use burn::backend::{Cuda, cuda::CudaDevice};
+        use burn::backend::{cuda::CudaDevice, Cuda};
         info!("Using CUDA backend");
         launch::<Cuda>(CudaDevice::default())?;
     }

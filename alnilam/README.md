@@ -54,7 +54,7 @@ alnilam novel.epub
 
 # 通用模型 + 术语表
 alnilam novel.epub \
-  --llm-url "https://api.deepseek.com" \
+  --llm-url "https://api.deepseek.com/v1" \
   --model "deepseek-chat" \
   --api-key "sk-xxx" \
   --glossary-path glossary.json

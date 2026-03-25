@@ -39,8 +39,8 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:3000")]
         api_url: String,
 
-        /// LLM API 地址
-        #[arg(long, default_value = "https://api.deepseek.com/v1/chat/completions")]
+        /// LLM API BASE_URL（如 https://api.deepseek.com/v1）
+        #[arg(long, default_value = "https://api.deepseek.com/v1")]
         llm_url: String,
 
         /// LLM API Key (也可通过 LLM_API_KEY 环境变量设置)
@@ -105,8 +105,8 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:3000")]
         api_url: String,
 
-        /// LLM API 地址
-        #[arg(long, default_value = "https://api.deepseek.com/v1/chat/completions")]
+        /// LLM API BASE_URL（如 https://api.deepseek.com/v1）
+        #[arg(long, default_value = "https://api.deepseek.com/v1")]
         llm_url: String,
 
         /// LLM API Key (也可通过 LLM_API_KEY 环境变量设置)
@@ -197,14 +197,9 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let characters = detector::detect_characters(
-                &lines,
-                &ner_client,
-                batch_size,
-                workers,
-                min_count,
-            )
-            .await?;
+            let characters =
+                detector::detect_characters(&lines, &ner_client, batch_size, workers, min_count)
+                    .await?;
             if characters.is_empty() {
                 println!("❌ 未找到出现次数≥{}的人物", min_count);
                 return Ok(());
@@ -272,14 +267,9 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let characters = detector::detect_characters(
-                &lines,
-                &ner_client,
-                batch_size,
-                workers,
-                min_count,
-            )
-            .await?;
+            let characters =
+                detector::detect_characters(&lines, &ner_client, batch_size, workers, min_count)
+                    .await?;
 
             if characters.is_empty() {
                 println!("❌ 未找到出现次数≥{}的人物", min_count);

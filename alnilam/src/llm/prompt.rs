@@ -137,10 +137,7 @@ pub fn build_common_prompt_with_context(
     COMMON_PROMPT_TEMPLATE
         .replace("{{context}}", &context_text)
         .replace("{{glossary}}", glossary_text)
-        .replace(
-            "{\"1\": \"\"}\n{\"2\": \"\"}",
-            &input_jsonl,
-        )
+        .replace("{\"1\": \"\"}\n{\"2\": \"\"}", &input_jsonl)
 }
 
 /// 为通用模型构建单行翻译 prompt（重试时使用）
@@ -160,10 +157,7 @@ pub fn build_common_single_prompt_with_context(
     COMMON_PROMPT_TEMPLATE
         .replace("{{context}}", &context_text)
         .replace("{{glossary}}", glossary_text)
-        .replace(
-            "{\"1\": \"\"}\n{\"2\": \"\"}",
-            &input_jsonl,
-        )
+        .replace("{\"1\": \"\"}\n{\"2\": \"\"}", &input_jsonl)
 }
 
 #[cfg(test)]

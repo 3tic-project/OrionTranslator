@@ -21,15 +21,55 @@ const MAX_CONTEXT_ITEMS: usize = 10;
 const MAX_CONTEXT_CHARS_PER_ITEM: usize = 220;
 
 const HONORIFIC_SUFFIXES: &[&str] = &[
-    "さん", "ちゃん", "くん", "君", "様", "さま", "殿", "どの", "先輩", "先生", "部長", "会長", "委員長", "店長", "課長",
-    "社長", "監督", "姉", "兄", "妹", "弟", "姉さん", "兄さん", "姉ちゃん", "兄ちゃん",
+    "さん",
+    "ちゃん",
+    "くん",
+    "君",
+    "様",
+    "さま",
+    "殿",
+    "どの",
+    "先輩",
+    "先生",
+    "部長",
+    "会長",
+    "委員長",
+    "店長",
+    "課長",
+    "社長",
+    "監督",
+    "姉",
+    "兄",
+    "妹",
+    "弟",
+    "姉さん",
+    "兄さん",
+    "姉ちゃん",
+    "兄ちゃん",
 ];
 
 const HONORIFIC_PREFIXES: &[&str] = &["お", "ご"];
 
 const PURE_TITLE_CORES: &[&str] = &[
-    "先生", "部長", "先輩", "会長", "委員長", "店長", "課長", "社長", "監督", "校長", "副会長", "副部長", "王様", "お兄様",
-    "お姉様", "お兄さん", "お姉さん", "お兄ちゃん", "お姉ちゃん",
+    "先生",
+    "部長",
+    "先輩",
+    "会長",
+    "委員長",
+    "店長",
+    "課長",
+    "社長",
+    "監督",
+    "校長",
+    "副会長",
+    "副部長",
+    "王様",
+    "お兄様",
+    "お姉様",
+    "お兄さん",
+    "お姉さん",
+    "お兄ちゃん",
+    "お姉ちゃん",
 ];
 
 #[derive(Debug, Serialize)]
@@ -106,7 +146,7 @@ impl LlmClient {
 
         Self {
             client,
-            api_url: api_url.to_string(),
+            api_url: normalize_chat_completions_endpoint(api_url),
             api_key: api_key.to_string(),
             model: model.to_string(),
         }
@@ -155,7 +195,7 @@ impl LlmClient {
 
 /// Parse JSON from LLM response, handling markdown code blocks
 fn parse_json_from_llm(content: &str) -> Result<LlmResult> {
-    let content = content.trim();
+    let content = strip_leading_thinking_content(content);
 
     // Try direct parse
     if let Ok(result) = serde_json::from_str::<LlmResult>(content) {
@@ -171,11 +211,7 @@ fn parse_json_from_llm(content: &str) -> Result<LlmResult> {
             .unwrap_or(content)
             .trim()
     } else if content.contains("```") {
-        content
-            .split("```")
-            .nth(1)
-            .unwrap_or(content)
-            .trim()
+        content.split("```").nth(1).unwrap_or(content).trim()
     } else {
         content
     };
@@ -193,14 +229,63 @@ fn parse_json_from_llm(content: &str) -> Result<LlmResult> {
     anyhow::bail!("Failed to parse LLM response as JSON: {}", content)
 }
 
+fn normalize_chat_completions_endpoint(raw_url: &str) -> String {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if trimmed.ends_with("/chat/completions") {
+        return trimmed.to_string();
+    }
+
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        let path = url.path().trim_matches('/');
+        if path.is_empty() {
+            return format!("{}/v1/chat/completions", trimmed);
+        }
+    }
+
+    format!("{}/chat/completions", trimmed)
+}
+
+fn strip_leading_thinking_content(content: &str) -> &str {
+    let mut remaining = content.trim_start();
+
+    loop {
+        if let Some(rest) = remaining.strip_prefix("<think>") {
+            if let Some(end) = rest.find("</think>") {
+                remaining = rest[end + "</think>".len()..].trim_start();
+                continue;
+            }
+        }
+
+        if let Some(rest) = remaining.strip_prefix("<thinking>") {
+            if let Some(end) = rest.find("</thinking>") {
+                remaining = rest[end + "</thinking>".len()..].trim_start();
+                continue;
+            }
+        }
+
+        break;
+    }
+
+    remaining
+}
+
 fn build_name_clusters(
     characters: &std::collections::HashMap<String, crate::detector::CharacterInfo>,
 ) -> Vec<NameCluster> {
-    let mut grouped: std::collections::HashMap<String, Vec<AliasInfo>> = std::collections::HashMap::new();
+    let mut grouped: std::collections::HashMap<String, Vec<AliasInfo>> =
+        std::collections::HashMap::new();
 
     for (name, info) in characters {
         let key = canonical_key(name);
-        let key = if key.is_empty() { name.trim().to_string() } else { key };
+        let key = if key.is_empty() {
+            name.trim().to_string()
+        } else {
+            key
+        };
 
         let alias = AliasInfo {
             name: name.clone(),
@@ -413,10 +498,12 @@ fn gender_hint_from_alias_name(name: &str) -> (i32, i32) {
     if s.ends_with("君") || s.ends_with("くん") || s.ends_with("クン") {
         male += 4;
     }
-    if s.contains("姉") || s.contains("お姉") || s.contains("姉さん") || s.contains("姉ちゃん") {
+    if s.contains("姉") || s.contains("お姉") || s.contains("姉さん") || s.contains("姉ちゃん")
+    {
         female += 4;
     }
-    if s.contains("兄") || s.contains("お兄") || s.contains("兄さん") || s.contains("兄ちゃん") {
+    if s.contains("兄") || s.contains("お兄") || s.contains("兄さん") || s.contains("兄ちゃん")
+    {
         male += 2;
     }
 
@@ -643,8 +730,8 @@ fn normalize_gender(g: Option<String>) -> Option<String> {
 
 fn contains_traditional_hint(s: &str) -> bool {
     const HINTS: &[char] = &[
-        '為', '國', '學', '體', '發', '會', '對', '這', '說', '嗎', '麼', '後', '於', '與', '過', '還', '點', '當', '場',
-        '歲', '裡', '與', '總', '劃', '顏', '髮', '聲', '覺', '親', '願',
+        '為', '國', '學', '體', '發', '會', '對', '這', '說', '嗎', '麼', '後', '於', '與', '過',
+        '還', '點', '當', '場', '歲', '裡', '與', '總', '劃', '顏', '髮', '聲', '覺', '親', '願',
     ];
     s.chars().any(|c| HINTS.contains(&c))
 }
@@ -907,7 +994,11 @@ fn parse_info(info: &str) -> Option<(Option<String>, Option<String>)> {
         let a = a.trim();
         let b = b.trim();
         if b == "男性" || b == "女性" || b == "动物" {
-            let full = if a.is_empty() { None } else { Some(a.to_string()) };
+            let full = if a.is_empty() {
+                None
+            } else {
+                Some(a.to_string())
+            };
             return Some((full, Some(b.to_string())));
         }
     }
@@ -958,7 +1049,10 @@ mod tests {
 
     #[test]
     fn test_build_alias_dst() {
-        assert_eq!(build_alias_dst("志喜屋", "志喜屋", "志喜屋先輩"), "志喜屋前辈");
+        assert_eq!(
+            build_alias_dst("志喜屋", "志喜屋", "志喜屋先輩"),
+            "志喜屋前辈"
+        );
         assert_eq!(build_alias_dst("佳樹", "佳树", "佳樹さん"), "佳树");
         assert_eq!(build_alias_dst("温水", "温水", "温水君"), "温水君");
     }
@@ -1006,7 +1100,10 @@ mod tests {
             aliases: vec![AliasInfo {
                 name: "ネギちゃん".to_string(),
                 count: 2,
-                mentions: vec![m(100, "ネギちゃんが座る"), m(50, "ネギちゃんと呼ばれた女性が手を上げる")],
+                mentions: vec![
+                    m(100, "ネギちゃんが座る"),
+                    m(50, "ネギちゃんと呼ばれた女性が手を上げる"),
+                ],
             }],
             primary: "ネギちゃん".to_string(),
         };

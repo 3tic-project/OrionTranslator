@@ -7,9 +7,7 @@ mod ui;
 mod utils;
 
 use gpui::*;
-use gpui_component::{
-    h_flex, v_flex, ActiveTheme, Root, Theme, ThemeMode, TitleBar,
-};
+use gpui_component::{ActiveTheme, Root, Theme, ThemeMode, TitleBar, h_flex, v_flex};
 use gpui_component_assets::Assets;
 
 use app::OrionApp;
@@ -25,15 +23,12 @@ impl Render for OrionApp {
             .size_full()
             .child(
                 TitleBar::new().child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Orion 翻译器"),
-                        ),
+                    h_flex().items_center().gap_2().child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Orion 翻译器"),
+                    ),
                 ),
             )
             .child(

@@ -1,18 +1,23 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::*;
 
-use alnilam::{config::{
-    self, DEFAULT_BATCH_SIZE, DEFAULT_CONTEXT_LINES, DEFAULT_LLM_URL, DEFAULT_MAX_RETRY, DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P, DEFAULT_WORKERS, PipelineConfig, TranslationMode
-}, llm::LlmClient};
 use alnilam::pipeline::{self, ProgressCallback, ProgressEvent};
+use alnilam::{
+    config::{
+        self, DEFAULT_BATCH_SIZE, DEFAULT_CONTEXT_LINES, DEFAULT_LLM_URL, DEFAULT_MAX_RETRY,
+        DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P, DEFAULT_WORKERS,
+        PipelineConfig, TranslationMode,
+    },
+    llm::LlmClient,
+};
 
 use crate::app::OrionApp;
-use crate::types::{TranslationStatus, GlossaryGenStatus, ModelPreset};
+use crate::types::{GlossaryGenStatus, ModelPreset, TranslationStatus};
 
 // ============================================================================
 // Event Handlers
@@ -32,7 +37,11 @@ impl OrionApp {
     fn collect_cache_targets(path: &Path) -> Vec<PathBuf> {
         let mut targets = Vec::new();
         let parent = path.parent().unwrap_or(Path::new("."));
-        let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let legacy_suffixes = [
             "_translation_data.json",
             "_error_report.json",
@@ -48,7 +57,9 @@ impl OrionApp {
 
                 if entry_path.is_file()
                     && file_name.starts_with(&stem)
-                    && legacy_suffixes.iter().any(|suffix| file_name.ends_with(suffix))
+                    && legacy_suffixes
+                        .iter()
+                        .any(|suffix| file_name.ends_with(suffix))
                 {
                     targets.push(entry_path.clone());
                 }
@@ -57,8 +68,7 @@ impl OrionApp {
                     let exact_work = format!("{}_work", stem);
                     let prefixed_work = format!("{}.", stem);
                     if file_name == exact_work
-                        || (file_name.starts_with(&prefixed_work)
-                            && file_name.ends_with("_work"))
+                        || (file_name.starts_with(&prefixed_work) && file_name.ends_with("_work"))
                     {
                         targets.push(entry_path);
                     }
@@ -78,10 +88,12 @@ impl OrionApp {
         let preset = ModelPreset::from_index(*selected_ix);
         self.model_preset = preset;
 
-        self.llm_url_input
-            .update(cx, |state, cx| state.set_value(preset.llm_url(), window, cx));
-        self.model_input
-            .update(cx, |state, cx| state.set_value(preset.model_name(), window, cx));
+        self.llm_url_input.update(cx, |state, cx| {
+            state.set_value(preset.llm_url(), window, cx)
+        });
+        self.model_input.update(cx, |state, cx| {
+            state.set_value(preset.model_name(), window, cx)
+        });
         self.batch_size_input.update(cx, |state, cx| {
             state.set_value(preset.batch_size().to_string(), window, cx)
         });
@@ -249,14 +261,8 @@ impl OrionApp {
 
     fn add_model_suffix(path: &std::path::Path, model: &str) -> PathBuf {
         let tag = Self::sanitize_model_name(model);
-        let stem = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let parent = path.parent().unwrap_or(std::path::Path::new("."));
         if ext.is_empty() {
             parent.join(format!("{}[{}]", stem, tag))
@@ -471,7 +477,11 @@ impl OrionApp {
                                 Some((output_mono.clone().unwrap(), TranslationMode::Replace)),
                             )
                         } else if run_bilingual {
-                            (output_bilingual.clone().unwrap(), cfg_bilingual.clone(), None)
+                            (
+                                output_bilingual.clone().unwrap(),
+                                cfg_bilingual.clone(),
+                                None,
+                            )
                         } else {
                             (output_mono.clone().unwrap(), cfg_mono.clone(), None)
                         };
@@ -509,9 +519,13 @@ impl OrionApp {
                                 .file_stem()
                                 .unwrap_or_default()
                                 .to_string_lossy();
-                            let primary_parent = primary_output.parent().unwrap_or(std::path::Path::new("."));
+                            let primary_parent =
+                                primary_output.parent().unwrap_or(std::path::Path::new("."));
                             let work_dir = primary_parent.join(format!("{}_work", primary_stem));
-                            let json_path = work_dir.join("translation_data.json").to_string_lossy().to_string();
+                            let json_path = work_dir
+                                .join("translation_data.json")
+                                .to_string_lossy()
+                                .to_string();
 
                             if is_txt {
                                 let data = pipeline::load_txt_translation_data(&json_path)?;
@@ -523,7 +537,8 @@ impl OrionApp {
                                 )?;
                                 outputs.push(secondary_output);
                             } else {
-                                let data = alnilam::epub::EpubHandler::load_translation_data(&json_path)?;
+                                let data =
+                                    alnilam::epub::EpubHandler::load_translation_data(&json_path)?;
                                 pipeline::export_epub_from_data(
                                     &input,
                                     &data,
@@ -628,7 +643,17 @@ impl OrionApp {
             let result = smol::unblock(move || {
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
                 rt.block_on(async {
-                    let llm = LlmClient::with_params(&url, &mdl, 1, 0.8, None, None, String::new(), None, api_key)?;
+                    let llm = LlmClient::with_params(
+                        &url,
+                        &mdl,
+                        1,
+                        0.8,
+                        None,
+                        None,
+                        String::new(),
+                        None,
+                        api_key,
+                    )?;
 
                     let result = if llm.is_orion_model() {
                         tokio::time::timeout(Duration::from_secs(30), async {
@@ -662,7 +687,10 @@ impl OrionApp {
                         this.model_test_ok = Some(true);
                         this.model_test_message =
                             format!("✓ {}", Self::compact_single_line(&translated, 72)).into();
-                        this.add_log(&format!("模型测试成功: \"今日はいい天気ですね。\" → \"{}\"", translated));
+                        this.add_log(&format!(
+                            "模型测试成功: \"今日はいい天気ですね。\" → \"{}\"",
+                            translated
+                        ));
                     }
                     Err(e) => {
                         this.model_test_ok = Some(false);
@@ -709,12 +737,7 @@ impl OrionApp {
         .detach();
     }
 
-    pub fn clear_glossary(
-        &mut self,
-        _: &ClickEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn clear_glossary(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.glossary_path = None;
         self.add_log("已清除术语表");
         cx.notify();
@@ -790,7 +813,11 @@ impl OrionApp {
         self.auto_scroll_log = !self.auto_scroll_log;
         self.add_log(&format!(
             "日志跟随: {}",
-            if self.auto_scroll_log { "开启" } else { "关闭" }
+            if self.auto_scroll_log {
+                "开启"
+            } else {
+                "关闭"
+            }
         ));
         cx.notify();
     }
@@ -856,7 +883,8 @@ impl OrionApp {
         let entity = cx.entity();
 
         // Create a channel for progress events
-        let (progress_tx, progress_rx) = smol::channel::unbounded::<bellatrix::GlossaryProgressEvent>();
+        let (progress_tx, progress_rx) =
+            smol::channel::unbounded::<bellatrix::GlossaryProgressEvent>();
 
         // Build progress callback
         let progress_cb: bellatrix::GlossaryProgressCallback = Some(Arc::new(move |event| {
@@ -884,7 +912,10 @@ impl OrionApp {
                         bellatrix::GlossaryProgressEvent::Log { message } => {
                             this.add_log(&format!("[术语表] {}", message));
                         }
-                        bellatrix::GlossaryProgressEvent::Completed { output_path, entry_count } => {
+                        bellatrix::GlossaryProgressEvent::Completed {
+                            output_path,
+                            entry_count,
+                        } => {
                             this.add_log(&format!(
                                 "[术语表] 完成: {} ({} 条)",
                                 output_path, entry_count
@@ -933,7 +964,7 @@ impl OrionApp {
             model_dir,
             ner_batch_size: 16,
             min_count: 2,
-            llm_url: format!("{}/v1/chat/completions", llm_url.trim_end_matches('/')),
+            llm_url: llm_url.clone(),
             llm_api_key: api_key,
             llm_model: model_name.clone(),
             llm_workers: 4,
@@ -972,8 +1003,8 @@ impl OrionApp {
                     }?;
                     config.lines = lines;
 
-                    let rt = tokio::runtime::Runtime::new()
-                        .expect("Failed to create tokio runtime");
+                    let rt =
+                        tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
                     rt.block_on(async {
                         // Test LLM connectivity (only for generic models)
                         if !skip_llm {
@@ -991,7 +1022,8 @@ impl OrionApp {
                             let test_result = tokio::time::timeout(
                                 Duration::from_secs(30),
                                 llm.test_translation(),
-                            ).await;
+                            )
+                            .await;
                             match test_result {
                                 Ok(Ok(_)) => {} // connectivity OK
                                 Ok(Err(e)) => {
@@ -1008,7 +1040,8 @@ impl OrionApp {
                         Ok::<std::path::PathBuf, anyhow::Error>(output_path)
                     })
                 }
-            }).await;
+            })
+            .await;
 
             _ = entity.update(cx, |this, cx| {
                 match result {
@@ -1016,10 +1049,7 @@ impl OrionApp {
                         this.glossary_gen_status = GlossaryGenStatus::Completed;
                         this.glossary_gen_progress = "".into();
                         this.glossary_path = Some(output_path.clone());
-                        this.add_log(&format!(
-                            "术语表生成完成: {}",
-                            output_path.display()
-                        ));
+                        this.add_log(&format!("术语表生成完成: {}", output_path.display()));
                     }
                     Err(e) => {
                         this.glossary_gen_status = GlossaryGenStatus::Failed;
@@ -1067,7 +1097,12 @@ impl OrionApp {
             candidates.push(exe.join("alnilam/ner_model").to_string_lossy().to_string());
             if let Some(parent) = exe.parent() {
                 candidates.push(parent.join("ner_model").to_string_lossy().to_string());
-                candidates.push(parent.join("alnilam/ner_model").to_string_lossy().to_string());
+                candidates.push(
+                    parent
+                        .join("alnilam/ner_model")
+                        .to_string_lossy()
+                        .to_string(),
+                );
             }
             // macOS .app bundle: Contents/MacOS/<exe> → Contents/Resources/ner_model
             // exe_dir is already Contents/MacOS/, so check exe itself
@@ -1114,7 +1149,11 @@ impl OrionApp {
                 "\n  - {} ({}) [缺少: {}]",
                 candidate,
                 abs,
-                if missing.is_empty() { "OK".to_string() } else { missing.join(", ") }
+                if missing.is_empty() {
+                    "OK".to_string()
+                } else {
+                    missing.join(", ")
+                }
             ));
         }
         msg.push_str("\n  请将 NER 模型文件 (model.safetensors, config.json, vocab.txt, system.dic.zst) 放入 ner_model/ 目录");

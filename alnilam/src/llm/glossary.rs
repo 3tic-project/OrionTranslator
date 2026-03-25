@@ -112,13 +112,11 @@ mod tests {
     #[test]
     fn test_format_glossary_for_orion_empty_dst() {
         // Entries with empty dst should be filtered out
-        let entries = vec![
-            GlossaryEntry {
-                src: "テスト".to_string(),
-                dst: String::new(),
-                info: String::new(),
-            },
-        ];
+        let entries = vec![GlossaryEntry {
+            src: "テスト".to_string(),
+            dst: String::new(),
+            info: String::new(),
+        }];
         assert!(format_glossary_for_orion(&entries).is_none());
     }
 

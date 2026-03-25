@@ -21,8 +21,8 @@ const ONOMATOPOEIA_KANA: &[char] = &[
 
 /// Punctuation mapping: Japanese punctuation -> alternatives that LLMs may produce
 const PUNCTUATION_MAP: &[(&str, &[&str])] = &[
-    ("「", &["\u{201C}", "\u{2018}"]),  // "" '
-    ("」", &["\u{201D}", "\u{2019}"]),  // "" '
+    ("「", &["\u{201C}", "\u{2018}"]), // "" '
+    ("」", &["\u{201D}", "\u{2019}"]), // "" '
     ("『", &["\u{201C}", "\u{2018}"]),
     ("』", &["\u{201D}", "\u{2019}"]),
     ("（", &["("]),

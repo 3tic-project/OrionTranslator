@@ -87,7 +87,10 @@ async fn ner_predict<B: Backend + 'static>(
 
     let results = if let Some(ref batcher) = state.batcher {
         // Dynamic batching mode
-        let futures: Vec<_> = texts.iter().map(|text| batcher.predict(text.clone())).collect();
+        let futures: Vec<_> = texts
+            .iter()
+            .map(|text| batcher.predict(text.clone()))
+            .collect();
         let results: Vec<_> = futures::future::join_all(futures).await;
         let mut ner_results = Vec::new();
         for result in results {

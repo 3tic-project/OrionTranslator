@@ -56,9 +56,7 @@ pub fn apply_format_fixes(
 
 /// Fix CSS: convert vertical-rl to horizontal-tb and inject safe image CSS
 fn fix_css_writing_mode(raw_items: &mut HashMap<String, Vec<u8>>) {
-    let vertical_re = Regex::new(
-        r"(?i)((-webkit-|-epub-)?writing-mode\s*:\s*)vertical-[lr][rl]"
-    );
+    let vertical_re = Regex::new(r"(?i)((-webkit-|-epub-)?writing-mode\s*:\s*)vertical-[lr][rl]");
 
     let mut css_fixed = false;
     let keys: Vec<String> = raw_items.keys().cloned().collect();
@@ -71,9 +69,7 @@ fn fix_css_writing_mode(raw_items: &mut HashMap<String, Vec<u8>>) {
 
                     // Fix vertical writing mode
                     if let Ok(ref re) = vertical_re {
-                        new_css = re
-                            .replace_all(&new_css, "${1}horizontal-tb")
-                            .to_string();
+                        new_css = re.replace_all(&new_css, "${1}horizontal-tb").to_string();
                     }
 
                     // Add image fix CSS (only once, to the first CSS file)
@@ -111,7 +107,10 @@ fn fix_opf_direction(raw_items: &mut HashMap<String, Vec<u8>>) {
                             // Insert page-progression-direction if not present
                             if let Ok(spine_re) = Regex::new(r#"<spine\b([^>]*?)>"#) {
                                 new_opf = spine_re
-                                    .replace(&new_opf, r#"<spine page-progression-direction="ltr"$1>"#)
+                                    .replace(
+                                        &new_opf,
+                                        r#"<spine page-progression-direction="ltr"$1>"#,
+                                    )
                                     .to_string();
                             }
                         }
@@ -164,7 +163,8 @@ fn simplify_svg_images(documents: &mut [DocumentItem]) {
         let matches: Vec<_> = svg_re.find_iter(&original).collect();
         for m in matches.into_iter().rev() {
             let svg_html = m.as_str();
-            let inner = svg_re.captures(svg_html)
+            let inner = svg_re
+                .captures(svg_html)
                 .and_then(|c| c.get(1))
                 .map(|m| m.as_str())
                 .unwrap_or("");
@@ -198,8 +198,12 @@ fn simplify_svg_images(documents: &mut [DocumentItem]) {
             // This preserves the intrinsic aspect ratio for the replacement <img>
             let (img_w, img_h) = {
                 // Try <image> width/height first
-                let w = img_width_re.captures(image_tag).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-                let h = img_height_re.captures(image_tag).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+                let w = img_width_re
+                    .captures(image_tag)
+                    .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+                let h = img_height_re
+                    .captures(image_tag)
+                    .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
                 if let (Some(w), Some(h)) = (w, h) {
                     (Some(w), Some(h))
                 } else {
@@ -234,9 +238,7 @@ fn simplify_svg_images(documents: &mut [DocumentItem]) {
 
 /// Fix inline vertical writing-mode styles in HTML body tags
 fn fix_html_inline_styles(documents: &mut [DocumentItem]) {
-    let vertical_style_re = match Regex::new(
-        r"(?i)(writing-mode\s*:\s*)vertical-[lr][rl]"
-    ) {
+    let vertical_style_re = match Regex::new(r"(?i)(writing-mode\s*:\s*)vertical-[lr][rl]") {
         Ok(r) => r,
         Err(_) => return,
     };

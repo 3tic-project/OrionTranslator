@@ -3,6 +3,7 @@ use std::time::Instant;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
+    ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -10,7 +11,7 @@ use gpui_component::{
     progress::Progress,
     radio::{Radio, RadioGroup},
     spinner::Spinner,
-    v_flex, ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
+    v_flex,
 };
 
 use crate::app::OrionApp;
@@ -293,9 +294,11 @@ impl OrionApp {
                             )
                             .child(
                                 RadioGroup::horizontal("model-preset")
-                                    .children(ModelPreset::ALL.iter().map(|p| {
-                                        Radio::new(p.label()).label(p.label()).small()
-                                    }))
+                                    .children(
+                                        ModelPreset::ALL.iter().map(|p| {
+                                            Radio::new(p.label()).label(p.label()).small()
+                                        }),
+                                    )
                                     .text_xs()
                                     .gap_1p5()
                                     .selected_index(Some(self.model_preset.index()))
@@ -317,7 +320,7 @@ impl OrionApp {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("LLM 地址"),
+                                    .child("LLM BASE_URL"),
                             )
                             .child(Input::new(&self.llm_url_input).small()),
                     )
@@ -704,11 +707,7 @@ impl OrionApp {
                     .text_color(cx.theme().muted_foreground)
                     .child(self.progress_detail.clone()),
             )
-            .child(
-                Progress::new()
-                    .h_2()
-                    .value(self.progress),
-            )
+            .child(Progress::new().h_2().value(self.progress))
     }
 
     pub fn render_log_section(&self, cx: &Context<Self>) -> impl IntoElement {

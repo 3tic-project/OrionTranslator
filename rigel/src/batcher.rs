@@ -80,8 +80,8 @@ impl<B: Backend + 'static> DynamicBatcher<B> {
 
             // Collect more requests within time window
             while batch.len() < config.max_batch_size {
-                let remaining = Duration::from_millis(config.max_wait_ms)
-                    .saturating_sub(batch_start.elapsed());
+                let remaining =
+                    Duration::from_millis(config.max_wait_ms).saturating_sub(batch_start.elapsed());
 
                 if remaining.is_zero() {
                     break;

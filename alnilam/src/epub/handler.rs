@@ -75,8 +75,8 @@ impl EpubHandler {
         tracing::info!("Loading {}...", self.epub_path);
         let file = std::fs::File::open(&self.epub_path)
             .with_context(|| format!("Failed to open EPUB: {}", self.epub_path))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .with_context(|| "Failed to read EPUB as ZIP")?;
+        let mut archive =
+            zip::ZipArchive::new(file).with_context(|| "Failed to read EPUB as ZIP")?;
 
         // Read all files
         for i in 0..archive.len() {
@@ -99,7 +99,10 @@ impl EpubHandler {
         // Load document items
         for (id, name) in &self.manifest {
             let media_type = self.media_types.get(id).map(|s| s.as_str()).unwrap_or("");
-            if media_type.contains("html") || media_type.contains("xhtml") || media_type.contains("xml") {
+            if media_type.contains("html")
+                || media_type.contains("xhtml")
+                || media_type.contains("xml")
+            {
                 // Find the actual file in raw_items
                 if let Some(content_bytes) = self.find_item_content(name) {
                     let content_str = String::from_utf8_lossy(&content_bytes).to_string();
@@ -165,9 +168,15 @@ impl EpubHandler {
 
         for caps in item_tag_re.captures_iter(&opf_str) {
             let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let id = id_re.captures(attrs).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-            let href = href_re.captures(attrs).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-            let media_type = media_type_re.captures(attrs).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+            let id = id_re
+                .captures(attrs)
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+            let href = href_re
+                .captures(attrs)
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+            let media_type = media_type_re
+                .captures(attrs)
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
 
             if let (Some(id), Some(href), Some(media_type)) = (id, href, media_type) {
                 let full_href = format!("{}{}", opf_dir, href);
@@ -189,8 +198,12 @@ impl EpubHandler {
         let props_re = Regex::new(r#"properties="([^"]*)""#)?;
         for caps in item_tag_re.captures_iter(&opf_str) {
             let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let href = href_re.captures(attrs).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-            let props = props_re.captures(attrs).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+            let href = href_re
+                .captures(attrs)
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+            let props = props_re
+                .captures(attrs)
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
             if let (Some(href), Some(props)) = (href, props) {
                 if props.split_whitespace().any(|p| p == "nav") {
                     let full_href = format!("{}{}", opf_dir, href);
@@ -356,7 +369,12 @@ impl EpubHandler {
         };
 
         for doc in &ordered_docs {
-            tracing::debug!("Processing doc: {} (id={}), content len={}", doc.name, doc.id, doc.content.len());
+            tracing::debug!(
+                "Processing doc: {} (id={}), content len={}",
+                doc.name,
+                doc.id,
+                doc.content.len()
+            );
         }
         tracing::info!("Processing {} ordered documents", ordered_docs.len());
 
@@ -369,14 +387,40 @@ impl EpubHandler {
 
             // Content is already preprocessed during load()
             let fragment = Html::parse_document(&doc.content);
-            let block_tags = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "div", "caption", "td", "th"];
+            let block_tags = [
+                "p",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "li",
+                "blockquote",
+                "div",
+                "caption",
+                "td",
+                "th",
+            ];
 
             // Debug: count all elements in the parsed document
-            let elem_count: usize = fragment.tree.values().filter(|n| n.as_element().is_some()).count();
+            let elem_count: usize = fragment
+                .tree
+                .values()
+                .filter(|n| n.as_element().is_some())
+                .count();
             if elem_count == 0 {
-                tracing::debug!("Doc '{}': HTML parse produced 0 elements from {} bytes", doc.name, doc.content.len());
+                tracing::debug!(
+                    "Doc '{}': HTML parse produced 0 elements from {} bytes",
+                    doc.name,
+                    doc.content.len()
+                );
             } else {
-                tracing::debug!("Doc '{}': HTML parse found {} elements total", doc.name, elem_count);
+                tracing::debug!(
+                    "Doc '{}': HTML parse found {} elements total",
+                    doc.name,
+                    elem_count
+                );
             }
 
             let mut block_index = 0;
@@ -393,9 +437,9 @@ impl EpubHandler {
                     // Note: descendants() includes the element itself as the first item,
                     // so we skip(1) to only check actual descendants.
                     let has_nested_block = element.descendants().skip(1).any(|node| {
-                        node.value().as_element().map_or(false, |e| {
-                            block_tags.iter().any(|bt| *bt == e.name())
-                        })
+                        node.value()
+                            .as_element()
+                            .map_or(false, |e| block_tags.iter().any(|bt| *bt == e.name()))
                     });
 
                     if has_nested_block {
@@ -434,7 +478,11 @@ impl EpubHandler {
             if total_elements > 0 || block_index > 0 {
                 tracing::debug!(
                     "Doc '{}': {} elements found, {} skipped (nested), {} empty, {} extracted",
-                    doc.name, total_elements, skipped_nested, empty_text, block_index
+                    doc.name,
+                    total_elements,
+                    skipped_nested,
+                    empty_text,
+                    block_index
                 );
             }
         }
@@ -486,8 +534,10 @@ impl EpubHandler {
         // Tags that are "raw text" or "RCDATA" in HTML5 and must not be self-closing
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| {
-            Regex::new(r"(?i)<(script|style|textarea|title|iframe|noscript|noframes)\b([^>]*?)\s*/>")
-                .unwrap()
+            Regex::new(
+                r"(?i)<(script|style|textarea|title|iframe|noscript|noframes)\b([^>]*?)\s*/>",
+            )
+            .unwrap()
         });
         re.replace_all(content, "<$1$2></$1>").to_string()
     }
@@ -560,8 +610,19 @@ impl EpubHandler {
             let mut new_content = canonical_html;
 
             let block_tags = [
-                "p", "h1", "h2", "h3", "h4", "h5", "h6",
-                "li", "blockquote", "div", "caption", "td", "th",
+                "p",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "li",
+                "blockquote",
+                "div",
+                "caption",
+                "td",
+                "th",
             ];
 
             // Collect all leaf block elements and their positions
@@ -576,9 +637,9 @@ impl EpubHandler {
                     // Check if it's a leaf block (no nested block children)
                     // descendants() includes the element itself, so skip(1)
                     let has_nested_block = element.descendants().skip(1).any(|node| {
-                        node.value().as_element().map_or(false, |e| {
-                            block_tags.iter().any(|bt| *bt == e.name())
-                        })
+                        node.value()
+                            .as_element()
+                            .map_or(false, |e| block_tags.iter().any(|bt| *bt == e.name()))
                     });
 
                     if has_nested_block {
@@ -588,7 +649,12 @@ impl EpubHandler {
                     let raw_text = Self::get_clean_text(&element);
                     if !raw_text.trim().is_empty() {
                         let html = element.html();
-                        elements_info.push((block_index, html, raw_text.trim().to_string(), raw_text));
+                        elements_info.push((
+                            block_index,
+                            html,
+                            raw_text.trim().to_string(),
+                            raw_text,
+                        ));
                         block_index += 1;
                     }
                 }
@@ -596,7 +662,8 @@ impl EpubHandler {
 
             tracing::debug!(
                 "Doc '{}': found {} leaf block elements for injection",
-                doc.id, elements_info.len()
+                doc.id,
+                elements_info.len()
             );
 
             // Check if this document is a ToC page
@@ -629,21 +696,26 @@ impl EpubHandler {
                         // ToC pages or blocks with page_type "toc": use "original / translation" format
                         let effective_toc = is_toc_page || block.page_type == "toc";
                         if effective_toc {
-                            let toc_replaced = replace_tag_content_toc(original_html, &block.src_text, translated);
+                            let toc_replaced =
+                                replace_tag_content_toc(original_html, &block.src_text, translated);
                             new_content = new_content.replacen(original_html, &toc_replaced, 1);
                             count += 1;
                         } else {
                             match mode {
                                 crate::config::TranslationMode::Replace => {
-                                    let replaced = replace_tag_content(original_html, translated, raw_text);
+                                    let replaced =
+                                        replace_tag_content(original_html, translated, raw_text);
                                     new_content = new_content.replacen(original_html, &replaced, 1);
                                     count += 1;
                                 }
                                 crate::config::TranslationMode::Bilingual => {
-                                    let new_tag =
-                                        create_translation_tag(original_html, translated, raw_text, translation_gap);
-                                    let replacement =
-                                        format!("{}\n{}", original_html, new_tag);
+                                    let new_tag = create_translation_tag(
+                                        original_html,
+                                        translated,
+                                        raw_text,
+                                        translation_gap,
+                                    );
+                                    let replacement = format!("{}\n{}", original_html, new_tag);
                                     new_content =
                                         new_content.replacen(original_html, &replacement, 1);
                                     count += 1;
@@ -656,7 +728,9 @@ impl EpubHandler {
             if match_failures > 0 {
                 tracing::warn!(
                     "Doc '{}': {} element.html() match failures (out of {} blocks)",
-                    doc.id, match_failures, blocks.len()
+                    doc.id,
+                    match_failures,
+                    blocks.len()
                 );
             }
 
@@ -681,10 +755,10 @@ impl EpubHandler {
         for doc in &self.documents {
             // Find the matching raw item key
             for (key, _) in self.raw_items.clone() {
-                if key == doc.name || key.ends_with(doc.name.rsplit('/').next().unwrap_or(&doc.name))
+                if key == doc.name
+                    || key.ends_with(doc.name.rsplit('/').next().unwrap_or(&doc.name))
                 {
-                    self.raw_items
-                        .insert(key, doc.content.as_bytes().to_vec());
+                    self.raw_items.insert(key, doc.content.as_bytes().to_vec());
                     break;
                 }
             }
@@ -708,8 +782,8 @@ impl EpubHandler {
         }
 
         // Write all other files
-        let options =
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
 
         for (name, content) in &self.raw_items {
             if name == "mimetype" {
@@ -735,12 +809,9 @@ impl EpubHandler {
 
     // ── JSON I/O ─────────────────────────────────────────────────────────
 
-    pub fn save_translation_data(
-        data: &[TranslationBlock],
-        output_path: &str,
-    ) -> Result<()> {
-        let json = serde_json::to_string_pretty(data)
-            .context("Failed to serialize translation data")?;
+    pub fn save_translation_data(data: &[TranslationBlock], output_path: &str) -> Result<()> {
+        let json =
+            serde_json::to_string_pretty(data).context("Failed to serialize translation data")?;
         std::fs::write(output_path, json)
             .with_context(|| format!("Failed to write: {}", output_path))?;
         tracing::info!("Translation data saved to {}", output_path);
@@ -748,8 +819,8 @@ impl EpubHandler {
     }
 
     pub fn load_translation_data(path: &str) -> Result<Vec<TranslationBlock>> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read: {}", path))?;
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("Failed to read: {}", path))?;
         let data: Vec<TranslationBlock> =
             serde_json::from_str(&content).context("Failed to parse translation data JSON")?;
         Ok(data)
@@ -802,12 +873,7 @@ fn replace_tag_content_toc(html: &str, original_text: &str, translated: &str) ->
         // replace inner content of the outermost tag
         if let (Some(open_end), Some(close_start)) = (html.find('>'), html.rfind('<')) {
             if open_end < close_start {
-                return format!(
-                    "{}{}{}",
-                    &html[..=open_end],
-                    toc_text,
-                    &html[close_start..]
-                );
+                return format!("{}{}{}", &html[..=open_end], toc_text, &html[close_start..]);
             }
         }
         html.to_string()
@@ -815,7 +881,12 @@ fn replace_tag_content_toc(html: &str, original_text: &str, translated: &str) ->
 }
 
 /// Create a new translation tag to insert after the original
-fn create_translation_tag(original_html: &str, translated: &str, raw_text: &str, gap: Option<&str>) -> String {
+fn create_translation_tag(
+    original_html: &str,
+    translated: &str,
+    raw_text: &str,
+    gap: Option<&str>,
+) -> String {
     let tag_name = original_html
         .trim_start_matches('<')
         .split(|c: char| c.is_whitespace() || c == '>')
@@ -827,7 +898,8 @@ fn create_translation_tag(original_html: &str, translated: &str, raw_text: &str,
         let id_re = Regex::new(r#"\s*id="[^"]*""#).unwrap_or(Regex::new("$^").expect("impossible"));
         let attrs = id_re.replace_all(attrs_part, "");
         // Add orion-translation class
-        let class_re = Regex::new(r#"class="([^"]*)""#).unwrap_or(Regex::new("$^").expect("impossible"));
+        let class_re =
+            Regex::new(r#"class="([^"]*)""#).unwrap_or(Regex::new("$^").expect("impossible"));
         let with_class = if class_re.is_match(&attrs) {
             class_re
                 .replace(&attrs, r#"class="$1 orion-translation""#)
@@ -837,19 +909,30 @@ fn create_translation_tag(original_html: &str, translated: &str, raw_text: &str,
         };
         // Optionally add margin-bottom style for spacing
         if let Some(gap_value) = gap {
-            let style_re = Regex::new(r#"style="([^"]*)""#).unwrap_or(Regex::new("$^").expect("impossible"));
+            let style_re =
+                Regex::new(r#"style="([^"]*)""#).unwrap_or(Regex::new("$^").expect("impossible"));
             if style_re.is_match(&with_class) {
                 style_re
-                    .replace(&with_class, &format!("style=\"$1 margin-bottom:{};\"", gap_value))
+                    .replace(
+                        &with_class,
+                        &format!("style=\"$1 margin-bottom:{};\"", gap_value),
+                    )
                     .to_string()
             } else {
-                format!("{} style=\"margin-bottom:{};\"", with_class.trim(), gap_value)
+                format!(
+                    "{} style=\"margin-bottom:{};\"",
+                    with_class.trim(),
+                    gap_value
+                )
             }
         } else {
             with_class
         }
     } else if let Some(gap_value) = gap {
-        format!(" class=\"orion-translation\" style=\"margin-bottom:{};\"", gap_value)
+        format!(
+            " class=\"orion-translation\" style=\"margin-bottom:{};\"",
+            gap_value
+        )
     } else {
         " class=\"orion-translation\"".to_string()
     };

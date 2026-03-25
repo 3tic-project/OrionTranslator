@@ -36,7 +36,7 @@ struct Cli {
     #[arg(short, long, default_value_t = config::DEFAULT_WORKERS)]
     workers: usize,
 
-    /// LLM API 地址
+    /// LLM API BASE_URL（如 https://api.deepseek.com/v1）
     #[arg(long, default_value = config::DEFAULT_LLM_URL)]
     llm_url: String,
 
@@ -97,8 +97,8 @@ enum Commands {
         #[arg(long, default_value_t = 2)]
         min_count: usize,
 
-        /// LLM API 地址
-        #[arg(long, default_value = "https://api.deepseek.com/v1/chat/completions")]
+        /// LLM API BASE_URL（如 https://api.deepseek.com/v1）
+        #[arg(long, default_value = config::DEFAULT_LLM_URL)]
         llm_url: String,
 
         /// LLM API Key
@@ -267,37 +267,46 @@ async fn run_subcommand(cmd: Commands) -> Result<()> {
 
             // Check that model is generic (non-Orion)
             if !bellatrix::is_generic_model(&llm_model) {
-                eprintln!("警告: 术语表生成需要通用模型（如 deepseek-chat），当前模型 \"{}\" 是专用模型", llm_model);
+                eprintln!(
+                    "警告: 术语表生成需要通用模型（如 deepseek-chat），当前模型 \"{}\" 是专用模型",
+                    llm_model
+                );
                 eprintln!("       专用模型不支持 NER 术语翻译任务，请切换到通用模型");
                 std::process::exit(1);
             }
 
             // Build progress callback that prints to console
             use std::sync::Arc;
-            let progress: bellatrix::GlossaryProgressCallback = Some(Arc::new(|event| {
-                match event {
+            let progress: bellatrix::GlossaryProgressCallback =
+                Some(Arc::new(|event| match event {
                     bellatrix::GlossaryProgressEvent::StageStarted { stage, detail } => {
                         println!("📋 [{}] {}", stage, detail);
                     }
                     bellatrix::GlossaryProgressEvent::NerProgress { completed, total } => {
                         print!("\r🔍 NER进度: {}/{}  ", completed, total);
-                        if completed == total { println!(); }
+                        if completed == total {
+                            println!();
+                        }
                     }
                     bellatrix::GlossaryProgressEvent::LlmProgress { completed, total } => {
                         print!("\r🌐 LLM翻译进度: {}/{}  ", completed, total);
-                        if completed == total { println!(); }
+                        if completed == total {
+                            println!();
+                        }
                     }
                     bellatrix::GlossaryProgressEvent::Log { message } => {
                         println!("  {}", message);
                     }
-                    bellatrix::GlossaryProgressEvent::Completed { output_path, entry_count } => {
+                    bellatrix::GlossaryProgressEvent::Completed {
+                        output_path,
+                        entry_count,
+                    } => {
                         println!("✅ 术语表已保存: {} ({} 条)", output_path, entry_count);
                     }
                     bellatrix::GlossaryProgressEvent::Error { message } => {
                         eprintln!("❌ {}", message);
                     }
-                }
-            }));
+                }));
 
             let config = bellatrix::GlossaryConfig {
                 lines: extract_text_lines(&file)?,

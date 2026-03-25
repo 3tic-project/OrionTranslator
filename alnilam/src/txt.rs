@@ -34,7 +34,11 @@ pub fn read_txt_data(input_path: &Path) -> Result<Vec<TxtBlock>> {
 }
 
 /// Write translation results to TXT file
-pub fn write_txt_output(data: &[TxtBlock], output_path: &Path, mode: TranslationMode) -> Result<()> {
+pub fn write_txt_output(
+    data: &[TxtBlock],
+    output_path: &Path,
+    mode: TranslationMode,
+) -> Result<()> {
     let mut file = std::fs::File::create(output_path)
         .with_context(|| format!("Failed to create: {}", output_path.display()))?;
 

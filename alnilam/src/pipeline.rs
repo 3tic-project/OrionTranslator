@@ -230,8 +230,10 @@ fn load_context_detector(config: &PipelineConfig) -> Option<ContextDetector> {
     // This path should not be reached in normal builds (embed-rules is the default feature).
     // If reached, it means the binary was built with --no-default-features and no --rules-path
     // was specified at runtime.
-    warn!("未能加载上下文规则，回退到简单上下文（翻译质量可能下降）。\
-           建议：使用默认编译（embed-rules 特性），或通过 --rules-path 指定规则文件。");
+    warn!(
+        "未能加载上下文规则，回退到简单上下文（翻译质量可能下降）。\
+           建议：使用默认编译（embed-rules 特性），或通过 --rules-path 指定规则文件。"
+    );
     None
 }
 
@@ -242,18 +244,16 @@ fn load_context_detector(config: &PipelineConfig) -> Option<ContextDetector> {
 fn load_glossary_text(config: &PipelineConfig) -> String {
     use crate::llm::glossary;
     match &config.glossary_path {
-        Some(path) if path.exists() => {
-            match glossary::load_glossary(path) {
-                Ok(entries) => {
-                    info!("已加载术语表: {} 条", entries.len());
-                    glossary::format_glossary(&entries)
-                }
-                Err(e) => {
-                    warn!("加载术语表失败: {}", e);
-                    String::new()
-                }
+        Some(path) if path.exists() => match glossary::load_glossary(path) {
+            Ok(entries) => {
+                info!("已加载术语表: {} 条", entries.len());
+                glossary::format_glossary(&entries)
             }
-        }
+            Err(e) => {
+                warn!("加载术语表失败: {}", e);
+                String::new()
+            }
+        },
         _ => String::new(),
     }
 }
@@ -262,12 +262,10 @@ fn load_glossary_text(config: &PipelineConfig) -> String {
 fn load_orion_glossary_text(config: &PipelineConfig) -> Option<String> {
     use crate::llm::glossary;
     match &config.glossary_path {
-        Some(path) if path.exists() => {
-            match glossary::load_glossary(path) {
-                Ok(entries) => glossary::format_glossary_for_orion(&entries),
-                Err(_) => None,
-            }
-        }
+        Some(path) if path.exists() => match glossary::load_glossary(path) {
+            Ok(entries) => glossary::format_glossary_for_orion(&entries),
+            Err(_) => None,
+        },
         _ => None,
     }
 }
@@ -354,7 +352,10 @@ fn check_and_fix_translations(
             fixed_results.insert(orig_idx, fixed_dst.clone());
 
             if fixed_dst != *dst {
-                info!("[#{}] 自动修复: '{:.30}...' -> '{:.30}...'", orig_idx, dst, fixed_dst);
+                info!(
+                    "[#{}] 自动修复: '{:.30}...' -> '{:.30}...'",
+                    orig_idx, dst, fixed_dst
+                );
                 let mut records = error_records.lock().unwrap_or_else(|e| e.into_inner());
                 records.push(ErrorRecord {
                     index: orig_idx,
@@ -368,21 +369,13 @@ fn check_and_fix_translations(
             }
         } else {
             let fixed_dst = fixer.fix(src, dst);
-            let recheck = checker.check(
-                &[src.clone()],
-                &[fixed_dst.clone()],
-                retry_count,
-            );
+            let recheck = checker.check(&[src.clone()], &[fixed_dst.clone()], retry_count);
 
             if !recheck.is_empty() && recheck[0].error == ErrorType::None {
                 fixed_results.insert(orig_idx, fixed_dst.clone());
                 info!(
                     "[#{}] {} -> 已修复: '{:.20}...' -> '{:.20}...': {}",
-                    orig_idx,
-                    result.error,
-                    dst,
-                    fixed_dst,
-                    result.details
+                    orig_idx, result.error, dst, fixed_dst, result.details
                 );
                 let mut records = error_records.lock().unwrap_or_else(|e| e.into_inner());
                 records.push(ErrorRecord {
@@ -422,8 +415,8 @@ fn build_context_for_batch(
 ) -> Vec<String> {
     if let Some(det) = detector {
         if start_idx > 0 {
-            let window = (context_lines * DEFAULT_CONTEXT_WINDOW_MULTIPLIER)
-                .max(DEFAULT_CONTEXT_WINDOW_MIN);
+            let window =
+                (context_lines * DEFAULT_CONTEXT_WINDOW_MULTIPLIER).max(DEFAULT_CONTEXT_WINDOW_MIN);
             match select_context(
                 det,
                 all_src_lines,
@@ -461,8 +454,8 @@ fn build_context_for_batch_precomputed(
 ) -> Vec<String> {
     if let Some(pc) = precomputed {
         if start_idx > 0 {
-            let window = (context_lines * DEFAULT_CONTEXT_WINDOW_MULTIPLIER)
-                .max(DEFAULT_CONTEXT_WINDOW_MIN);
+            let window =
+                (context_lines * DEFAULT_CONTEXT_WINDOW_MULTIPLIER).max(DEFAULT_CONTEXT_WINDOW_MIN);
             match select_context_precomputed(
                 all_src_lines,
                 pc,
@@ -472,14 +465,18 @@ fn build_context_for_batch_precomputed(
                 context_lines,
             ) {
                 Ok(sel) => {
-                    return sel.selected.iter().map(|s| {
-                        // precomputed 版本返回的 text 为空，需要从原始数据获取
-                        if s.text.is_empty() {
-                            all_src_lines[s.line_number - 1].clone()
-                        } else {
-                            s.text.clone()
-                        }
-                    }).collect();
+                    return sel
+                        .selected
+                        .iter()
+                        .map(|s| {
+                            // precomputed 版本返回的 text 为空，需要从原始数据获取
+                            if s.text.is_empty() {
+                                all_src_lines[s.line_number - 1].clone()
+                            } else {
+                                s.text.clone()
+                            }
+                        })
+                        .collect();
                 }
                 Err(e) => {
                     tracing::debug!("Context precomputed fallback: {}", e);
@@ -560,12 +557,7 @@ async fn retry_failed_with_context(
                     Err(_) => {
                         let start = idx.saturating_sub(context_lines);
                         (start..idx)
-                            .map(|i| {
-                                data[i]
-                                    .1
-                                    .clone()
-                                    .unwrap_or_else(|| data[i].0.clone())
-                            })
+                            .map(|i| data[i].1.clone().unwrap_or_else(|| data[i].0.clone()))
                             .collect()
                     }
                 }
@@ -575,12 +567,7 @@ async fn retry_failed_with_context(
         } else {
             let start = idx.saturating_sub(context_lines);
             (start..idx)
-                .map(|i| {
-                    data[i]
-                        .1
-                        .clone()
-                        .unwrap_or_else(|| data[i].0.clone())
-                })
+                .map(|i| data[i].1.clone().unwrap_or_else(|| data[i].0.clone()))
                 .collect()
         };
 
@@ -589,10 +576,7 @@ async fn retry_failed_with_context(
             .map(|i| data[i].0.clone())
             .collect();
 
-        let full_context: Vec<String> = context_before
-            .into_iter()
-            .chain(context_after)
-            .collect();
+        let full_context: Vec<String> = context_before.into_iter().chain(context_after).collect();
 
         retry_items.push((idx, full_context));
     }
@@ -624,19 +608,34 @@ async fn retry_failed_with_context(
 
         join_set.spawn(async move {
             // Check cancel before waiting for semaphore
-            if task_cancel.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
+            if task_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
                 return Ok::<_, anyhow::Error>((idx, src_text, None, err_rec));
             }
             let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
             // Check cancel again after acquiring permit
-            if task_cancel.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
+            if task_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
                 return Ok((idx, src_text, None, err_rec));
             }
             let retry_llm = LlmClient::with_params(
-                &llm_url, &model, 1, temperature, top_p, top_k,
-                glossary_text, orion_glossary_text, api_key,
+                &llm_url,
+                &model,
+                1,
+                temperature,
+                top_p,
+                top_k,
+                glossary_text,
+                orion_glossary_text,
+                api_key,
             )?;
-            let result = retry_llm.translate_single(&src_text, &full_context, &batch_id).await?;
+            let result = retry_llm
+                .translate_single(&src_text, &full_context, &batch_id)
+                .await?;
             Ok::<_, anyhow::Error>((idx, src_text, result, err_rec))
         });
     }
@@ -665,7 +664,10 @@ async fn retry_failed_with_context(
 
                 if let Some(fixed) = fixed_results.get(&idx) {
                     results.insert(idx, fixed.clone());
-                    info!("[#{}] 重试{}成功: '{:.30}...'", idx, current_retry, src_text);
+                    info!(
+                        "[#{}] 重试{}成功: '{:.30}...'",
+                        idx, current_retry, src_text
+                    );
                 } else {
                     still_failed.push(idx);
                 }
@@ -761,37 +763,56 @@ pub async fn translate_epub(
         println!("译文间距: {}", gap);
     }
     println!("{}", "=".repeat(60));
-    emit_progress(&progress_cb, ProgressEvent::Log {
-        message: format!("EPUB 翻译: {} → {}", input_epub.display(), output_epub.display()),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::Log {
+            message: format!(
+                "EPUB 翻译: {} → {}",
+                input_epub.display(),
+                output_epub.display()
+            ),
+        },
+    );
 
     // ========================================================================
     // Step 1: Load and extract EPUB
     // ========================================================================
     println!("\n[Step 1/5] 加载并解析 EPUB...");
-    emit_progress(&progress_cb, ProgressEvent::StageStarted {
-        stage: "Step 1/5".into(),
-        detail: "加载并解析 EPUB...".into(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::StageStarted {
+            stage: "Step 1/5".into(),
+            detail: "加载并解析 EPUB...".into(),
+        },
+    );
     let mut handler = EpubHandler::new(&input_epub.to_string_lossy());
     handler.load()?;
 
     let data = handler.extract_translation_data();
     let all_src_lines: Vec<String> = data.iter().map(|b| b.src_text.clone()).collect();
     println!("提取到 {} 个可翻译文本块", data.len());
-    emit_progress(&progress_cb, ProgressEvent::Log {
-        message: format!("提取到 {} 个可翻译文本块", data.len()),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::Log {
+            message: format!("提取到 {} 个可翻译文本块", data.len()),
+        },
+    );
 
     // Precompute context for all lines (efficient: O(n) total instead of O(n^2))
     let precomputed: Arc<Option<PrecomputedContext>> = Arc::new(
-        detector.as_ref().as_ref().map(|det| precompute_context(det, &all_src_lines))
+        detector
+            .as_ref()
+            .as_ref()
+            .map(|det| precompute_context(det, &all_src_lines)),
     );
 
     // Create work directory for intermediate data
     let work_dir = create_work_dir(output_epub)?;
     println!("工作目录: {}", work_dir.display());
-    let json_path = work_dir.join("translation_data.json").to_string_lossy().to_string();
+    let json_path = work_dir
+        .join("translation_data.json")
+        .to_string_lossy()
+        .to_string();
 
     // Check for existing translation data (resume support)
     let mut translations: HashMap<usize, String> = HashMap::new();
@@ -818,14 +839,27 @@ pub async fn translate_epub(
     // Step 2: Translate with LLM
     // ========================================================================
     println!("\n[Step 2/5] 调用 LLM 进行翻译...");
-    emit_progress(&progress_cb, ProgressEvent::StageStarted {
-        stage: "Step 2/5".into(),
-        detail: "调用 LLM 进行翻译...".into(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::StageStarted {
+            stage: "Step 2/5".into(),
+            detail: "调用 LLM 进行翻译...".into(),
+        },
+    );
 
     let glossary_text = load_glossary_text(config);
     let orion_glossary_text = load_orion_glossary_text(config);
-    let llm = LlmClient::with_params(&config.llm_url, &config.model, 3, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), orion_glossary_text.clone(), config.api_key.clone())?;
+    let llm = LlmClient::with_params(
+        &config.llm_url,
+        &config.model,
+        3,
+        config.temperature,
+        Some(config.top_p),
+        Some(config.top_k),
+        glossary_text.clone(),
+        orion_glossary_text.clone(),
+        config.api_key.clone(),
+    )?;
     let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
 
@@ -922,13 +956,16 @@ pub async fn translate_epub(
             all_failed_indices.extend(missing_indices);
 
             pb.inc(1);
-            emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                completed: batch_num + 1,
-                total: total_batches,
-                total_lines: data.len(),
-                translated: translated_count,
-                failed: all_failed_indices.len(),
-            });
+            emit_progress(
+                &progress_cb,
+                ProgressEvent::BatchProgress {
+                    completed: batch_num + 1,
+                    total: total_batches,
+                    total_lines: data.len(),
+                    translated: translated_count,
+                    failed: all_failed_indices.len(),
+                },
+            );
         }
     } else {
         // Concurrent processing
@@ -947,20 +984,23 @@ pub async fn translate_epub(
 
         for (batch_num, &start_idx) in batch_indices.iter().enumerate() {
             let end_idx = (start_idx + config.batch_size).min(data.len());
-            
+
             // Skip batch if all blocks already translated (resume support)
             let all_done = (start_idx..end_idx).all(|i| translations.contains_key(&i));
             if all_done {
                 translated_count += end_idx - start_idx;
                 pb.inc(1);
                 completed_batches += 1;
-                emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                    completed: completed_batches,
-                    total: total_batches,
-                    total_lines: data.len(),
-                    translated: translated_count,
-                    failed: all_failed_indices.len(),
-                });
+                emit_progress(
+                    &progress_cb,
+                    ProgressEvent::BatchProgress {
+                        completed: completed_batches,
+                        total: total_batches,
+                        total_lines: data.len(),
+                        translated: translated_count,
+                        failed: all_failed_indices.len(),
+                    },
+                );
                 continue;
             }
 
@@ -1015,9 +1055,7 @@ pub async fn translate_epub(
                 }
 
                 let (fixed, failed) = if !srcs.is_empty() {
-                    check_and_fix_translations(
-                        &chk, &fix, &srcs, &dsts, &indices, &err_rec, 0,
-                    )
+                    check_and_fix_translations(&chk, &fix, &srcs, &dsts, &indices, &err_rec, 0)
                 } else {
                     (HashMap::new(), Vec::new())
                 };
@@ -1041,10 +1079,11 @@ pub async fn translate_epub(
                 return Ok(false);
             }
 
-            let maybe_joined = tokio::time::timeout(Duration::from_millis(120), join_set.join_next())
-                .await
-                .ok()
-                .flatten();
+            let maybe_joined =
+                tokio::time::timeout(Duration::from_millis(120), join_set.join_next())
+                    .await
+                    .ok()
+                    .flatten();
 
             let Some(join_result) = maybe_joined else {
                 continue;
@@ -1060,36 +1099,48 @@ pub async fn translate_epub(
                         translated_count += 1;
                     }
                     all_failed_indices.extend(failed);
-                    emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                        completed: completed_batches,
-                        total: total_batches,
-                        total_lines: data.len(),
-                        translated: translated_count,
-                        failed: all_failed_indices.len(),
-                    });
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::BatchProgress {
+                            completed: completed_batches,
+                            total: total_batches,
+                            total_lines: data.len(),
+                            translated: translated_count,
+                            failed: all_failed_indices.len(),
+                        },
+                    );
                 }
                 Ok(Err(e)) => {
                     warn!("批次处理错误: {}", e);
-                    emit_progress(&progress_cb, ProgressEvent::Log {
-                        message: format!("批次错误: {}", e),
-                    });
-                    emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                        completed: completed_batches,
-                        total: total_batches,
-                        total_lines: data.len(),
-                        translated: translated_count,
-                        failed: all_failed_indices.len(),
-                    });
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::Log {
+                            message: format!("批次错误: {}", e),
+                        },
+                    );
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::BatchProgress {
+                            completed: completed_batches,
+                            total: total_batches,
+                            total_lines: data.len(),
+                            translated: translated_count,
+                            failed: all_failed_indices.len(),
+                        },
+                    );
                 }
                 Err(e) => {
                     warn!("Task join error: {}", e);
-                    emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                        completed: completed_batches,
-                        total: total_batches,
-                        total_lines: data.len(),
-                        translated: translated_count,
-                        failed: all_failed_indices.len(),
-                    });
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::BatchProgress {
+                            completed: completed_batches,
+                            total: total_batches,
+                            total_lines: data.len(),
+                            translated: translated_count,
+                            failed: all_failed_indices.len(),
+                        },
+                    );
                 }
             }
         }
@@ -1098,7 +1149,13 @@ pub async fn translate_epub(
     pb.finish_with_message("翻译完成");
 
     // Save stage snapshot after first pass
-    save_epub_stage(&work_dir, "step2_first_pass", &data, &translations, &all_failed_indices)?;
+    save_epub_stage(
+        &work_dir,
+        "step2_first_pass",
+        &data,
+        &translations,
+        &all_failed_indices,
+    )?;
 
     // Also save intermediate translation_data.json for crash recovery
     {
@@ -1129,10 +1186,13 @@ pub async fn translate_epub(
             "\n[Step 3/5] 重试 {} 个失败的翻译...",
             all_failed_indices.len()
         );
-        emit_progress(&progress_cb, ProgressEvent::StageStarted {
-            stage: "Step 3/5".into(),
-            detail: format!("重试 {} 个失败的翻译...", all_failed_indices.len()),
-        });
+        emit_progress(
+            &progress_cb,
+            ProgressEvent::StageStarted {
+                stage: "Step 3/5".into(),
+                detail: format!("重试 {} 个失败的翻译...", all_failed_indices.len()),
+            },
+        );
 
         // Build data pairs for retry
         let data_pairs: Vec<(String, Option<String>)> = data
@@ -1141,7 +1201,17 @@ pub async fn translate_epub(
             .map(|(i, b)| (b.src_text.clone(), translations.get(&i).cloned()))
             .collect();
 
-        let llm_retry = LlmClient::with_params(&config.llm_url, &config.model, 1, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), orion_glossary_text.clone(), config.api_key.clone())?;
+        let llm_retry = LlmClient::with_params(
+            &config.llm_url,
+            &config.model,
+            1,
+            config.temperature,
+            Some(config.top_p),
+            Some(config.top_k),
+            glossary_text.clone(),
+            orion_glossary_text.clone(),
+            config.api_key.clone(),
+        )?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");
 
@@ -1194,7 +1264,13 @@ pub async fn translate_epub(
             .filter(|idx| !translations.contains_key(idx))
             .copied()
             .collect();
-        save_epub_stage(&work_dir, "step3_after_retry", &data, &translations, &remaining_failed)?;
+        save_epub_stage(
+            &work_dir,
+            "step3_after_retry",
+            &data,
+            &translations,
+            &remaining_failed,
+        )?;
     }
 
     // Save translation data with results
@@ -1221,10 +1297,13 @@ pub async fn translate_epub(
         return Ok(false);
     }
 
-    emit_progress(&progress_cb, ProgressEvent::StageStarted {
-        stage: "Step 4/5".into(),
-        detail: "将译文注入 EPUB...".into(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::StageStarted {
+            stage: "Step 4/5".into(),
+            detail: "将译文注入 EPUB...".into(),
+        },
+    );
 
     let mut handler2 = EpubHandler::new(&input_epub.to_string_lossy());
     handler2.load()?;
@@ -1234,10 +1313,13 @@ pub async fn translate_epub(
     // Step 5: Apply fixes and save
     // ========================================================================
     println!("\n[Step 5/5] 应用格式修复并保存...");
-    emit_progress(&progress_cb, ProgressEvent::StageStarted {
-        stage: "Step 5/5".into(),
-        detail: "应用格式修复并保存...".into(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::StageStarted {
+            stage: "Step 5/5".into(),
+            detail: "应用格式修复并保存...".into(),
+        },
+    );
     handler2.save(&output_epub.to_string_lossy(), config.apply_fixes)?;
     println!("输出 EPUB: {}", output_epub.display());
 
@@ -1287,13 +1369,16 @@ pub async fn translate_epub(
         );
     }
 
-    emit_progress(&progress_cb, ProgressEvent::Completed {
-        total: data.len(),
-        translated: translated_count,
-        fixed: fixed_count,
-        failed: failed_count,
-        output_path: output_epub.display().to_string(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::Completed {
+            total: data.len(),
+            translated: translated_count,
+            fixed: fixed_count,
+            failed: failed_count,
+            output_path: output_epub.display().to_string(),
+        },
+    );
 
     Ok(true)
 }
@@ -1314,16 +1399,22 @@ pub fn export_epub_from_data(
     apply_fixes: bool,
     progress_cb: &ProgressCallback,
 ) -> Result<()> {
-    emit_progress(progress_cb, ProgressEvent::Log {
-        message: format!("导出 {} 模式 → {}", mode, output_epub.display()),
-    });
+    emit_progress(
+        progress_cb,
+        ProgressEvent::Log {
+            message: format!("导出 {} 模式 → {}", mode, output_epub.display()),
+        },
+    );
     let mut handler = EpubHandler::new(&input_epub.to_string_lossy());
     handler.load()?;
     handler.inject_translations(translation_data, mode, translation_gap)?;
     handler.save(&output_epub.to_string_lossy(), apply_fixes)?;
-    emit_progress(progress_cb, ProgressEvent::Log {
-        message: format!("导出完成: {}", output_epub.display()),
-    });
+    emit_progress(
+        progress_cb,
+        ProgressEvent::Log {
+            message: format!("导出完成: {}", output_epub.display()),
+        },
+    );
     Ok(())
 }
 
@@ -1334,13 +1425,19 @@ pub fn export_txt_from_data(
     mode: crate::config::TranslationMode,
     progress_cb: &ProgressCallback,
 ) -> Result<()> {
-    emit_progress(progress_cb, ProgressEvent::Log {
-        message: format!("导出 {} 模式 → {}", mode, output_txt.display()),
-    });
+    emit_progress(
+        progress_cb,
+        ProgressEvent::Log {
+            message: format!("导出 {} 模式 → {}", mode, output_txt.display()),
+        },
+    );
     txt::write_txt_output(translation_data, output_txt, mode)?;
-    emit_progress(progress_cb, ProgressEvent::Log {
-        message: format!("导出完成: {}", output_txt.display()),
-    });
+    emit_progress(
+        progress_cb,
+        ProgressEvent::Log {
+            message: format!("导出完成: {}", output_txt.display()),
+        },
+    );
     Ok(())
 }
 
@@ -1386,26 +1483,42 @@ pub async fn translate_txt(
     );
     println!("并行数: {}, 最大重试: {}", config.workers, config.max_retry);
     println!("{}", "=".repeat(60));
-    emit_progress(&progress_cb, ProgressEvent::Log {
-        message: format!("TXT 翻译: {} → {}", input_txt.display(), output_txt.display()),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::Log {
+            message: format!(
+                "TXT 翻译: {} → {}",
+                input_txt.display(),
+                output_txt.display()
+            ),
+        },
+    );
 
     // Step 1: Load TXT
     println!("\n[Step 1/5] 加载并解析 TXT...");
-    emit_progress(&progress_cb, ProgressEvent::StageStarted {
-        stage: "Step 1/5".into(),
-        detail: "加载并解析 TXT...".into(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::StageStarted {
+            stage: "Step 1/5".into(),
+            detail: "加载并解析 TXT...".into(),
+        },
+    );
     let mut data = txt::read_txt_data(input_txt)?;
     println!("提取到 {} 个可翻译文本行", data.len());
-    emit_progress(&progress_cb, ProgressEvent::Log {
-        message: format!("提取到 {} 个可翻译文本行", data.len()),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::Log {
+            message: format!("提取到 {} 个可翻译文本行", data.len()),
+        },
+    );
 
     // Create work directory for intermediate data
     let work_dir = create_work_dir(output_txt)?;
     println!("工作目录: {}", work_dir.display());
-    let txt_json_path = work_dir.join("translation_data.json").to_string_lossy().to_string();
+    let txt_json_path = work_dir
+        .join("translation_data.json")
+        .to_string_lossy()
+        .to_string();
 
     // Check for existing translation data (resume support, same as EPUB)
     let mut translations: HashMap<usize, String> = HashMap::new();
@@ -1422,9 +1535,12 @@ pub async fn translate_txt(
             }
             if resumed > 0 {
                 println!("从已有翻译数据恢复了 {} 个译文", resumed);
-                emit_progress(&progress_cb, ProgressEvent::Log {
-                    message: format!("从已有翻译数据恢复了 {} 个译文", resumed),
-                });
+                emit_progress(
+                    &progress_cb,
+                    ProgressEvent::Log {
+                        message: format!("从已有翻译数据恢复了 {} 个译文", resumed),
+                    },
+                );
             }
         }
     }
@@ -1435,13 +1551,26 @@ pub async fn translate_txt(
 
     // Step 2: Translate
     println!("\n[Step 2/5] 调用 LLM 进行翻译...");
-    emit_progress(&progress_cb, ProgressEvent::StageStarted {
-        stage: "Step 2/5".into(),
-        detail: "调用 LLM 进行翻译...".into(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::StageStarted {
+            stage: "Step 2/5".into(),
+            detail: "调用 LLM 进行翻译...".into(),
+        },
+    );
     let glossary_text = load_glossary_text(config);
     let orion_glossary_text = load_orion_glossary_text(config);
-    let llm = LlmClient::with_params(&config.llm_url, &config.model, 3, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), orion_glossary_text.clone(), config.api_key.clone())?;
+    let llm = LlmClient::with_params(
+        &config.llm_url,
+        &config.model,
+        3,
+        config.temperature,
+        Some(config.top_p),
+        Some(config.top_k),
+        glossary_text.clone(),
+        orion_glossary_text.clone(),
+        config.api_key.clone(),
+    )?;
     let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
 
@@ -1452,12 +1581,16 @@ pub async fn translate_txt(
             .unwrap_or(ProgressStyle::default_bar()),
     );
 
-    let all_src_lines: Arc<Vec<String>> = Arc::new(data.iter().map(|b| b.src_text.clone()).collect());
+    let all_src_lines: Arc<Vec<String>> =
+        Arc::new(data.iter().map(|b| b.src_text.clone()).collect());
     let detector: Arc<Option<ContextDetector>> = Arc::new(detector);
 
     // Precompute context for all lines
     let precomputed: Arc<Option<PrecomputedContext>> = Arc::new(
-        detector.as_ref().as_ref().map(|det| precompute_context(det, &all_src_lines))
+        detector
+            .as_ref()
+            .as_ref()
+            .map(|det| precompute_context(det, &all_src_lines)),
     );
 
     let mut translated_count = translations.len();
@@ -1526,7 +1659,13 @@ pub async fn translate_txt(
 
             if !srcs.is_empty() {
                 let (fixed, failed) = check_and_fix_translations(
-                    &checker, &fixer, &srcs, &dsts, &indices, &error_records, 0,
+                    &checker,
+                    &fixer,
+                    &srcs,
+                    &dsts,
+                    &indices,
+                    &error_records,
+                    0,
                 );
                 for (idx, translated) in fixed {
                     translations.insert(idx, translated);
@@ -1537,13 +1676,16 @@ pub async fn translate_txt(
             all_failed_indices.extend(missing);
 
             pb.inc(1);
-            emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                completed: batch_num + 1,
-                total: total_batches,
-                total_lines: data.len(),
-                translated: translated_count,
-                failed: all_failed_indices.len(),
-            });
+            emit_progress(
+                &progress_cb,
+                ProgressEvent::BatchProgress {
+                    completed: batch_num + 1,
+                    total: total_batches,
+                    total_lines: data.len(),
+                    translated: translated_count,
+                    failed: all_failed_indices.len(),
+                },
+            );
         }
     } else {
         // Concurrent processing with JoinSet
@@ -1566,13 +1708,16 @@ pub async fn translate_txt(
                 translated_count += end_idx - start_idx;
                 pb.inc(1);
                 completed_batches += 1;
-                emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                    completed: completed_batches,
-                    total: total_batches,
-                    total_lines: data.len(),
-                    translated: translated_count,
-                    failed: all_failed_indices.len(),
-                });
+                emit_progress(
+                    &progress_cb,
+                    ProgressEvent::BatchProgress {
+                        completed: completed_batches,
+                        total: total_batches,
+                        total_lines: data.len(),
+                        translated: translated_count,
+                        failed: all_failed_indices.len(),
+                    },
+                );
                 continue;
             }
 
@@ -1650,10 +1795,11 @@ pub async fn translate_txt(
                 return Ok(false);
             }
 
-            let maybe_joined = tokio::time::timeout(Duration::from_millis(120), join_set.join_next())
-                .await
-                .ok()
-                .flatten();
+            let maybe_joined =
+                tokio::time::timeout(Duration::from_millis(120), join_set.join_next())
+                    .await
+                    .ok()
+                    .flatten();
 
             let Some(join_result) = maybe_joined else {
                 continue;
@@ -1669,36 +1815,48 @@ pub async fn translate_txt(
                         translated_count += 1;
                     }
                     all_failed_indices.extend(failed);
-                    emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                        completed: completed_batches,
-                        total: total_batches,
-                        total_lines: data.len(),
-                        translated: translated_count,
-                        failed: all_failed_indices.len(),
-                    });
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::BatchProgress {
+                            completed: completed_batches,
+                            total: total_batches,
+                            total_lines: data.len(),
+                            translated: translated_count,
+                            failed: all_failed_indices.len(),
+                        },
+                    );
                 }
                 Ok(Err(e)) => {
                     warn!("TXT 批次处理错误: {}", e);
-                    emit_progress(&progress_cb, ProgressEvent::Log {
-                        message: format!("批次错误: {}", e),
-                    });
-                    emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                        completed: completed_batches,
-                        total: total_batches,
-                        total_lines: data.len(),
-                        translated: translated_count,
-                        failed: all_failed_indices.len(),
-                    });
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::Log {
+                            message: format!("批次错误: {}", e),
+                        },
+                    );
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::BatchProgress {
+                            completed: completed_batches,
+                            total: total_batches,
+                            total_lines: data.len(),
+                            translated: translated_count,
+                            failed: all_failed_indices.len(),
+                        },
+                    );
                 }
                 Err(e) => {
                     warn!("Task join error: {}", e);
-                    emit_progress(&progress_cb, ProgressEvent::BatchProgress {
-                        completed: completed_batches,
-                        total: total_batches,
-                        total_lines: data.len(),
-                        translated: translated_count,
-                        failed: all_failed_indices.len(),
-                    });
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::BatchProgress {
+                            completed: completed_batches,
+                            total: total_batches,
+                            total_lines: data.len(),
+                            translated: translated_count,
+                            failed: all_failed_indices.len(),
+                        },
+                    );
                 }
             }
         }
@@ -1707,7 +1865,13 @@ pub async fn translate_txt(
     pb.finish_with_message("翻译完成");
 
     // Save stage snapshot after first pass
-    save_txt_stage(&work_dir, "step2_first_pass", &data, &translations, &all_failed_indices)?;
+    save_txt_stage(
+        &work_dir,
+        "step2_first_pass",
+        &data,
+        &translations,
+        &all_failed_indices,
+    )?;
 
     // Also save intermediate translation_data.json for crash recovery
     {
@@ -1737,10 +1901,13 @@ pub async fn translate_txt(
             "\n[Step 3/5] 重试 {} 个失败的翻译...",
             all_failed_indices.len()
         );
-        emit_progress(&progress_cb, ProgressEvent::StageStarted {
-            stage: "Step 3/5".into(),
-            detail: format!("重试 {} 个失败的翻译...", all_failed_indices.len()),
-        });
+        emit_progress(
+            &progress_cb,
+            ProgressEvent::StageStarted {
+                stage: "Step 3/5".into(),
+                detail: format!("重试 {} 个失败的翻译...", all_failed_indices.len()),
+            },
+        );
 
         let data_pairs: Vec<(String, Option<String>)> = data
             .iter()
@@ -1748,7 +1915,17 @@ pub async fn translate_txt(
             .map(|(i, b)| (b.src_text.clone(), translations.get(&i).cloned()))
             .collect();
 
-        let llm_retry = LlmClient::with_params(&config.llm_url, &config.model, 1, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), orion_glossary_text.clone(), config.api_key.clone())?;
+        let llm_retry = LlmClient::with_params(
+            &config.llm_url,
+            &config.model,
+            1,
+            config.temperature,
+            Some(config.top_p),
+            Some(config.top_k),
+            glossary_text.clone(),
+            orion_glossary_text.clone(),
+            config.api_key.clone(),
+        )?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");
 
@@ -1801,7 +1978,13 @@ pub async fn translate_txt(
             .filter(|idx| !translations.contains_key(idx))
             .copied()
             .collect();
-        save_txt_stage(&work_dir, "step3_after_retry", &data, &translations, &remaining_failed)?;
+        save_txt_stage(
+            &work_dir,
+            "step3_after_retry",
+            &data,
+            &translations,
+            &remaining_failed,
+        )?;
     }
 
     // Save translation data with results
@@ -1826,20 +2009,26 @@ pub async fn translate_txt(
         return Ok(false);
     }
 
-    emit_progress(&progress_cb, ProgressEvent::StageStarted {
-        stage: "Step 4/5".into(),
-        detail: "写入输出 TXT...".into(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::StageStarted {
+            stage: "Step 4/5".into(),
+            detail: "写入输出 TXT...".into(),
+        },
+    );
 
     txt::write_txt_output(&data, output_txt, config.mode)?;
     println!("输出 TXT: {}", output_txt.display());
 
     // Step 5: Error report (same as EPUB)
     println!("\n[Step 5/5] 生成错误报告...");
-    emit_progress(&progress_cb, ProgressEvent::StageStarted {
-        stage: "Step 5/5".into(),
-        detail: "生成错误报告...".into(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::StageStarted {
+            stage: "Step 5/5".into(),
+            detail: "生成错误报告...".into(),
+        },
+    );
     let error_summary = {
         let records = error_records.lock().unwrap_or_else(|e| e.into_inner());
         if !records.is_empty() {
@@ -1850,13 +2039,16 @@ pub async fn translate_txt(
         }
     };
 
-    emit_progress(&progress_cb, ProgressEvent::Completed {
-        total: data.len(),
-        translated: translated_count,
-        fixed: fixed_count,
-        failed: failed_count,
-        output_path: output_txt.display().to_string(),
-    });
+    emit_progress(
+        &progress_cb,
+        ProgressEvent::Completed {
+            total: data.len(),
+            translated: translated_count,
+            fixed: fixed_count,
+            failed: failed_count,
+            output_path: output_txt.display().to_string(),
+        },
+    );
 
     // Summary
     println!("\n{}", "=".repeat(60));

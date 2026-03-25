@@ -5,14 +5,13 @@ fn main() {
     #[cfg(target_os = "windows")]
     {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let ico = std::path::Path::new(&manifest_dir)
-            .join("../assets/logo.ico");
+        let ico = std::path::Path::new(&manifest_dir).join("../assets/logo.ico");
 
         if ico.exists() {
             let mut res = winresource::WindowsResource::new();
             res.set_icon(ico.to_str().unwrap());
             res.set("FileDescription", "Orion 翻译器");
-            res.set("ProductName",     "OrionTranslator");
+            res.set("ProductName", "OrionTranslator");
             if let Err(e) = res.compile() {
                 eprintln!("winresource compile error: {e}");
                 std::process::exit(1);

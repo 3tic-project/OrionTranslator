@@ -45,9 +45,11 @@ cargo build --release -p alnitak
 
 在界面顶部填写以下信息，内置了三个预设，默认为deepseek-chat：
 
+`API URL` 现在直接填写 OpenAI-compatible 的 `BASE_URL`，例如 `https://api.deepseek.com/v1`、`https://ark.cn-beijing.volces.com/api/v3`。
+
 | 字段 | 示例值 | 说明 |
 |------|--------|------|
-| API URL | `https://api.deepseek.com` | OpenAI-compatible 接口地址 |
+| API URL | `https://api.deepseek.com/v1` | 直接填写 OpenAI-compatible `BASE_URL` |
 | 模型名称 | `deepseek-chat` | 填入 `orion` 系列名称可启用专用格式 |
 | API Key | `sk-xxx` | 对应服务的密钥 |
 
@@ -241,7 +243,7 @@ alnilam novel.epub
 
 # 通用模型 + 术语表
 alnilam novel.epub \
-  --llm-url "https://api.deepseek.com" \
+  --llm-url "https://api.deepseek.com/v1" \
   --model "deepseek-chat" \
   --api-key "sk-xxx" \
   --glossary-path glossary.json

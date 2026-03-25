@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::config;
+
 use super::parser::parse_jsonl_response;
 use super::prompt;
 
@@ -35,7 +37,11 @@ struct ChatChoice {
 
 #[derive(Debug, Deserialize)]
 struct ChatChoiceMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,7 +67,17 @@ pub struct LlmClient {
 
 impl LlmClient {
     pub fn new(llm_url: &str, model: &str, max_retries: usize) -> Result<Self> {
-        Self::with_params(llm_url, model, max_retries, 0.8, None, None, String::new(), None, None)
+        Self::with_params(
+            llm_url,
+            model,
+            max_retries,
+            0.8,
+            None,
+            None,
+            String::new(),
+            None,
+            None,
+        )
     }
 
     pub fn with_params(
@@ -132,7 +148,7 @@ impl LlmClient {
 
     /// Call the LLM API and return the raw response text
     pub async fn call(&self, prompt: &str, batch_id: &str) -> Result<Option<String>> {
-        let endpoint = format!("{}/v1/chat/completions", self.llm_url);
+        let endpoint = config::resolve_chat_completions_endpoint(&self.llm_url);
 
         let payload = ChatRequest {
             model: self.model.clone(),
@@ -179,10 +195,12 @@ impl LlmClient {
                     if attempt + 1 < self.max_retries {
                         // 限流时使用更长的退避时间
                         let base_ms = if is_rate_limit { 3000 } else { 1000 };
-                        let delay = Duration::from_millis(
-                            base_ms * 2u64.pow(attempt as u32),
+                        let delay = Duration::from_millis(base_ms * 2u64.pow(attempt as u32));
+                        warn!(
+                            "[Batch {}] 等待 {:.1}s 后重试...",
+                            batch_id,
+                            delay.as_secs_f64()
                         );
-                        warn!("[Batch {}] 等待 {:.1}s 后重试...", batch_id, delay.as_secs_f64());
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -199,10 +217,7 @@ impl LlmClient {
                 req = req.header("Authorization", format!("Bearer {}", key));
             }
         }
-        let response = req
-            .send()
-            .await
-            .context("Failed to send request to LLM")?;
+        let response = req.send().await.context("Failed to send request to LLM")?;
 
         let status = response.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -220,12 +235,16 @@ impl LlmClient {
             anyhow::bail!("HTTP error {}: {}", status, body);
         }
 
-        let data: ChatResponse = response.json().await.context("Failed to parse LLM response")?;
+        let data: ChatResponse = response
+            .json()
+            .await
+            .context("Failed to parse LLM response")?;
 
         data.choices
             .first()
-            .map(|c| c.message.content.clone())
-            .ok_or_else(|| anyhow::anyhow!("No choices in LLM response"))
+            .and_then(|c| c.message.content.as_ref())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No content in LLM response"))
     }
 
     /// 测试模型：发送一条真实翻译格式的 prompt，验证返回是否可正常解析
@@ -234,7 +253,11 @@ impl LlmClient {
         let context: Vec<String> = vec![];
 
         let prompt_text = if self.is_orion_model() {
-            prompt::build_prompt_with_context(&test_texts, &context, self.orion_glossary_text.as_deref())
+            prompt::build_prompt_with_context(
+                &test_texts,
+                &context,
+                self.orion_glossary_text.as_deref(),
+            )
         } else {
             prompt::build_common_prompt_with_context(&test_texts, &context, &self.glossary_text)
         };
@@ -288,7 +311,11 @@ impl LlmClient {
         batch_id: &str,
     ) -> Result<Option<String>> {
         let prompt_text = if self.is_orion_model() {
-            prompt::build_single_prompt_with_context(text, context, self.orion_glossary_text.as_deref())
+            prompt::build_single_prompt_with_context(
+                text,
+                context,
+                self.orion_glossary_text.as_deref(),
+            )
         } else {
             prompt::build_common_single_prompt_with_context(text, context, &self.glossary_text)
         };

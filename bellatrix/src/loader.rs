@@ -1,7 +1,5 @@
 use crate::embedding::BertEmbeddingsRecord;
-use crate::model::{
-    BertForTokenClassificationRecord, BertModelConfig, BertModelRecord, NerConfig,
-};
+use crate::model::{BertForTokenClassificationRecord, BertModelConfig, BertModelRecord, NerConfig};
 use burn::module::{ConstantRecord, Param};
 use burn::nn::attention::MultiHeadAttentionRecord;
 use burn::nn::transformer::{
@@ -78,10 +76,8 @@ fn load_intermediate_layer_safetensor<B: Backend>(
     linear_outer_bias: &CandleTensor,
     device: &B::Device,
 ) -> PositionWiseFeedForwardRecord<B> {
-    let linear_inner =
-        load_linear_safetensor::<B>(linear_inner_bias, linear_inner_weight, device);
-    let linear_outer =
-        load_linear_safetensor::<B>(linear_outer_bias, linear_outer_weight, device);
+    let linear_inner = load_linear_safetensor::<B>(linear_inner_bias, linear_inner_weight, device);
+    let linear_outer = load_linear_safetensor::<B>(linear_outer_bias, linear_outer_weight, device);
 
     PositionWiseFeedForwardRecord {
         linear_inner,

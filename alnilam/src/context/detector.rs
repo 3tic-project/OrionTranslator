@@ -42,8 +42,8 @@ impl ContextDetector {
     pub fn from_file(rules_path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(rules_path)
             .with_context(|| format!("Failed to read rules file: {}", rules_path.display()))?;
-        let config: Value = serde_json::from_str(&content)
-            .with_context(|| "Failed to parse rules JSON")?;
+        let config: Value =
+            serde_json::from_str(&content).with_context(|| "Failed to parse rules JSON")?;
         Self::from_config(&config)
     }
 
@@ -89,11 +89,7 @@ impl ContextDetector {
 
     // ── Public API ──────────────────────────────────────────────────────
 
-    pub fn detect_line(
-        &self,
-        line: &str,
-        _history: &[String],
-    ) -> DetectionResult {
+    pub fn detect_line(&self, line: &str, _history: &[String]) -> DetectionResult {
         let line_type = self.classify_line(line);
 
         // Blank / metadata → no context needed
@@ -102,10 +98,7 @@ impl ContextDetector {
                 line_type,
                 dominant_category: None,
                 matches: vec![],
-                actions: HashMap::from([(
-                    "reset_context".to_string(),
-                    Value::Bool(false),
-                )]),
+                actions: HashMap::from([("reset_context".to_string(), Value::Bool(false))]),
             };
         }
 
@@ -115,19 +108,15 @@ impl ContextDetector {
                 line_type,
                 dominant_category: None,
                 matches: vec![],
-                actions: HashMap::from([(
-                    "reset_context".to_string(),
-                    Value::Bool(true),
-                )]),
+                actions: HashMap::from([("reset_context".to_string(), Value::Bool(true))]),
             };
         }
 
         // ── Collect matches ─────────────────────────────────────────────
         let raw_matches = self.trie.find(line);
         let regex_matches = self.find_regex_matches(line);
-        let mut all_matches = self.dedupe_matches(
-            raw_matches.into_iter().chain(regex_matches).collect(),
-        );
+        let mut all_matches =
+            self.dedupe_matches(raw_matches.into_iter().chain(regex_matches).collect());
 
         // Filter: dialogue_reaction only for dialogue lines
         if line_type != LineType::Dialogue {
@@ -135,9 +124,7 @@ impl ContextDetector {
         }
 
         // ── Position-aware weight adjustment ────────────────────────────
-        let stripped = line.trim_start_matches(|c: char| {
-            "「『【《（(\u{3000} ".contains(c)
-        });
+        let stripped = line.trim_start_matches(|c: char| "「『【《（(\u{3000} ".contains(c));
         let initial_offset = line.len() - stripped.len();
         all_matches = self.apply_position_bonus(all_matches, initial_offset);
 
@@ -180,10 +167,20 @@ impl ContextDetector {
                     .entry(m.category_id.clone())
                     .or_insert(cat.priority);
 
-                if cat.actions.get("needs_glossary").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if cat
+                    .actions
+                    .get("needs_glossary")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     actions.insert("needs_glossary".to_string(), Value::Bool(true));
                 }
-                if cat.actions.get("reset_context").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if cat
+                    .actions
+                    .get("reset_context")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     actions.insert("reset_context".to_string(), Value::Bool(true));
                 }
             }
@@ -301,10 +298,7 @@ impl ContextDetector {
             .unwrap_or(&id)
             .to_string();
 
-        let priority = cat
-            .get("priority")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(3) as i32;
+        let priority = cat.get("priority").and_then(|v| v.as_i64()).unwrap_or(3) as i32;
 
         let base_weight = cat
             .get("base_weight")
@@ -418,7 +412,11 @@ impl ContextDetector {
                     let len_b = b.end - b.start;
                     len_b.cmp(&len_a) // longer first
                 })
-                .then_with(|| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| {
+                    b.weight
+                        .partial_cmp(&a.weight)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| a.start.cmp(&b.start))
         });
 
@@ -503,21 +501,17 @@ impl ContextDetector {
 
     // ── Scoring and recommendation ──────────────────────────────────────
 
-    fn pick_dominant(
-        scores: &HashMap<String, f64>,
-        priorities: &HashMap<String, i32>,
-    ) -> String {
+    fn pick_dominant(scores: &HashMap<String, f64>, priorities: &HashMap<String, i32>) -> String {
         scores
             .keys()
             .max_by(|a, b| {
                 let pa = priorities.get(*a).copied().unwrap_or(3);
                 let pb = priorities.get(*b).copied().unwrap_or(3);
-                pa.cmp(&pb)
-                    .then_with(|| {
-                        let sa = scores.get(*a).copied().unwrap_or(0.0);
-                        let sb = scores.get(*b).copied().unwrap_or(0.0);
-                        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                pa.cmp(&pb).then_with(|| {
+                    let sa = scores.get(*a).copied().unwrap_or(0.0);
+                    let sb = scores.get(*b).copied().unwrap_or(0.0);
+                    sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+                })
             })
             .cloned()
             .unwrap_or_default()
@@ -559,22 +553,13 @@ mod tests {
         });
         let detector = ContextDetector::from_config(&config).expect("should parse config");
 
-        assert_eq!(
-            detector.classify_line(""),
-            LineType::Blank
-        );
-        assert_eq!(
-            detector.classify_line("「こんにちは」"),
-            LineType::Dialogue
-        );
+        assert_eq!(detector.classify_line(""), LineType::Blank);
+        assert_eq!(detector.classify_line("「こんにちは」"), LineType::Dialogue);
         assert_eq!(
             detector.classify_line("普通のテキスト"),
             LineType::Narration
         );
-        assert_eq!(
-            detector.classify_line("◆◆◆"),
-            LineType::SceneBreak
-        );
+        assert_eq!(detector.classify_line("◆◆◆"), LineType::SceneBreak);
         assert_eq!(
             detector.classify_line("プロローグ"),
             LineType::ChapterHeading

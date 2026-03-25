@@ -31,7 +31,7 @@ use bellatrix::{GlossaryConfig, generate_glossary, GlossaryProgressEvent};
 let config = GlossaryConfig {
     lines: text_lines,
     model_dir: "ner_model".to_string(),
-    llm_url: "https://api.deepseek.com".to_string(),
+    llm_url: "https://api.deepseek.com/v1".to_string(),
     llm_model: "deepseek-chat".to_string(),
     // ...
 };

@@ -141,10 +141,7 @@ fn target_needs(result: &DetectionResult) -> HashSet<&'static str> {
 /// 预计算所有行的上下文检测结果和特征。
 ///
 /// 完成后可多次调用 `select_context_precomputed()` 而无需重复检测。
-pub fn precompute_context(
-    detector: &ContextDetector,
-    lines: &[String],
-) -> PrecomputedContext {
+pub fn precompute_context(detector: &ContextDetector, lines: &[String]) -> PrecomputedContext {
     let mut segment_start_before = vec![1; lines.len() + 1];
     let mut features = Vec::with_capacity(lines.len());
     let mut detection_results = Vec::with_capacity(lines.len());
@@ -222,11 +219,7 @@ pub fn select_context_precomputed(
     // Use precomputed features for candidate lines
     let candidate_features: HashMap<usize, HashSet<&str>> = (allowed_start..=allowed_end)
         .map(|i| {
-            let feats = precomputed
-                .features
-                .get(i - 1)
-                .cloned()
-                .unwrap_or_default();
+            let feats = precomputed.features.get(i - 1).cloned().unwrap_or_default();
             (i, feats)
         })
         .collect();
@@ -245,11 +238,7 @@ pub fn select_context_precomputed(
 
 // ── Segment start computation (used by select_context) ──────────────────
 
-fn compute_segment_start(
-    detector: &ContextDetector,
-    lines: &[String],
-    upto_line: usize,
-) -> usize {
+fn compute_segment_start(detector: &ContextDetector, lines: &[String], upto_line: usize) -> usize {
     let mut segment_start = 1;
     let mut history: Vec<String> = Vec::new();
 
@@ -295,9 +284,7 @@ pub fn select_context(
     let allowed_end = target_start - 1;
 
     if allowed_end < allowed_start {
-        return Ok(SelectionResult {
-            selected: vec![],
-        });
+        return Ok(SelectionResult { selected: vec![] });
     }
 
     // Build segment history
