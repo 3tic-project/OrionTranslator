@@ -41,3 +41,14 @@ impl DetectionResult {
             .unwrap_or(false)
     }
 }
+
+impl Default for DetectionResult {
+    fn default() -> Self {
+        Self {
+            line_type: LineType::Narration,
+            dominant_category: None,
+            matches: vec![],
+            actions: HashMap::new(),
+        }
+    }
+}

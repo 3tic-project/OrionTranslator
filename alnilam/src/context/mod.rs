@@ -4,4 +4,7 @@ mod trie;
 mod types;
 
 pub use detector::ContextDetector;
-pub use selector::select_context;
+pub use selector::{
+    precompute_context, select_context, select_context_precomputed, PrecomputedContext,
+    SelectionResult,
+};

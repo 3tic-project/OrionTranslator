@@ -13,7 +13,10 @@ use crate::checker::{AutoFixer, ErrorRecord, ErrorType, ResponseChecker};
 use crate::config::{
     PipelineConfig, DEFAULT_CONTEXT_WINDOW_MIN, DEFAULT_CONTEXT_WINDOW_MULTIPLIER,
 };
-use crate::context::{select_context, ContextDetector};
+use crate::context::{
+    precompute_context, select_context, select_context_precomputed, ContextDetector,
+    PrecomputedContext,
+};
 use crate::epub::{EpubHandler, TranslationBlock};
 use crate::llm::LlmClient;
 use crate::txt;
@@ -255,6 +258,20 @@ fn load_glossary_text(config: &PipelineConfig) -> String {
     }
 }
 
+/// 加载术语表并格式化为 Orion 模型专用格式（与 SFT 训练一致）
+fn load_orion_glossary_text(config: &PipelineConfig) -> Option<String> {
+    use crate::llm::glossary;
+    match &config.glossary_path {
+        Some(path) if path.exists() => {
+            match glossary::load_glossary(path) {
+                Ok(entries) => glossary::format_glossary_for_orion(&entries),
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 // ============================================================================
 // Error Report Generation
 // ============================================================================
@@ -394,6 +411,7 @@ fn check_and_fix_translations(
 // Context Building
 // ============================================================================
 
+#[allow(dead_code)]
 fn build_context_for_batch(
     detector: Option<&ContextDetector>,
     all_src_lines: &[String],
@@ -419,6 +437,52 @@ fn build_context_for_batch(
                 }
                 Err(e) => {
                     tracing::debug!("Context detector fallback: {}", e);
+                }
+            }
+        }
+    }
+
+    // Fallback: simple previous lines
+    let context_start = start_idx.saturating_sub(context_lines);
+    (context_start..start_idx)
+        .filter(|&i| i < data_len)
+        .map(|i| all_src_lines[i].clone())
+        .collect()
+}
+
+/// 使用预计算上下文数据构建批次上下文（高效版本）
+fn build_context_for_batch_precomputed(
+    precomputed: Option<&PrecomputedContext>,
+    all_src_lines: &[String],
+    start_idx: usize,
+    end_idx: usize,
+    context_lines: usize,
+    data_len: usize,
+) -> Vec<String> {
+    if let Some(pc) = precomputed {
+        if start_idx > 0 {
+            let window = (context_lines * DEFAULT_CONTEXT_WINDOW_MULTIPLIER)
+                .max(DEFAULT_CONTEXT_WINDOW_MIN);
+            match select_context_precomputed(
+                all_src_lines,
+                pc,
+                start_idx + 1,
+                end_idx,
+                window,
+                context_lines,
+            ) {
+                Ok(sel) => {
+                    return sel.selected.iter().map(|s| {
+                        // precomputed 版本返回的 text 为空，需要从原始数据获取
+                        if s.text.is_empty() {
+                            all_src_lines[s.line_number - 1].clone()
+                        } else {
+                            s.text.clone()
+                        }
+                    }).collect();
+                }
+                Err(e) => {
+                    tracing::debug!("Context precomputed fallback: {}", e);
                 }
             }
         }
@@ -553,6 +617,7 @@ async fn retry_failed_with_context(
         let top_p = llm.top_p();
         let top_k = llm.top_k();
         let glossary_text = llm.glossary_text().to_string();
+        let orion_glossary_text = llm.orion_glossary_text().map(|s| s.to_string());
         let api_key = llm.api_key().cloned();
         let err_rec = error_records.clone();
         let task_cancel = cancel_flag.clone();
@@ -569,7 +634,7 @@ async fn retry_failed_with_context(
             }
             let retry_llm = LlmClient::with_params(
                 &llm_url, &model, 1, temperature, top_p, top_k,
-                glossary_text, api_key,
+                glossary_text, orion_glossary_text, api_key,
             )?;
             let result = retry_llm.translate_single(&src_text, &full_context, &batch_id).await?;
             Ok::<_, anyhow::Error>((idx, src_text, result, err_rec))
@@ -718,6 +783,11 @@ pub async fn translate_epub(
         message: format!("提取到 {} 个可翻译文本块", data.len()),
     });
 
+    // Precompute context for all lines (efficient: O(n) total instead of O(n^2))
+    let precomputed: Arc<Option<PrecomputedContext>> = Arc::new(
+        detector.as_ref().as_ref().map(|det| precompute_context(det, &all_src_lines))
+    );
+
     // Create work directory for intermediate data
     let work_dir = create_work_dir(output_epub)?;
     println!("工作目录: {}", work_dir.display());
@@ -754,7 +824,8 @@ pub async fn translate_epub(
     });
 
     let glossary_text = load_glossary_text(config);
-    let llm = LlmClient::with_params(&config.llm_url, &config.model, 3, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), config.api_key.clone())?;
+    let orion_glossary_text = load_orion_glossary_text(config);
+    let llm = LlmClient::with_params(&config.llm_url, &config.model, 3, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), orion_glossary_text.clone(), config.api_key.clone())?;
     let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
 
@@ -801,8 +872,8 @@ pub async fn translate_epub(
                 .map(|b| b.src_text.clone())
                 .collect();
 
-            let context = build_context_for_batch(
-                detector.as_ref().as_ref(),
+            let context = build_context_for_batch_precomputed(
+                precomputed.as_ref().as_ref(),
                 &all_src_lines,
                 start_idx,
                 end_idx,
@@ -864,6 +935,7 @@ pub async fn translate_epub(
         let semaphore = Arc::new(tokio::sync::Semaphore::new(config.workers));
         let llm = Arc::new(llm);
         let detector_arc = detector.clone();
+        let precomputed_arc = precomputed.clone();
         let all_src_lines = Arc::new(all_src_lines.clone());
         let data_arc = Arc::new(data.clone());
         let checker = Arc::new(checker);
@@ -894,7 +966,8 @@ pub async fn translate_epub(
 
             let sem = semaphore.clone();
             let llm = llm.clone();
-            let det = detector_arc.clone();
+            let _det = detector_arc.clone();
+            let pc = precomputed_arc.clone();
             let src_lines = all_src_lines.clone();
             let data_c = data_arc.clone();
             let chk = checker.clone();
@@ -912,8 +985,8 @@ pub async fn translate_epub(
                     .map(|b| b.src_text.clone())
                     .collect();
 
-                let context = build_context_for_batch(
-                    det.as_ref().as_ref(),
+                let context = build_context_for_batch_precomputed(
+                    pc.as_ref().as_ref(),
                     &src_lines,
                     start_idx,
                     end_idx,
@@ -1068,7 +1141,7 @@ pub async fn translate_epub(
             .map(|(i, b)| (b.src_text.clone(), translations.get(&i).cloned()))
             .collect();
 
-        let llm_retry = LlmClient::with_params(&config.llm_url, &config.model, 1, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), config.api_key.clone())?;
+        let llm_retry = LlmClient::with_params(&config.llm_url, &config.model, 1, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), orion_glossary_text.clone(), config.api_key.clone())?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");
 
@@ -1367,7 +1440,8 @@ pub async fn translate_txt(
         detail: "调用 LLM 进行翻译...".into(),
     });
     let glossary_text = load_glossary_text(config);
-    let llm = LlmClient::with_params(&config.llm_url, &config.model, 3, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), config.api_key.clone())?;
+    let orion_glossary_text = load_orion_glossary_text(config);
+    let llm = LlmClient::with_params(&config.llm_url, &config.model, 3, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), orion_glossary_text.clone(), config.api_key.clone())?;
     let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
 
@@ -1380,6 +1454,11 @@ pub async fn translate_txt(
 
     let all_src_lines: Arc<Vec<String>> = Arc::new(data.iter().map(|b| b.src_text.clone()).collect());
     let detector: Arc<Option<ContextDetector>> = Arc::new(detector);
+
+    // Precompute context for all lines
+    let precomputed: Arc<Option<PrecomputedContext>> = Arc::new(
+        detector.as_ref().as_ref().map(|det| precompute_context(det, &all_src_lines))
+    );
 
     let mut translated_count = translations.len();
     let mut fixed_count = 0usize;
@@ -1416,8 +1495,8 @@ pub async fn translate_txt(
                 .map(|b| b.src_text.clone())
                 .collect();
 
-            let context = build_context_for_batch(
-                detector.as_ref().as_ref(),
+            let context = build_context_for_batch_precomputed(
+                precomputed.as_ref().as_ref(),
                 &all_src_lines,
                 start_idx,
                 end_idx,
@@ -1499,7 +1578,7 @@ pub async fn translate_txt(
 
             let sem = semaphore.clone();
             let llm = llm.clone();
-            let det = detector.clone();
+            let pc = precomputed.clone();
             let src_lines = all_src_lines.clone();
             let data_c = data_arc.clone();
             let chk = checker.clone();
@@ -1517,8 +1596,8 @@ pub async fn translate_txt(
                     .map(|b| b.src_text.clone())
                     .collect();
 
-                let context = build_context_for_batch(
-                    det.as_ref().as_ref(),
+                let context = build_context_for_batch_precomputed(
+                    pc.as_ref().as_ref(),
                     &src_lines,
                     start_idx,
                     end_idx,
@@ -1669,7 +1748,7 @@ pub async fn translate_txt(
             .map(|(i, b)| (b.src_text.clone(), translations.get(&i).cloned()))
             .collect();
 
-        let llm_retry = LlmClient::with_params(&config.llm_url, &config.model, 1, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), config.api_key.clone())?;
+        let llm_retry = LlmClient::with_params(&config.llm_url, &config.model, 1, config.temperature, Some(config.top_p), Some(config.top_k), glossary_text.clone(), orion_glossary_text.clone(), config.api_key.clone())?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");
 

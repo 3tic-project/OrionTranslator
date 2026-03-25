@@ -54,12 +54,14 @@ pub struct LlmClient {
     top_p: Option<f64>,
     top_k: Option<u32>,
     glossary_text: String,
+    /// Orion 模型专用术语表（与 SFT 训练格式一致：术语表：\nJA→ZH\n）
+    orion_glossary_text: Option<String>,
     api_key: Option<String>,
 }
 
 impl LlmClient {
     pub fn new(llm_url: &str, model: &str, max_retries: usize) -> Result<Self> {
-        Self::with_params(llm_url, model, max_retries, 0.8, None, None, String::new(), None)
+        Self::with_params(llm_url, model, max_retries, 0.8, None, None, String::new(), None, None)
     }
 
     pub fn with_params(
@@ -70,6 +72,7 @@ impl LlmClient {
         top_p: Option<f64>,
         top_k: Option<u32>,
         glossary_text: String,
+        orion_glossary_text: Option<String>,
         api_key: Option<String>,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
@@ -86,6 +89,7 @@ impl LlmClient {
             top_p,
             top_k,
             glossary_text,
+            orion_glossary_text,
             api_key,
         })
     }
@@ -116,6 +120,10 @@ impl LlmClient {
 
     pub fn glossary_text(&self) -> &str {
         &self.glossary_text
+    }
+
+    pub fn orion_glossary_text(&self) -> Option<&str> {
+        self.orion_glossary_text.as_deref()
     }
 
     pub fn api_key(&self) -> Option<&String> {
@@ -226,7 +234,7 @@ impl LlmClient {
         let context: Vec<String> = vec![];
 
         let prompt_text = if self.is_orion_model() {
-            prompt::build_prompt_with_context(&test_texts, &context)
+            prompt::build_prompt_with_context(&test_texts, &context, self.orion_glossary_text.as_deref())
         } else {
             prompt::build_common_prompt_with_context(&test_texts, &context, &self.glossary_text)
         };
@@ -257,7 +265,7 @@ impl LlmClient {
         batch_id: &str,
     ) -> Result<HashMap<usize, String>> {
         let prompt_text = if self.is_orion_model() {
-            prompt::build_prompt_with_context(texts, context)
+            prompt::build_prompt_with_context(texts, context, self.orion_glossary_text.as_deref())
         } else {
             prompt::build_common_prompt_with_context(texts, context, &self.glossary_text)
         };
@@ -280,22 +288,18 @@ impl LlmClient {
         batch_id: &str,
     ) -> Result<Option<String>> {
         let prompt_text = if self.is_orion_model() {
-            prompt::build_single_prompt_with_context(text, context)
+            prompt::build_single_prompt_with_context(text, context, self.orion_glossary_text.as_deref())
         } else {
             prompt::build_common_single_prompt_with_context(text, context, &self.glossary_text)
         };
         let response = self.call(&prompt_text, batch_id).await?;
-        if self.is_orion_model() {
-            Ok(response.map(|s| s.trim().to_string()))
-        } else {
-            // 通用模型单行也走 JSONL 解析
-            match response {
-                Some(text) => {
-                    let parsed = parse_jsonl_response(&text, 1);
-                    Ok(parsed.get(&1).cloned())
-                }
-                None => Ok(None),
+        // Orion 模型现在也输出 JSONL 格式（与 SFT 训练一致），统一用 JSONL 解析
+        match response {
+            Some(text) => {
+                let parsed = parse_jsonl_response(&text, 1);
+                Ok(parsed.get(&1).cloned())
             }
+            None => Ok(None),
         }
     }
 }

@@ -628,7 +628,7 @@ impl OrionApp {
             let result = smol::unblock(move || {
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
                 rt.block_on(async {
-                    let llm = LlmClient::with_params(&url, &mdl, 1, 0.8, None, None, String::new(), api_key)?;
+                    let llm = LlmClient::with_params(&url, &mdl, 1, 0.8, None, None, String::new(), None, api_key)?;
 
                     let result = if llm.is_orion_model() {
                         tokio::time::timeout(Duration::from_secs(30), async {
@@ -985,6 +985,7 @@ impl OrionApp {
                                 None,
                                 None,
                                 String::new(),
+                                None,
                                 Some(test_key),
                             )?;
                             let test_result = tokio::time::timeout(
