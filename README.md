@@ -196,7 +196,7 @@ OrionTranslator/
 
 ### 环境要求
 
-- **Rust** stable 1.85+（alnitak 需要 edition 2024）
+- **Rust** stable 1.85+
 - **GPU**：支持 wgpu 的显卡（Metal/Vulkan/DX12）
 - **NER 模型文件**（术语表功能）：`model.safetensors`、`config.json`、`vocab.txt`、`system.dic.zst`
 - **LLM API**：任何 OpenAI-compatible Chat Completions 接口
