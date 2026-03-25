@@ -53,7 +53,7 @@ impl ModelPreset {
     pub fn label(self) -> &'static str {
         match self {
             ModelPreset::DeepSeek => "deepseek-chat",
-            ModelPreset::Orion => "Orion-Qwen3.5",
+            ModelPreset::Orion => "Orion",
         }
     }
 
@@ -67,7 +67,7 @@ impl ModelPreset {
     pub fn model_name(self) -> &'static str {
         match self {
             ModelPreset::DeepSeek => "deepseek-chat",
-            ModelPreset::Orion => "Orion-Qwen3.5_SFT_v2603",
+            ModelPreset::Orion => "Orion-Qwen3-1.7B-SFT",
         }
     }
 
