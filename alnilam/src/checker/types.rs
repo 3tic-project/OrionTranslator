@@ -51,4 +51,12 @@ pub struct ErrorRecord {
     pub fixed: bool,
     pub fix_details: String,
     pub retry_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_details: Option<String>,
 }

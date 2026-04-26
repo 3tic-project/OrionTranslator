@@ -2,9 +2,38 @@ use std::collections::HashMap;
 
 use regex::Regex;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParseDiagnostics {
+    pub missing_indices: Vec<usize>,
+    pub duplicate_indices: Vec<usize>,
+    pub out_of_range_indices: Vec<usize>,
+    pub malformed_lines: Vec<String>,
+}
+
+impl ParseDiagnostics {
+    pub fn has_issues(&self) -> bool {
+        !self.missing_indices.is_empty()
+            || !self.duplicate_indices.is_empty()
+            || !self.out_of_range_indices.is_empty()
+            || !self.malformed_lines.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedJsonlResponse {
+    pub translations: HashMap<usize, String>,
+    pub diagnostics: ParseDiagnostics,
+}
+
 /// Parse JSONL response from LLM into {index -> translated_text}
 pub fn parse_jsonl_response(response: &str, _expected_count: usize) -> HashMap<usize, String> {
+    parse_jsonl_response_detailed(response, _expected_count).translations
+}
+
+/// Parse JSONL response from LLM and report structural issues.
+pub fn parse_jsonl_response_detailed(response: &str, expected_count: usize) -> ParsedJsonlResponse {
     let mut results = HashMap::new();
+    let mut diagnostics = ParseDiagnostics::default();
     let response = strip_leading_thinking_content(response);
 
     for line in response.trim().lines() {
@@ -13,18 +42,29 @@ pub fn parse_jsonl_response(response: &str, _expected_count: usize) -> HashMap<u
             continue;
         }
 
+        let mut parsed_any = false;
+
         // Try standard JSON parse first
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(map) = obj.as_object() {
                 for (key, value) in map {
                     if let Ok(idx) = key.parse::<usize>() {
-                        let text = match value {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        results.insert(idx, text);
+                        parsed_any = true;
+                        insert_translation(
+                            &mut results,
+                            &mut diagnostics,
+                            expected_count,
+                            idx,
+                            match value {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            },
+                        );
                     }
                 }
+            }
+            if !parsed_any {
+                diagnostics.malformed_lines.push(line.to_string());
             }
             continue;
         }
@@ -34,19 +74,48 @@ pub fn parse_jsonl_response(response: &str, _expected_count: usize) -> HashMap<u
         for caps in re.captures_iter(line) {
             if let (Some(idx_match), Some(val_match)) = (caps.get(1), caps.get(2)) {
                 if let Ok(idx) = idx_match.as_str().parse::<usize>() {
+                    parsed_any = true;
                     let mut value = val_match.as_str().to_string();
                     value = value.replace("\\n", "\n");
                     value = value.replace("\\r", "\r");
                     value = value.replace("\\t", "\t");
                     value = value.replace("\\\"", "\"");
                     value = value.replace("\\\\", "\\");
-                    results.insert(idx, value);
+                    insert_translation(&mut results, &mut diagnostics, expected_count, idx, value);
                 }
             }
         }
+        if !parsed_any {
+            diagnostics.malformed_lines.push(line.to_string());
+        }
     }
 
-    results
+    for idx in 1..=expected_count {
+        if !results.contains_key(&idx) {
+            diagnostics.missing_indices.push(idx);
+        }
+    }
+
+    ParsedJsonlResponse {
+        translations: results,
+        diagnostics,
+    }
+}
+
+fn insert_translation(
+    results: &mut HashMap<usize, String>,
+    diagnostics: &mut ParseDiagnostics,
+    expected_count: usize,
+    idx: usize,
+    value: String,
+) {
+    if idx == 0 || idx > expected_count {
+        diagnostics.out_of_range_indices.push(idx);
+        return;
+    }
+    if results.insert(idx, value).is_some() {
+        diagnostics.duplicate_indices.push(idx);
+    }
 }
 
 fn strip_leading_thinking_content(response: &str) -> &str {
@@ -109,5 +178,23 @@ mod tests {
 {"1":"你好"}"#;
         let results = parse_jsonl_response(response, 1);
         assert_eq!(results.get(&1).map(|s| s.as_str()), Some("你好"));
+    }
+
+    #[test]
+    fn reports_parse_diagnostics() {
+        let response = r#"{"1":"你好"}
+{"1":"重复"}
+{"3":"越界"}
+not json"#;
+        let parsed = parse_jsonl_response_detailed(response, 2);
+
+        assert_eq!(
+            parsed.translations.get(&1).map(|s| s.as_str()),
+            Some("重复")
+        );
+        assert_eq!(parsed.diagnostics.missing_indices, vec![2]);
+        assert_eq!(parsed.diagnostics.duplicate_indices, vec![1]);
+        assert_eq!(parsed.diagnostics.out_of_range_indices, vec![3]);
+        assert_eq!(parsed.diagnostics.malformed_lines, vec!["not json"]);
     }
 }

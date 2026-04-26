@@ -3,4 +3,4 @@ pub mod glossary;
 mod parser;
 mod prompt;
 
-pub use client::LlmClient;
+pub use client::{BatchTranslationResponse, LlmClient};

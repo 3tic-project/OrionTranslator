@@ -106,7 +106,7 @@ enum Commands {
         llm_key: Option<String>,
 
         /// LLM 模型名
-        #[arg(long, default_value = "deepseek-chat")]
+        #[arg(long, default_value = "deepseek-v4-flash")]
         llm_model: String,
 
         /// LLM 翻译并发数
@@ -223,8 +223,15 @@ async fn main() -> Result<()> {
         top_p: config::DEFAULT_TOP_P,
         top_k: config::DEFAULT_TOP_K,
         glossary_path: cli.glossary_path,
-        api_key: cli.api_key,
+        api_key: cli
+            .api_key
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty()),
     };
+    pipeline_config.validate()?;
+    for warning in pipeline_config.api_security_warnings() {
+        eprintln!("安全提示: {}", warning);
+    }
 
     let success = if is_txt {
         pipeline::translate_txt(&input, &output, &pipeline_config, None, None).await?
@@ -268,7 +275,7 @@ async fn run_subcommand(cmd: Commands) -> Result<()> {
             // Check that model is generic (non-Orion)
             if !bellatrix::is_generic_model(&llm_model) {
                 eprintln!(
-                    "警告: 术语表生成需要通用模型（如 deepseek-chat），当前模型 \"{}\" 是专用模型",
+                    "警告: 术语表生成需要通用模型（如 deepseek-v4-flash），当前模型 \"{}\" 是专用模型",
                     llm_model
                 );
                 eprintln!("       专用模型不支持 NER 术语翻译任务，请切换到通用模型");

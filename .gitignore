@@ -40,3 +40,7 @@ name-map.txt
 
 # Build distribution output
 dist/
+开发规范.md
+AGENTS.md
+docs/orion-translator-code-review-2026-04-25.md
+docs/translation-test-analysis-2026-04-25.md

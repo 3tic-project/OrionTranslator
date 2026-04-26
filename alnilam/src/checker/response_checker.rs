@@ -14,12 +14,65 @@ fn is_katakana(c: char) -> bool {
     ('\u{30A0}'..='\u{30FF}').contains(&c)
 }
 
+fn is_cjk(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
+        || ('\u{3400}'..='\u{4DBF}').contains(&c)
+        || ('\u{F900}'..='\u{FAFF}').contains(&c)
+}
+
+fn has_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk)
+}
+
 fn is_kana(c: char) -> bool {
     is_hiragana(c) || is_katakana(c)
 }
 
-fn any_kana(text: &str) -> bool {
-    text.chars().any(is_kana)
+fn has_problematic_kana_residue(text: &str) -> bool {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if !is_kana(chars[i].1) {
+            i += 1;
+            continue;
+        }
+
+        let start_byte = chars[i].0;
+        let mut end = i + 1;
+        while end < chars.len() && is_kana(chars[end].1) {
+            end += 1;
+        }
+        let end_byte = chars
+            .get(end)
+            .map(|(byte, _)| *byte)
+            .unwrap_or_else(|| text.len());
+        let run = &text[start_byte..end_byte];
+        let prev = if i == 0 { None } else { Some(chars[i - 1].1) };
+        let next = chars.get(end).map(|(_, c)| *c);
+
+        if !is_allowed_shape_kana(run, prev, next) {
+            return true;
+        }
+        i = end;
+    }
+
+    false
+}
+
+fn is_allowed_shape_kana(run: &str, prev: Option<char>, next: Option<char>) -> bool {
+    let shape_markers = ['字', '形', '型', '状', '口', '角', '弯', '折', '线'];
+    let allowed_runs = [
+        "く", "へ", "し", "つ", "の", "ノ", "ハ", "コ", "ロ", "ニ", "へ", "への",
+    ];
+    let quoted = matches!(prev, Some('“' | '"' | '「' | '『' | '《' | '(' | '（'))
+        && matches!(next, Some('”' | '"' | '」' | '』' | '》' | ')' | '）'));
+
+    if quoted && run.chars().count() <= 2 && allowed_runs.contains(&run) {
+        return true;
+    }
+
+    allowed_runs.contains(&run) && next.is_some_and(|c| shape_markers.contains(&c))
 }
 
 fn is_hangeul(c: char) -> bool {
@@ -177,25 +230,16 @@ impl ResponseChecker {
                 .collect();
         }
 
-        // 3. If already retried too much, skip checks
-        if retry_count >= self.retry_threshold {
-            return srcs
-                .iter()
-                .map(|_| CheckResult {
-                    error: ErrorType::None,
-                    details: String::new(),
-                })
-                .collect();
-        }
-
-        // 4. Per-line check
+        // 3. Per-line check. After retry threshold, keep hard safety checks but
+        // skip soft heuristics that are prone to false positives.
+        let skip_soft_checks = retry_count >= self.retry_threshold;
         srcs.iter()
             .zip(dsts.iter())
-            .map(|(src, dst)| self.check_line(src, dst))
+            .map(|(src, dst)| self.check_line(src, dst, skip_soft_checks))
             .collect()
     }
 
-    fn check_line(&self, src: &str, dst: &str) -> CheckResult {
+    fn check_line(&self, src: &str, dst: &str, skip_soft_checks: bool) -> CheckResult {
         let src = src.trim();
         let dst = dst.trim();
 
@@ -244,6 +288,37 @@ impl ResponseChecker {
             };
         }
 
+        // Kana residue (ja -> other), with small shape-marker tolerance.
+        if self.source_lang == "ja" && self.target_lang != "ja" && has_problematic_kana_residue(dst)
+        {
+            return CheckResult {
+                error: ErrorType::KanaResidue,
+                details: "译文中残留假名".to_string(),
+            };
+        }
+
+        // Hangeul residue (ko -> other)
+        if self.source_lang == "ko" && self.target_lang != "ko" && any_hangeul(dst) {
+            return CheckResult {
+                error: ErrorType::HangeulResidue,
+                details: "译文中残留谚文".to_string(),
+            };
+        }
+
+        if skip_soft_checks {
+            return CheckResult {
+                error: ErrorType::None,
+                details: String::new(),
+            };
+        }
+
+        if src == dst && src.chars().count() >= 3 && has_cjk(src) {
+            return CheckResult {
+                error: ErrorType::HighSimilarity,
+                details: "译文与原文完全相同".to_string(),
+            };
+        }
+
         // Length ratio check
         if src.chars().count() >= 10 && dst.chars().count() >= 5 {
             let ratio = dst.chars().count() as f64 / src.chars().count() as f64;
@@ -287,26 +362,10 @@ impl ResponseChecker {
             }
         }
 
-        // Kana residue (ja -> other)
-        if self.source_lang == "ja" && self.target_lang != "ja" && any_kana(dst) {
-            return CheckResult {
-                error: ErrorType::KanaResidue,
-                details: "译文中残留假名".to_string(),
-            };
-        }
-
-        // Hangeul residue (ko -> other)
-        if self.source_lang == "ko" && self.target_lang != "ko" && any_hangeul(dst) {
-            return CheckResult {
-                error: ErrorType::HangeulResidue,
-                details: "译文中残留谚文".to_string(),
-            };
-        }
-
         // Similarity check
         if self.check_similarity(src, dst) {
             let should_flag = if self.source_lang == "ja" && self.target_lang == "zh" {
-                any_kana(dst)
+                has_problematic_kana_residue(dst)
             } else if self.source_lang == "ko" && self.target_lang == "zh" {
                 any_hangeul(dst)
             } else {
@@ -362,5 +421,32 @@ mod tests {
     fn test_jaccard() {
         assert!(jaccard_similarity("abc", "abc") > 0.99);
         assert!(jaccard_similarity("abc", "xyz") < 0.01);
+    }
+
+    #[test]
+    fn allows_kana_shape_markers() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 2);
+        let srcs = vec!["くの字に曲がる".to_string()];
+        let dsts = vec!["身体弯成く字形".to_string()];
+        let results = checker.check(&srcs, &dsts, 0);
+        assert_eq!(results[0].error, ErrorType::None);
+    }
+
+    #[test]
+    fn still_flags_substantial_kana_residue_after_retries() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 1);
+        let srcs = vec!["今日はいい天気ですね".to_string()];
+        let dsts = vec!["今天はいい天気ですね".to_string()];
+        let results = checker.check(&srcs, &dsts, 1);
+        assert_eq!(results[0].error, ErrorType::KanaResidue);
+    }
+
+    #[test]
+    fn flags_unchanged_cjk_text_before_retry_threshold() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 2);
+        let srcs = vec!["第一章".to_string()];
+        let dsts = vec!["第一章".to_string()];
+        let results = checker.check(&srcs, &dsts, 0);
+        assert_eq!(results[0].error, ErrorType::HighSimilarity);
     }
 }

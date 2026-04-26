@@ -910,42 +910,29 @@ fn build_alias_dst(cluster_key: &str, base_dst: &str, alias: &str) -> String {
     }
 
     if let Some(rest) = alias.strip_prefix(cluster_key) {
-        let mut suffix = rest.to_string();
-        suffix = suffix.replace('\u{3000}', "").trim().to_string();
+        let suffix = rest.replace('\u{3000}', "").trim().to_string();
         if suffix.is_empty() {
             return base_dst.to_string();
         }
-        let mapped = map_suffix(&suffix);
-        if mapped.is_empty() {
-            return base_dst.to_string();
+        if let Some(mapped) = map_suffix(&suffix) {
+            return format!("{}{}", base_dst, mapped);
         }
-        return format!("{}{}", base_dst, mapped);
     }
 
     base_dst.to_string()
 }
 
-fn map_suffix(s: &str) -> String {
+fn map_suffix(s: &str) -> Option<&'static str> {
     match s {
-        "さん" => "".to_string(),
-        "ちゃん" | "チャン" => "酱".to_string(),
-        "くん" | "クン" => "君".to_string(),
-        "君" => "君".to_string(),
-        "先輩" => "前辈".to_string(),
-        "先生" => "老师".to_string(),
-        "部長" => "部长".to_string(),
-        "会長" => "会长".to_string(),
-        "委員長" => "委员长".to_string(),
-        "店長" => "店长".to_string(),
-        "課長" => "课长".to_string(),
-        "社長" => "社长".to_string(),
-        "監督" => "监督".to_string(),
-        "様" | "さま" => "大人".to_string(),
-        "姉" | "姉さん" | "姉ちゃん" => "姐".to_string(),
-        "兄" | "兄さん" | "兄ちゃん" => "哥".to_string(),
-        "妹" => "妹".to_string(),
-        "弟" => "弟".to_string(),
-        _ => "".to_string(),
+        "くん" | "クン" | "君" => Some("君"),
+        "先生" => Some("老师"),
+        "部長" => Some("部长"),
+        "会長" => Some("会长"),
+        "委員長" => Some("委员长"),
+        "店長" => Some("店长"),
+        "課長" => Some("课长"),
+        "社長" => Some("社长"),
+        _ => None,
     }
 }
 
@@ -1049,12 +1036,14 @@ mod tests {
 
     #[test]
     fn test_build_alias_dst() {
-        assert_eq!(
-            build_alias_dst("志喜屋", "志喜屋", "志喜屋先輩"),
-            "志喜屋前辈"
-        );
+        assert_eq!(build_alias_dst("志喜屋", "志喜屋", "志喜屋先輩"), "志喜屋");
         assert_eq!(build_alias_dst("佳樹", "佳树", "佳樹さん"), "佳树");
+        assert_eq!(build_alias_dst("佳樹", "佳树", "佳樹ちゃん"), "佳树");
+        assert_eq!(build_alias_dst("姫乃", "姬乃", "姫乃様"), "姬乃");
         assert_eq!(build_alias_dst("温水", "温水", "温水君"), "温水君");
+        assert_eq!(build_alias_dst("星野", "星野", "星野先生"), "星野老师");
+        assert_eq!(build_alias_dst("美波", "美波", "美波監督"), "美波");
+        assert_eq!(build_alias_dst("ゆづ", "柚", "ゆづ姉"), "柚");
     }
 
     fn m(line: usize, text: &str) -> crate::detector::Mention {

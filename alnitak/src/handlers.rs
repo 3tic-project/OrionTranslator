@@ -1,17 +1,17 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::{anyhow, Result};
 use gpui::*;
 
 use alnilam::pipeline::{self, ProgressCallback, ProgressEvent};
 use alnilam::{
     config::{
-        self, DEFAULT_BATCH_SIZE, DEFAULT_CONTEXT_LINES, DEFAULT_LLM_URL, DEFAULT_MAX_RETRY,
-        DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P, DEFAULT_WORKERS,
-        PipelineConfig, TranslationMode,
+        self, PipelineConfig, TranslationMode, DEFAULT_BATCH_SIZE, DEFAULT_CONTEXT_LINES,
+        DEFAULT_LLM_URL, DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_TOP_K, DEFAULT_TOP_P,
     },
     llm::LlmClient,
 };
@@ -171,58 +171,50 @@ impl OrionApp {
         .detach();
     }
 
-    pub fn build_config(&self, cx: &App, mode: TranslationMode) -> PipelineConfig {
-        let llm_url = self.llm_url_input.read(cx).value().to_string();
-        let model = self.model_input.read(cx).value().to_string();
+    fn parse_config_number<T>(value: &str, label: &str) -> Result<T>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(anyhow!("{} 不能为空", label));
+        }
+        value
+            .parse::<T>()
+            .map_err(|e| anyhow!("{} 必须是有效数字，当前为 {:?}: {}", label, value, e))
+    }
+
+    pub fn build_config(&self, cx: &App, mode: TranslationMode) -> Result<PipelineConfig> {
+        let llm_url = self.llm_url_input.read(cx).value().trim().to_string();
+        let model = self.model_input.read(cx).value().trim().to_string();
         let api_key_raw = self.api_key_input.read(cx).value().to_string();
         let api_key = if api_key_raw.trim().is_empty() {
             None
         } else {
-            Some(api_key_raw)
+            Some(api_key_raw.trim().to_string())
         };
-        let batch_size = self
-            .batch_size_input
-            .read(cx)
-            .value()
-            .parse::<usize>()
-            .unwrap_or(DEFAULT_BATCH_SIZE);
-        let workers = self
-            .workers_input
-            .read(cx)
-            .value()
-            .parse::<usize>()
-            .unwrap_or(DEFAULT_WORKERS);
-        let context_lines = self
-            .context_lines_input
-            .read(cx)
-            .value()
-            .parse::<usize>()
-            .unwrap_or(DEFAULT_CONTEXT_LINES);
-        let max_retry = self
-            .max_retry_input
-            .read(cx)
-            .value()
-            .parse::<usize>()
-            .unwrap_or(DEFAULT_MAX_RETRY);
-        let temperature = self
-            .temperature_input
-            .read(cx)
-            .value()
-            .parse::<f64>()
-            .unwrap_or(DEFAULT_TEMPERATURE);
-        let top_p = self
-            .top_p_input
-            .read(cx)
-            .value()
-            .parse::<f64>()
-            .unwrap_or(DEFAULT_TOP_P);
-        let top_k = self
-            .top_k_input
-            .read(cx)
-            .value()
-            .parse::<u32>()
-            .unwrap_or(DEFAULT_TOP_K);
-        PipelineConfig {
+        let batch_size = Self::parse_config_number::<usize>(
+            &self.batch_size_input.read(cx).value(),
+            "批次大小",
+        )?;
+        let workers =
+            Self::parse_config_number::<usize>(&self.workers_input.read(cx).value(), "并行数")?;
+        let context_lines = Self::parse_config_number::<usize>(
+            &self.context_lines_input.read(cx).value(),
+            "上下文行数",
+        )?;
+        let max_retry = Self::parse_config_number::<usize>(
+            &self.max_retry_input.read(cx).value(),
+            "最大重试次数",
+        )?;
+        let temperature = Self::parse_config_number::<f64>(
+            &self.temperature_input.read(cx).value(),
+            "temperature",
+        )?;
+        let top_p = Self::parse_config_number::<f64>(&self.top_p_input.read(cx).value(), "top_p")?;
+        let top_k = Self::parse_config_number::<u32>(&self.top_k_input.read(cx).value(), "top_k")?;
+        Ok(PipelineConfig {
             llm_url: if llm_url.is_empty() {
                 DEFAULT_LLM_URL.to_string()
             } else {
@@ -246,7 +238,7 @@ impl OrionApp {
             top_k,
             glossary_path: self.glossary_path.clone(),
             api_key,
-        }
+        })
     }
 
     fn sanitize_model_name(model: &str) -> String {
@@ -292,8 +284,36 @@ impl OrionApp {
             return;
         }
 
-        let config_bilingual = self.build_config(cx, TranslationMode::Bilingual);
-        let config_mono = self.build_config(cx, TranslationMode::Replace);
+        let config_bilingual = match self.build_config(cx, TranslationMode::Bilingual) {
+            Ok(config) => config,
+            Err(e) => {
+                self.add_log(&format!("配置错误: {}", e));
+                cx.notify();
+                return;
+            }
+        };
+        let config_mono = match self.build_config(cx, TranslationMode::Replace) {
+            Ok(config) => config,
+            Err(e) => {
+                self.add_log(&format!("配置错误: {}", e));
+                cx.notify();
+                return;
+            }
+        };
+
+        if let Err(e) = config_bilingual.validate() {
+            self.add_log(&format!("配置错误: {}", e));
+            cx.notify();
+            return;
+        }
+        if let Err(e) = config_mono.validate() {
+            self.add_log(&format!("配置错误: {}", e));
+            cx.notify();
+            return;
+        }
+        for warning in config_bilingual.api_security_warnings() {
+            self.add_log(&format!("安全提示: {}", warning));
+        }
 
         let model_name = config_bilingual.model.clone();
         let output_bilingual_path = if self.output_bilingual {
@@ -353,6 +373,7 @@ impl OrionApp {
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.cancel_flag = Some(cancel_flag.clone());
+        let completed_with_errors = Arc::new(AtomicBool::new(false));
         cx.notify();
 
         let entity = cx.entity();
@@ -361,7 +382,11 @@ impl OrionApp {
         let (progress_tx, progress_rx) = smol::channel::unbounded::<ProgressEvent>();
 
         // Build the progress callback (runs in the background tokio thread)
+        let callback_completed_with_errors = completed_with_errors.clone();
         let progress_cb: ProgressCallback = Some(Arc::new(move |event| {
+            if matches!(event, ProgressEvent::CompletedWithErrors { .. }) {
+                callback_completed_with_errors.store(true, Ordering::Relaxed);
+            }
             let _ = progress_tx.send_blocking(event);
         }));
 
@@ -383,6 +408,9 @@ impl OrionApp {
                             total_lines,
                             translated,
                             failed,
+                            corrected,
+                            quality_failed,
+                            api_failed,
                         } => {
                             if *total > 0 {
                                 this.progress = (*completed as f32 / *total as f32) * 100.0;
@@ -405,8 +433,14 @@ impl OrionApp {
                                 }
                             }
                             this.progress_detail = format!(
-                                "进度 {}/{} | 已译 {} | 失败 {}",
-                                completed, total, translated, failed
+                                "进度 {}/{} | 已译 {} | 修正 {} | 质量失败 {} | API失败 {} | 总失败 {}",
+                                completed,
+                                total,
+                                translated,
+                                corrected,
+                                quality_failed,
+                                api_failed,
+                                failed
                             )
                             .into();
                         }
@@ -419,12 +453,35 @@ impl OrionApp {
                             fixed,
                             failed,
                             output_path,
+                            error_report_path,
                         } => {
                             this.add_log(&format!(
                                 "完成: 总计 {} | 已译 {} | 修复 {} | 失败 {} | 输出: {}",
                                 total, translated, fixed, failed, output_path
                             ));
+                            if let Some(path) = error_report_path {
+                                this.add_log(&format!("错误报告: {}", path));
+                            }
                             this.progress_detail = "当前任务完成".into();
+                        }
+                        ProgressEvent::CompletedWithErrors {
+                            total,
+                            translated,
+                            fixed,
+                            failed,
+                            output_path,
+                            error_report_path,
+                        } => {
+                            this.status = TranslationStatus::CompletedWithErrors;
+                            this.add_log(&format!(
+                                "完成但有错误: 总计 {} | 已译 {} | 修复 {} | 失败 {} | 输出: {}",
+                                total, translated, fixed, failed, output_path
+                            ));
+                            if let Some(path) = error_report_path {
+                                this.add_log(&format!("错误报告: {}", path));
+                            }
+                            this.progress_detail =
+                                format!("当前任务完成，但仍有 {} 项失败", failed).into();
                         }
                         ProgressEvent::Error { message } => {
                             this.add_log(&format!("错误: {}", message));
@@ -451,6 +508,7 @@ impl OrionApp {
                 let cfg_mono = config_mono.clone();
                 let cb = progress_cb.clone();
                 let cancel = Some(cancel_flag.clone());
+                let completed_with_errors = completed_with_errors.clone();
                 move || {
                     let rt =
                         tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -507,7 +565,7 @@ impl OrionApp {
                             .await?
                         };
                         if !ok {
-                            return Ok::<Vec<PathBuf>, anyhow::Error>(Vec::new());
+                            return Ok::<(Vec<PathBuf>, bool), anyhow::Error>((Vec::new(), false));
                         }
                         let mut outputs = vec![primary_output.clone()];
 
@@ -552,7 +610,10 @@ impl OrionApp {
                             }
                         }
 
-                        Ok::<Vec<PathBuf>, anyhow::Error>(outputs)
+                        Ok::<(Vec<PathBuf>, bool), anyhow::Error>((
+                            outputs,
+                            completed_with_errors.load(Ordering::Relaxed),
+                        ))
                     })
                 }
             })
@@ -563,16 +624,31 @@ impl OrionApp {
                     return;
                 }
                 match result {
-                    Ok(outputs) if !outputs.is_empty() => {
-                        this.status = TranslationStatus::Completed;
+                    Ok((outputs, had_errors)) if !outputs.is_empty() => {
+                        this.status = if had_errors {
+                            TranslationStatus::CompletedWithErrors
+                        } else {
+                            TranslationStatus::Completed
+                        };
                         this.progress = 100.0;
                         this.remaining_lines = 0;
                         this.eta = Some(Duration::from_secs(0));
                         this.finished_at = Some(Instant::now());
-                        this.progress_detail = "全部任务完成".into();
+                        this.progress_detail = if had_errors {
+                            "全部任务完成，但存在失败项".into()
+                        } else {
+                            "全部任务完成".into()
+                        };
                         this.last_output_paths = outputs.clone();
                         for out in outputs {
-                            this.add_log(&format!("翻译完成! 输出: {}", out.display()));
+                            if had_errors {
+                                this.add_log(&format!(
+                                    "翻译完成（有失败项）! 输出: {}",
+                                    out.display()
+                                ));
+                            } else {
+                                this.add_log(&format!("翻译完成! 输出: {}", out.display()));
+                            }
                         }
                     }
                     Ok(_) => {
@@ -629,8 +705,36 @@ impl OrionApp {
         let api_key = if api_key_raw.trim().is_empty() {
             None
         } else {
-            Some(api_key_raw)
+            Some(api_key_raw.trim().to_string())
         };
+
+        let test_config = PipelineConfig {
+            llm_url: url.clone(),
+            model: mdl.clone(),
+            batch_size: DEFAULT_BATCH_SIZE,
+            context_lines: DEFAULT_CONTEXT_LINES,
+            workers: 1,
+            max_retry: 1,
+            mode: TranslationMode::Bilingual,
+            apply_fixes: true,
+            rules_path: None,
+            translation_gap: Some(config::DEFAULT_TRANSLATION_GAP.to_string()),
+            temperature: DEFAULT_TEMPERATURE,
+            top_p: DEFAULT_TOP_P,
+            top_k: DEFAULT_TOP_K,
+            glossary_path: None,
+            api_key: api_key.clone(),
+        };
+        if let Err(e) = test_config.validate() {
+            self.model_test_ok = Some(false);
+            self.model_test_message = format!("✗ 配置错误: {}", e).into();
+            self.add_log(&format!("模型测试配置错误: {}", e));
+            cx.notify();
+            return;
+        }
+        for warning in test_config.api_security_warnings() {
+            self.add_log(&format!("安全提示: {}", warning));
+        }
 
         self.model_test_running = true;
         self.model_test_ok = None;

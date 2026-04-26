@@ -48,7 +48,7 @@ enum Command {
         llm_key: Option<String>,
 
         /// LLM 模型名
-        #[arg(long, default_value = "deepseek-chat")]
+        #[arg(long, default_value = "deepseek-v4-flash")]
         llm_model: String,
 
         /// LLM 翻译并发数
@@ -114,7 +114,7 @@ enum Command {
         llm_key: Option<String>,
 
         /// LLM 模型名
-        #[arg(long, default_value = "deepseek-chat")]
+        #[arg(long, default_value = "deepseek-v4-flash")]
         llm_model: String,
 
         /// LLM 翻译并发数

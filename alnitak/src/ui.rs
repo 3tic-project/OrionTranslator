@@ -3,7 +3,6 @@ use std::time::Instant;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -11,7 +10,7 @@ use gpui_component::{
     progress::Progress,
     radio::{Radio, RadioGroup},
     spinner::Spinner,
-    v_flex,
+    v_flex, ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
 };
 
 use crate::app::OrionApp;
@@ -630,6 +629,7 @@ impl OrionApp {
             TranslationStatus::Idle => "就绪".into(),
             TranslationStatus::Running => "翻译中...".to_string().into(),
             TranslationStatus::Completed => "完成".to_string().into(),
+            TranslationStatus::CompletedWithErrors => "完成（有错误）".to_string().into(),
             TranslationStatus::Cancelled => "已取消".to_string().into(),
             TranslationStatus::Failed => "失败".into(),
         };
@@ -638,6 +638,7 @@ impl OrionApp {
             TranslationStatus::Idle => cx.theme().muted_foreground,
             TranslationStatus::Running => cx.theme().blue,
             TranslationStatus::Completed => cx.theme().green,
+            TranslationStatus::CompletedWithErrors => cx.theme().yellow,
             TranslationStatus::Cancelled => cx.theme().yellow,
             TranslationStatus::Failed => cx.theme().red,
         };

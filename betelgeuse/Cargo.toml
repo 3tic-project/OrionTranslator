@@ -8,6 +8,7 @@ description = "Shared EPUB/TXT text extraction library"
 anyhow = "1.0"
 regex = "1"
 scraper = "0.25"
+roxmltree = "0.20"
 zip = { version = "8", default-features = false, features = ["deflate", "bzip2", "zstd", "time", "lzma"] }
 log = "0.4"
 ego-tree = "0.10"

@@ -43,14 +43,14 @@ cargo build --release -p alnitak
 
 **2. 配置 LLM**
 
-在界面顶部填写以下信息，内置了三个预设，默认为deepseek-chat：
+在界面顶部填写以下信息，内置了三个预设，默认为deepseek-v4-flash：
 
 `API URL` 直接填写 OpenAI-compatible 的 `BASE_URL`，例如 `https://api.deepseek.com/v1`、`https://ark.cn-beijing.volces.com/api/v3`。
 
 | 字段 | 示例值 | 说明 |
 |------|--------|------|
 | API URL | `https://api.deepseek.com/v1` | 直接填写 OpenAI-compatible `BASE_URL` |
-| 模型名称 | `deepseek-chat` | 填入 `orion` 系列名称可启用专用格式 |
+| 模型名称 | `deepseek-v4-flash` | 填入 `orion` 系列名称可启用专用格式 |
 | API Key | `sk-xxx` | 对应服务的密钥 |
 
 
@@ -72,8 +72,8 @@ cargo build --release -p alnitak
 **输出文件**（与输入文件同目录）：
 
 ```
-novel.ja-zh[deepseek-chat].epub   # 日中双语对照
-novel.zh[deepseek-chat].epub      # 纯中文替换
+novel.ja-zh[deepseek-v4-flash].epub   # 日中双语对照
+novel.zh[deepseek-v4-flash].epub      # 纯中文替换
 novel_translation_data.json       # 翻译数据（支持断点续翻）
 novel_error_report.json           # 错误报告
 ```
@@ -244,7 +244,7 @@ alnilam novel.epub
 # 通用模型 + 术语表
 alnilam novel.epub \
   --llm-url "https://api.deepseek.com/v1" \
-  --model "deepseek-chat" \
+  --model "deepseek-v4-flash" \
   --api-key "sk-xxx" \
   --glossary-path glossary.json
 
@@ -257,7 +257,7 @@ alnilam novel.txt -m replace -w 4
 ```bash
 alnilam glossary novel.epub \
   --llm-key "sk-xxx" \
-  --llm-model "deepseek-chat"
+  --llm-model "deepseek-v4-flash"
 ```
 
 ### 3. 桌面 GUI

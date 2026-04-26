@@ -4,6 +4,33 @@ use regex::Regex;
 
 use super::handler::DocumentItem;
 
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn attr_value(attrs: &str, name: &str) -> Option<String> {
+    let escaped_name = regex::escape(name);
+    for quote in ['"', '\''] {
+        let pattern = format!(
+            r#"(?i)(?:^|\s)(?:xlink:)?{}\s*=\s*{}([^{}]*){}"#,
+            escaped_name, quote, quote, quote
+        );
+        if let Ok(re) = Regex::new(&pattern) {
+            if let Some(value) = re
+                .captures(attrs)
+                .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+            {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 const SAFE_CSS: &str = r#"
 /* Orion Image Fix */
 img {
@@ -98,7 +125,9 @@ fn fix_opf_direction(raw_items: &mut HashMap<String, Vec<u8>>) {
                     let mut new_opf = opf_str.clone();
 
                     // Replace existing page-progression-direction
-                    if let Ok(re) = Regex::new(r#"page-progression-direction="[^"]*""#) {
+                    if let Ok(re) = Regex::new(
+                        r#"(?i)page-progression-direction\s*=\s*"[^"]*"|page-progression-direction\s*=\s*'[^']*'"#,
+                    ) {
                         if re.is_match(&new_opf) {
                             new_opf = re
                                 .replace_all(&new_opf, r#"page-progression-direction="ltr""#)
@@ -125,6 +154,47 @@ fn fix_opf_direction(raw_items: &mut HashMap<String, Vec<u8>>) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::epub::handler::DocumentItem;
+
+    #[test]
+    fn opf_direction_fix_replaces_single_quotes_without_duplicate() {
+        let mut raw_items = HashMap::from([(
+            "OPS/content.opf".to_string(),
+            br#"<package><spine page-progression-direction='rtl'><itemref idref='c1'/></spine></package>"#.to_vec(),
+        )]);
+
+        fix_opf_direction(&mut raw_items);
+        fix_opf_direction(&mut raw_items);
+
+        let opf = String::from_utf8(raw_items.remove("OPS/content.opf").unwrap()).unwrap();
+        assert!(opf.contains(r#"page-progression-direction="ltr""#));
+        assert_eq!(opf.matches("page-progression-direction").count(), 1);
+    }
+
+    #[test]
+    fn simplify_svg_images_is_idempotent() {
+        let mut documents = vec![DocumentItem {
+            id: "chapter".to_string(),
+            name: "Text/chapter.xhtml".to_string(),
+            content: r#"<html><body><svg viewBox='0 0 640 480'><image href='../Images/pic.jpg' width='640' height='480'/></svg></body></html>"#.to_string(),
+        }];
+
+        simplify_svg_images(&mut documents);
+        let once = documents[0].content.clone();
+        simplify_svg_images(&mut documents);
+
+        assert_eq!(documents[0].content, once);
+        assert_eq!(
+            documents[0].content.matches("orion-image-wrapper").count(),
+            1
+        );
+        assert!(documents[0].content.contains(r#"src="../Images/pic.jpg""#));
+    }
+}
+
 /// Simplify SVG-wrapped images to plain <img> tags.
 /// Target: SVGs that contain only a single <image>, no complex shapes.
 /// Matches Python fixer.py `simplify_svg_images()`.
@@ -139,15 +209,9 @@ fn simplify_svg_images(documents: &mut [DocumentItem]) {
         Ok(r) => r,
         Err(_) => return,
     };
-    // Regex to extract href from <image> (xlink:href or href)
-    let href_re = match Regex::new(r#"(?:xlink:)?href="([^"]*)""#) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
     // Regex to extract width/height from <image> or SVG viewBox
-    let img_width_re = Regex::new(r#"width="(\d+)""#).unwrap();
-    let img_height_re = Regex::new(r#"height="(\d+)""#).unwrap();
-    let viewbox_re = Regex::new(r#"viewBox="[\d.]+\s+[\d.]+\s+([\d.]+)\s+([\d.]+)""#).unwrap();
+    let viewbox_re =
+        Regex::new(r#"(?i)viewBox=["'][\d.]+\s+[\d.]+\s+([\d.]+)\s+([\d.]+)["']"#).unwrap();
     // Complex SVG elements that indicate non-simple image wrapper
     let complex_re = match Regex::new(r"(?si)<(path|text|rect|circle|polygon)\b") {
         Ok(r) => r,
@@ -185,25 +249,16 @@ fn simplify_svg_images(documents: &mut [DocumentItem]) {
                 Some(m) => m.as_str(),
                 None => continue,
             };
-            let src = match href_re.captures(image_tag) {
-                Some(c) => c.get(1).map(|m| m.as_str().to_string()),
-                None => continue,
-            };
-            let src = match src {
-                Some(s) => s,
-                None => continue,
+            let Some(src) = attr_value(image_tag, "href") else {
+                continue;
             };
 
             // Extract original dimensions from <image> width/height or SVG viewBox
             // This preserves the intrinsic aspect ratio for the replacement <img>
             let (img_w, img_h) = {
                 // Try <image> width/height first
-                let w = img_width_re
-                    .captures(image_tag)
-                    .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-                let h = img_height_re
-                    .captures(image_tag)
-                    .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+                let w = attr_value(image_tag, "width");
+                let h = attr_value(image_tag, "height");
                 if let (Some(w), Some(h)) = (w, h) {
                     (Some(w), Some(h))
                 } else {
@@ -218,15 +273,18 @@ fn simplify_svg_images(documents: &mut [DocumentItem]) {
 
             // Build replacement with intrinsic dimensions + inline responsive style
             let dim_attrs = match (&img_w, &img_h) {
-                (Some(w), Some(h)) => format!(r#" width="{}" height="{}""#, w, h),
+                (Some(w), Some(h)) => {
+                    format!(r#" width="{}" height="{}""#, escape_attr(w), escape_attr(h))
+                }
                 _ => String::new(),
             };
             let replacement = format!(
                 r#"<div class="orion-image-wrapper"><img src="{}" class="orion-responsive-img"{} style="max-width:100%;max-height:100vh;width:auto;height:auto" alt="illustration"></div>"#,
-                src, dim_attrs
+                escape_attr(&src),
+                dim_attrs
             );
 
-            new_content = new_content.replacen(svg_html, &replacement, 1);
+            new_content.replace_range(m.start()..m.end(), &replacement);
             changed = true;
         }
 

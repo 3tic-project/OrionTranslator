@@ -7,7 +7,7 @@ mod ui;
 mod utils;
 
 use gpui::*;
-use gpui_component::{ActiveTheme, Root, Theme, ThemeMode, TitleBar, h_flex, v_flex};
+use gpui_component::{h_flex, v_flex, ActiveTheme, Root, Theme, ThemeMode, TitleBar};
 use gpui_component_assets::Assets;
 
 use app::OrionApp;

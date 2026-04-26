@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use serde_json;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::checker::{AutoFixer, ErrorRecord, ErrorType, ResponseChecker};
@@ -18,7 +20,7 @@ use crate::context::{
     PrecomputedContext,
 };
 use crate::epub::{EpubHandler, TranslationBlock};
-use crate::llm::LlmClient;
+use crate::llm::{BatchTranslationResponse, LlmClient};
 use crate::txt;
 
 // ============================================================================
@@ -37,6 +39,9 @@ pub enum ProgressEvent {
         total_lines: usize,
         translated: usize,
         failed: usize,
+        corrected: usize,
+        quality_failed: usize,
+        api_failed: usize,
     },
     /// Log message
     Log { message: String },
@@ -47,6 +52,16 @@ pub enum ProgressEvent {
         fixed: usize,
         failed: usize,
         output_path: String,
+        error_report_path: Option<String>,
+    },
+    /// Pipeline completed but some lines still failed
+    CompletedWithErrors {
+        total: usize,
+        translated: usize,
+        fixed: usize,
+        failed: usize,
+        output_path: String,
+        error_report_path: Option<String>,
     },
     /// Pipeline error
     Error { message: String },
@@ -72,6 +87,161 @@ fn is_cancelled(cancel_flag: &CancelFlag) -> bool {
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
+fn batch_progress_event(
+    completed: usize,
+    total: usize,
+    total_lines: usize,
+    translated: usize,
+    corrected: usize,
+    quality_failed: usize,
+    api_failed: usize,
+) -> ProgressEvent {
+    ProgressEvent::BatchProgress {
+        completed,
+        total,
+        total_lines,
+        translated,
+        failed: quality_failed + api_failed,
+        corrected,
+        quality_failed,
+        api_failed,
+    }
+}
+
+fn completion_event(
+    total: usize,
+    translated: usize,
+    fixed: usize,
+    failed: usize,
+    output_path: String,
+    error_report_path: Option<String>,
+) -> ProgressEvent {
+    if failed > 0 {
+        ProgressEvent::CompletedWithErrors {
+            total,
+            translated,
+            fixed,
+            failed,
+            output_path,
+            error_report_path,
+        }
+    } else {
+        ProgressEvent::Completed {
+            total,
+            translated,
+            fixed,
+            failed,
+            output_path,
+            error_report_path,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BatchOutcome {
+    fixed: HashMap<usize, String>,
+    quality_failed: Vec<usize>,
+    api_failed: Vec<usize>,
+    failure_causes: HashMap<usize, FailureCause>,
+    corrected_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailureCause {
+    error_type: String,
+    details: String,
+    stage: String,
+    retry_count: usize,
+}
+
+impl FailureCause {
+    fn new(
+        error_type: impl Into<String>,
+        details: impl Into<String>,
+        stage: impl Into<String>,
+        retry_count: usize,
+    ) -> Self {
+        Self {
+            error_type: error_type.into(),
+            details: details.into(),
+            stage: stage.into(),
+            retry_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BlockReportMetadata {
+    file_name: Option<String>,
+    block_index: usize,
+    title: Option<String>,
+    page_type: String,
+}
+
+fn push_unique(target: &mut Vec<usize>, idx: usize) {
+    if !target.contains(&idx) {
+        target.push(idx);
+    }
+}
+
+fn extend_unique(target: &mut Vec<usize>, indices: impl IntoIterator<Item = usize>) {
+    for idx in indices {
+        push_unique(target, idx);
+    }
+}
+
+fn extend_failure_causes(
+    target: &mut HashMap<usize, FailureCause>,
+    source: HashMap<usize, FailureCause>,
+) {
+    for (idx, cause) in source {
+        target.insert(idx, cause);
+    }
+}
+
+fn failure_cause_entry(cause: &FailureCause) -> serde_json::Value {
+    serde_json::json!({
+        "error_type": &cause.error_type,
+        "details": &cause.details,
+        "stage": &cause.stage,
+        "retry_count": cause.retry_count,
+    })
+}
+
+fn parser_diagnostic_summary(response: &BatchTranslationResponse) -> String {
+    let mut details = Vec::new();
+    if !response.diagnostics.missing_indices.is_empty() {
+        details.push(format!(
+            "missing={:?}",
+            response.diagnostics.missing_indices
+        ));
+    }
+    if !response.diagnostics.duplicate_indices.is_empty() {
+        details.push(format!(
+            "duplicate={:?}",
+            response.diagnostics.duplicate_indices
+        ));
+    }
+    if !response.diagnostics.out_of_range_indices.is_empty() {
+        details.push(format!(
+            "out_of_range={:?}",
+            response.diagnostics.out_of_range_indices
+        ));
+    }
+    if !response.diagnostics.malformed_lines.is_empty() {
+        details.push(format!(
+            "malformed_lines={}",
+            response.diagnostics.malformed_lines.len()
+        ));
+    }
+
+    if details.is_empty() {
+        "LLM 未返回该行 JSONL 译文".to_string()
+    } else {
+        details.join(", ")
+    }
+}
+
 // ============================================================================
 // Work Directory Management
 // ============================================================================
@@ -80,8 +250,8 @@ fn is_cancelled(cancel_flag: &CancelFlag) -> bool {
 /// The directory sits next to the output file and is named `{stem}_work/`.
 ///
 /// Example:
-///   output = `/data/book.ja-zh[deepseek-chat].epub`
-///   work   = `/data/book.ja-zh[deepseek-chat]_work/`
+///   output = `/data/book.ja-zh[deepseek-v4-flash].epub`
+///   work   = `/data/book.ja-zh[deepseek-v4-flash]_work/`
 fn create_work_dir(output_path: &Path) -> Result<PathBuf> {
     let stem = output_path
         .file_stem()
@@ -93,6 +263,129 @@ fn create_work_dir(output_path: &Path) -> Result<PathBuf> {
     Ok(work_dir)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResumeManifest {
+    version: u32,
+    source_kind: String,
+    input_path: String,
+    input_sha256: String,
+    config_sha256: String,
+    model: String,
+    llm_url: String,
+    mode: String,
+    batch_size: usize,
+    context_lines: usize,
+    temperature: String,
+    top_p: String,
+    top_k: u32,
+    glossary_sha256: Option<String>,
+    rules_sha256: Option<String>,
+    extractor_version: String,
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    Ok(sha256_bytes(&std::fs::read(path)?))
+}
+
+fn optional_file_hash(path: Option<&PathBuf>) -> Result<Option<String>> {
+    match path {
+        Some(path) if path.exists() => sha256_file(path).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn rules_hash(config: &PipelineConfig) -> Result<Option<String>> {
+    if let Some(path) = config.rules_path.as_ref() {
+        return optional_file_hash(Some(path));
+    }
+    Ok(EMBEDDED_RULES.map(|rules| sha256_bytes(rules.as_bytes())))
+}
+
+fn build_resume_manifest(
+    source_kind: &str,
+    input_path: &Path,
+    config: &PipelineConfig,
+) -> Result<ResumeManifest> {
+    let input_sha256 = sha256_file(input_path)?;
+    let glossary_sha256 = optional_file_hash(config.glossary_path.as_ref())?;
+    let rules_sha256 = rules_hash(config)?;
+    let config_value = serde_json::json!({
+        "source_kind": source_kind,
+        "input_sha256": &input_sha256,
+        "model": &config.model,
+        "llm_url": &config.llm_url,
+        "mode": config.mode.to_string(),
+        "batch_size": config.batch_size,
+        "context_lines": config.context_lines,
+        "max_retry": config.max_retry,
+        "translation_gap": config.translation_gap.as_deref(),
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "top_k": config.top_k,
+        "glossary_sha256": &glossary_sha256,
+        "rules_sha256": &rules_sha256,
+        "extractor_version": "2026-04-25-positioned-epub-v2",
+    });
+    let config_sha256 = sha256_bytes(serde_json::to_string(&config_value)?.as_bytes());
+
+    Ok(ResumeManifest {
+        version: 1,
+        source_kind: source_kind.to_string(),
+        input_path: input_path.display().to_string(),
+        input_sha256,
+        config_sha256,
+        model: config.model.clone(),
+        llm_url: config.llm_url.clone(),
+        mode: config.mode.to_string(),
+        batch_size: config.batch_size,
+        context_lines: config.context_lines,
+        temperature: config.temperature.to_string(),
+        top_p: config.top_p.to_string(),
+        top_k: config.top_k,
+        glossary_sha256,
+        rules_sha256,
+        extractor_version: "2026-04-25-positioned-epub-v2".to_string(),
+    })
+}
+
+fn load_resume_manifest(work_dir: &Path) -> Result<Option<ResumeManifest>> {
+    let path = work_dir.join("resume_manifest.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path)?;
+    Ok(Some(serde_json::from_str(&content)?))
+}
+
+fn save_resume_manifest(work_dir: &Path, manifest: &ResumeManifest) -> Result<()> {
+    let path = work_dir.join("resume_manifest.json");
+    std::fs::write(path, serde_json::to_string_pretty(manifest)?)?;
+    Ok(())
+}
+
+fn can_resume_from_manifest(work_dir: &Path, current: &ResumeManifest) -> Result<bool> {
+    match load_resume_manifest(work_dir)? {
+        Some(existing) if existing == *current => Ok(true),
+        Some(existing) => {
+            info!(
+                "恢复缓存指纹不匹配，跳过复用。旧 config={}, 新 config={}",
+                existing.config_sha256, current.config_sha256
+            );
+            Ok(false)
+        }
+        None => {
+            info!("未找到恢复指纹，跳过旧缓存复用");
+            Ok(false)
+        }
+    }
+}
+
 /// Save a stage snapshot (EPUB) into the work directory.
 /// `stage_name` examples: `step2_first_pass`, `step3_after_retry`
 fn save_epub_stage(
@@ -101,6 +394,7 @@ fn save_epub_stage(
     data: &[TranslationBlock],
     translations: &HashMap<usize, String>,
     failed_indices: &[usize],
+    failure_causes: &HashMap<usize, FailureCause>,
 ) -> Result<()> {
     // Build the snapshot: enrich data with current translations + failure markers
     let snapshot: Vec<serde_json::Value> = data
@@ -109,13 +403,21 @@ fn save_epub_stage(
         .map(|(i, block)| {
             let mut entry = serde_json::json!({
                 "index": i,
-                "src_text": block.src_text,
+                "global_index": i,
+                "file_name": &block.file_name,
+                "block_index": block.index,
+                "title": &block.title,
+                "page_type": &block.page_type,
+                "src_text": &block.src_text,
             });
             if let Some(dst) = translations.get(&i) {
                 entry["dst_text"] = serde_json::json!(dst);
                 entry["status"] = serde_json::json!("translated");
             } else if failed_indices.contains(&i) {
                 entry["status"] = serde_json::json!("failed");
+                if let Some(cause) = failure_causes.get(&i) {
+                    entry["failure"] = failure_cause_entry(cause);
+                }
             } else {
                 entry["status"] = serde_json::json!("pending");
             }
@@ -146,6 +448,7 @@ fn save_txt_stage(
     data: &[txt::TxtBlock],
     translations: &HashMap<usize, String>,
     failed_indices: &[usize],
+    failure_causes: &HashMap<usize, FailureCause>,
 ) -> Result<()> {
     let snapshot: Vec<serde_json::Value> = data
         .iter()
@@ -153,13 +456,19 @@ fn save_txt_stage(
         .map(|(i, block)| {
             let mut entry = serde_json::json!({
                 "index": i,
-                "src_text": block.src_text,
+                "global_index": i,
+                "block_index": block.index,
+                "page_type": "txt",
+                "src_text": &block.src_text,
             });
             if let Some(dst) = translations.get(&i) {
                 entry["dst_text"] = serde_json::json!(dst);
                 entry["status"] = serde_json::json!("translated");
             } else if failed_indices.contains(&i) {
                 entry["status"] = serde_json::json!("failed");
+                if let Some(cause) = failure_causes.get(&i) {
+                    entry["failure"] = failure_cause_entry(cause);
+                }
             } else {
                 entry["status"] = serde_json::json!("pending");
             }
@@ -274,50 +583,117 @@ fn load_orion_glossary_text(config: &PipelineConfig) -> Option<String> {
 // Error Report Generation
 // ============================================================================
 
+fn epub_report_metadata(data: &[TranslationBlock]) -> Vec<BlockReportMetadata> {
+    data.iter()
+        .map(|block| BlockReportMetadata {
+            file_name: Some(block.file_name.clone()),
+            block_index: block.index,
+            title: Some(block.title.clone()),
+            page_type: block.page_type.clone(),
+        })
+        .collect()
+}
+
+fn txt_report_metadata(data: &[txt::TxtBlock]) -> Vec<BlockReportMetadata> {
+    data.iter()
+        .map(|block| BlockReportMetadata {
+            file_name: None,
+            block_index: block.index,
+            title: None,
+            page_type: "txt".to_string(),
+        })
+        .collect()
+}
+
+fn error_report_entry(
+    record: &ErrorRecord,
+    metadata: Option<&BlockReportMetadata>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "index": record.index,
+        "global_index": record.index,
+        "src_text": &record.src_text,
+        "dst_text": &record.dst_text,
+        "error_type": &record.error_type,
+        "fix_details": &record.fix_details,
+        "retry_count": record.retry_count,
+    });
+
+    if let Some(metadata) = metadata {
+        entry["block_index"] = serde_json::json!(metadata.block_index);
+        entry["page_type"] = serde_json::json!(&metadata.page_type);
+        if let Some(file_name) = &metadata.file_name {
+            entry["file_name"] = serde_json::json!(file_name);
+        }
+        if let Some(title) = &metadata.title {
+            entry["title"] = serde_json::json!(title);
+        }
+    }
+
+    if let Some(stage) = &record.stage {
+        entry["stage"] = serde_json::json!(stage);
+    }
+    if let Some(details) = &record.details {
+        entry["details"] = serde_json::json!(details);
+    }
+    if let Some(last_error_type) = &record.last_error_type {
+        entry["last_error_type"] = serde_json::json!(last_error_type);
+    }
+    if let Some(last_error_details) = &record.last_error_details {
+        entry["last_error_details"] = serde_json::json!(last_error_details);
+    }
+
+    entry
+}
+
 fn generate_error_report(
     error_records: &[ErrorRecord],
     work_dir: &Path,
+    metadata: Option<&[BlockReportMetadata]>,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    let mut total_errors: u64 = 0;
-    let mut fixed_count: u64 = 0;
+    let mut total_records: u64 = 0;
+    let mut normalization_count: u64 = 0;
+    let mut fixed_quality_count: u64 = 0;
     let mut failed_count: u64 = 0;
-    let mut fixed_list = Vec::new();
+    let mut normalization_list = Vec::new();
+    let mut fixed_quality_list = Vec::new();
     let mut failed_list = Vec::new();
 
     for record in error_records {
-        total_errors += 1;
+        total_records += 1;
+        let entry = error_report_entry(record, metadata.and_then(|items| items.get(record.index)));
 
-        let entry = serde_json::json!({
-            "index": record.index,
-            "src_text": record.src_text,
-            "dst_text": record.dst_text,
-            "error_type": record.error_type,
-            "fix_details": record.fix_details,
-            "retry_count": record.retry_count,
-        });
-
-        if record.fixed {
-            fixed_count += 1;
-            fixed_list.push(entry);
+        if record.fixed && record.error_type == "AUTO_FIX" {
+            normalization_count += 1;
+            normalization_list.push(entry);
+        } else if record.fixed {
+            fixed_quality_count += 1;
+            fixed_quality_list.push(entry);
         } else {
             failed_count += 1;
             failed_list.push(entry);
         }
     }
 
+    let report_path = work_dir.join("error_report.json");
     let summary = serde_json::json!({
-        "total_errors": total_errors,
-        "fixed": fixed_count,
+        "total_records": total_records,
+        "total_errors": fixed_quality_count + failed_count,
+        "normalizations": normalization_count,
+        "fixed": fixed_quality_count,
+        "fixed_quality_errors": fixed_quality_count,
         "failed": failed_count,
+        "report_path": report_path.display().to_string(),
     });
 
     let report = serde_json::json!({
         "summary": summary,
-        "fixed": fixed_list,
+        "normalizations": normalization_list,
+        "fixed": fixed_quality_list.clone(),
+        "fixed_quality_errors": fixed_quality_list,
         "failed": failed_list,
     });
 
-    let report_path = work_dir.join("error_report.json");
     std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     let result: HashMap<String, serde_json::Value> =
@@ -337,10 +713,17 @@ fn check_and_fix_translations(
     original_indices: &[usize],
     error_records: &Arc<Mutex<Vec<ErrorRecord>>>,
     retry_count: usize,
-) -> (HashMap<usize, String>, Vec<usize>) {
+) -> (
+    HashMap<usize, String>,
+    Vec<usize>,
+    usize,
+    HashMap<usize, FailureCause>,
+) {
     let check_results = checker.check(srcs, dsts, retry_count);
     let mut fixed_results = HashMap::new();
     let mut failed_indices = Vec::new();
+    let mut corrected_count = 0usize;
+    let mut failure_causes = HashMap::new();
 
     for (i, result) in check_results.iter().enumerate() {
         let orig_idx = original_indices[i];
@@ -352,6 +735,7 @@ fn check_and_fix_translations(
             fixed_results.insert(orig_idx, fixed_dst.clone());
 
             if fixed_dst != *dst {
+                corrected_count += 1;
                 info!(
                     "[#{}] 自动修复: '{:.30}...' -> '{:.30}...'",
                     orig_idx, dst, fixed_dst
@@ -365,6 +749,10 @@ fn check_and_fix_translations(
                     fixed: true,
                     fix_details: format!("Auto-fixed: '{}' -> '{}'", dst, fixed_dst),
                     retry_count,
+                    stage: Some("normalization".to_string()),
+                    details: Some("标点/引号自动正规化".to_string()),
+                    last_error_type: None,
+                    last_error_details: None,
                 });
             }
         } else {
@@ -373,6 +761,7 @@ fn check_and_fix_translations(
 
             if !recheck.is_empty() && recheck[0].error == ErrorType::None {
                 fixed_results.insert(orig_idx, fixed_dst.clone());
+                corrected_count += 1;
                 info!(
                     "[#{}] {} -> 已修复: '{:.20}...' -> '{:.20}...': {}",
                     orig_idx, result.error, dst, fixed_dst, result.details
@@ -386,9 +775,22 @@ fn check_and_fix_translations(
                     fixed: true,
                     fix_details: format!("Auto-fixed: '{}' -> '{}'", dst, fixed_dst),
                     retry_count,
+                    stage: Some("quality_check".to_string()),
+                    details: Some(result.details.clone()),
+                    last_error_type: None,
+                    last_error_details: None,
                 });
             } else {
                 failed_indices.push(orig_idx);
+                failure_causes.insert(
+                    orig_idx,
+                    FailureCause::new(
+                        result.error.to_string(),
+                        result.details.clone(),
+                        "quality_check",
+                        retry_count,
+                    ),
+                );
                 info!(
                     "[#{}] {} 需重试: src='{:.30}...' dst='{:.30}...': {}",
                     orig_idx, result.error, src, dst, result.details
@@ -397,7 +799,79 @@ fn check_and_fix_translations(
         }
     }
 
-    (fixed_results, failed_indices)
+    (
+        fixed_results,
+        failed_indices,
+        corrected_count,
+        failure_causes,
+    )
+}
+
+fn process_batch_response(
+    response: BatchTranslationResponse,
+    start_idx: usize,
+    end_idx: usize,
+    src_text_at: impl Fn(usize) -> String,
+    checker: &ResponseChecker,
+    fixer: &AutoFixer,
+    error_records: &Arc<Mutex<Vec<ErrorRecord>>>,
+) -> BatchOutcome {
+    let mut srcs = Vec::new();
+    let mut dsts = Vec::new();
+    let mut indices = Vec::new();
+    let mut api_failed = Vec::new();
+    let mut failure_causes = HashMap::new();
+    let diagnostic_summary = parser_diagnostic_summary(&response);
+
+    for idx in start_idx..end_idx {
+        let jsonl_idx = idx - start_idx + 1;
+        if let Some(translated) = response.translations.get(&jsonl_idx) {
+            srcs.push(src_text_at(idx));
+            dsts.push(translated.clone());
+            indices.push(idx);
+        } else {
+            push_unique(&mut api_failed, idx);
+            failure_causes.insert(
+                idx,
+                FailureCause::new(
+                    ErrorType::JsonStructureError.to_string(),
+                    format!(
+                        "LLM 响应缺少 JSONL 序号 {}；{}",
+                        jsonl_idx, diagnostic_summary
+                    ),
+                    "first_pass_parser",
+                    0,
+                ),
+            );
+        }
+    }
+
+    if response.diagnostics.has_issues() {
+        warn!(
+            "批次 {}..{} 响应结构异常: {}",
+            start_idx, end_idx, diagnostic_summary
+        );
+    }
+
+    if srcs.is_empty() {
+        return BatchOutcome {
+            api_failed,
+            failure_causes,
+            ..BatchOutcome::default()
+        };
+    }
+
+    let (fixed, quality_failed, corrected_count, quality_failure_causes) =
+        check_and_fix_translations(checker, fixer, &srcs, &dsts, &indices, error_records, 0);
+    failure_causes.extend(quality_failure_causes);
+
+    BatchOutcome {
+        fixed,
+        quality_failed,
+        api_failed,
+        failure_causes,
+        corrected_count,
+    }
 }
 
 // ============================================================================
@@ -507,6 +981,7 @@ async fn retry_failed_with_context(
     failed_indices: &[usize],
     context_lines: usize,
     error_records: &Arc<Mutex<Vec<ErrorRecord>>>,
+    failure_causes: &Arc<Mutex<HashMap<usize, FailureCause>>>,
     max_retry: usize,
     current_retry: usize,
     workers: usize,
@@ -519,6 +994,11 @@ async fn retry_failed_with_context(
 
     if current_retry > max_retry {
         for &idx in failed_indices {
+            let last_cause = failure_causes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&idx)
+                .cloned();
             let mut records = error_records.lock().unwrap_or_else(|e| e.into_inner());
             records.push(ErrorRecord {
                 index: idx,
@@ -528,6 +1008,10 @@ async fn retry_failed_with_context(
                 fixed: false,
                 fix_details: format!("Failed after {} retries", max_retry),
                 retry_count: current_retry,
+                stage: Some("retry".to_string()),
+                details: Some(format!("Failed after {} retries", max_retry)),
+                last_error_type: last_cause.as_ref().map(|cause| cause.error_type.clone()),
+                last_error_details: last_cause.as_ref().map(|cause| cause.details.clone()),
             });
         }
         return Ok(HashMap::new());
@@ -612,31 +1096,34 @@ async fn retry_failed_with_context(
                 .as_ref()
                 .is_some_and(|f| f.load(Ordering::Relaxed))
             {
-                return Ok::<_, anyhow::Error>((idx, src_text, None, err_rec));
+                return (idx, src_text, Ok(None), err_rec);
             }
-            let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
-            // Check cancel again after acquiring permit
-            if task_cancel
-                .as_ref()
-                .is_some_and(|f| f.load(Ordering::Relaxed))
-            {
-                return Ok((idx, src_text, None, err_rec));
+            let result = async {
+                let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+                // Check cancel again after acquiring permit
+                if task_cancel
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+                {
+                    return Ok(None);
+                }
+                let retry_llm = LlmClient::with_params(
+                    &llm_url,
+                    &model,
+                    1,
+                    temperature,
+                    top_p,
+                    top_k,
+                    glossary_text,
+                    orion_glossary_text,
+                    api_key,
+                )?;
+                retry_llm
+                    .translate_single(&src_text, &full_context, &batch_id)
+                    .await
             }
-            let retry_llm = LlmClient::with_params(
-                &llm_url,
-                &model,
-                1,
-                temperature,
-                top_p,
-                top_k,
-                glossary_text,
-                orion_glossary_text,
-                api_key,
-            )?;
-            let result = retry_llm
-                .translate_single(&src_text, &full_context, &batch_id)
-                .await?;
-            Ok::<_, anyhow::Error>((idx, src_text, result, err_rec))
+            .await;
+            (idx, src_text, result, err_rec)
         });
     }
 
@@ -651,16 +1138,21 @@ async fn retry_failed_with_context(
         }
 
         match join_result {
-            Ok(Ok((idx, src_text, Some(translated), _err_rec))) if !translated.is_empty() => {
-                let (fixed_results, _retry_failed) = check_and_fix_translations(
-                    checker,
-                    fixer,
-                    &[src_text.clone()],
-                    &[translated],
-                    &[idx],
-                    error_records,
-                    current_retry,
-                );
+            Ok((idx, src_text, Ok(Some(translated)), _err_rec)) if !translated.is_empty() => {
+                let (fixed_results, _retry_failed, _corrected, retry_failure_causes) =
+                    check_and_fix_translations(
+                        checker,
+                        fixer,
+                        &[src_text.clone()],
+                        &[translated],
+                        &[idx],
+                        error_records,
+                        current_retry,
+                    );
+                if !retry_failure_causes.is_empty() {
+                    let mut causes = failure_causes.lock().unwrap_or_else(|e| e.into_inner());
+                    causes.extend(retry_failure_causes);
+                }
 
                 if let Some(fixed) = fixed_results.get(&idx) {
                     results.insert(idx, fixed.clone());
@@ -672,11 +1164,27 @@ async fn retry_failed_with_context(
                     still_failed.push(idx);
                 }
             }
-            Ok(Ok((idx, _, _, _))) => {
+            Ok((idx, _, Ok(_), _)) => {
+                let mut causes = failure_causes.lock().unwrap_or_else(|e| e.into_inner());
+                causes.insert(
+                    idx,
+                    FailureCause::new(
+                        ErrorType::EmptyTranslation.to_string(),
+                        "重试返回空译文或无可解析译文",
+                        "retry_parser",
+                        current_retry,
+                    ),
+                );
                 still_failed.push(idx);
             }
-            Ok(Err(e)) => {
+            Ok((idx, _, Err(e), _)) => {
                 warn!("重试任务错误: {}", e);
+                let mut causes = failure_causes.lock().unwrap_or_else(|e| e.into_inner());
+                causes.insert(
+                    idx,
+                    FailureCause::new("API_ERROR", e.to_string(), "retry_api", current_retry),
+                );
+                still_failed.push(idx);
             }
             Err(e) => {
                 warn!("重试任务 join 错误: {}", e);
@@ -695,6 +1203,7 @@ async fn retry_failed_with_context(
             &still_failed,
             context_lines,
             error_records,
+            failure_causes,
             max_retry,
             current_retry + 1,
             workers,
@@ -708,6 +1217,11 @@ async fn retry_failed_with_context(
                 "[#{}] 重试{}次后仍失败: '{:.30}...'",
                 idx, current_retry, data[idx].0
             );
+            let last_cause = failure_causes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&idx)
+                .cloned();
             let mut records = error_records.lock().unwrap_or_else(|e| e.into_inner());
             records.push(ErrorRecord {
                 index: idx,
@@ -717,6 +1231,10 @@ async fn retry_failed_with_context(
                 fixed: false,
                 fix_details: format!("Failed after {} retries", current_retry),
                 retry_count: current_retry,
+                stage: Some("retry".to_string()),
+                details: Some(format!("Failed after {} retries", current_retry)),
+                last_error_type: last_cause.as_ref().map(|cause| cause.error_type.clone()),
+                last_error_details: last_cause.as_ref().map(|cause| cause.details.clone()),
             });
         }
     }
@@ -735,6 +1253,8 @@ pub async fn translate_epub(
     progress_cb: ProgressCallback,
     cancel_flag: CancelFlag,
 ) -> Result<bool> {
+    config.validate()?;
+
     // Early cancel check before any work
     if is_cancelled(&cancel_flag) {
         return Ok(false);
@@ -813,10 +1333,12 @@ pub async fn translate_epub(
         .join("translation_data.json")
         .to_string_lossy()
         .to_string();
+    let resume_manifest = build_resume_manifest("epub", input_epub, config)?;
+    let resume_allowed = can_resume_from_manifest(&work_dir, &resume_manifest)?;
 
     // Check for existing translation data (resume support)
     let mut translations: HashMap<usize, String> = HashMap::new();
-    if std::path::Path::new(&json_path).exists() {
+    if resume_allowed && std::path::Path::new(&json_path).exists() {
         if let Ok(existing_data) = EpubHandler::load_translation_data(&json_path) {
             let mut resumed = 0usize;
             for (i, block) in existing_data.iter().enumerate() {
@@ -834,6 +1356,7 @@ pub async fn translate_epub(
     }
 
     EpubHandler::save_translation_data(&data, &json_path)?;
+    save_resume_manifest(&work_dir, &resume_manifest)?;
 
     // ========================================================================
     // Step 2: Translate with LLM
@@ -875,6 +1398,10 @@ pub async fn translate_epub(
     let mut fixed_count = 0usize;
     let mut failed_count = 0usize;
     let mut all_failed_indices: Vec<usize> = Vec::new();
+    let mut quality_failed_indices: Vec<usize> = Vec::new();
+    let mut api_failed_indices: Vec<usize> = Vec::new();
+    let mut failure_causes: HashMap<usize, FailureCause> = HashMap::new();
+    let mut corrected_count = 0usize;
 
     // Process batches (concurrent with semaphore for workers > 1)
     if config.workers <= 1 {
@@ -915,56 +1442,63 @@ pub async fn translate_epub(
                 data.len(),
             );
 
-            let raw_results = llm
-                .translate_batch(&texts, &context, &batch_num.to_string())
-                .await?;
-
-            // Build indices for checking
-            let mut srcs = Vec::new();
-            let mut dsts = Vec::new();
-            let mut indices = Vec::new();
-            let mut missing_indices = Vec::new();
-
-            for idx in start_idx..end_idx {
-                let jsonl_idx = idx - start_idx + 1;
-                if let Some(translated) = raw_results.get(&jsonl_idx) {
-                    srcs.push(data[idx].src_text.clone());
-                    dsts.push(translated.clone());
-                    indices.push(idx);
-                } else {
-                    missing_indices.push(idx);
-                    info!("[#{}] 翻译缺失: LLM 未返回该行翻译", idx);
+            match llm
+                .translate_batch_detailed(&texts, &context, &batch_num.to_string())
+                .await
+            {
+                Ok(response) => {
+                    let outcome = process_batch_response(
+                        response,
+                        start_idx,
+                        end_idx,
+                        |idx| data[idx].src_text.clone(),
+                        &checker,
+                        &fixer,
+                        &error_records,
+                    );
+                    for (idx, translated) in outcome.fixed {
+                        translations.insert(idx, translated);
+                        translated_count += 1;
+                    }
+                    corrected_count += outcome.corrected_count;
+                    extend_failure_causes(&mut failure_causes, outcome.failure_causes);
+                    extend_unique(&mut quality_failed_indices, outcome.quality_failed.clone());
+                    extend_unique(&mut api_failed_indices, outcome.api_failed.clone());
+                    extend_unique(&mut all_failed_indices, outcome.quality_failed);
+                    extend_unique(&mut all_failed_indices, outcome.api_failed);
+                }
+                Err(e) => {
+                    warn!("批次 {} API 错误: {}", batch_num, e);
+                    let failed_range: Vec<usize> = (start_idx..end_idx).collect();
+                    for idx in &failed_range {
+                        failure_causes.insert(
+                            *idx,
+                            FailureCause::new("API_ERROR", e.to_string(), "first_pass_api", 0),
+                        );
+                    }
+                    extend_unique(&mut api_failed_indices, failed_range.clone());
+                    extend_unique(&mut all_failed_indices, failed_range);
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::Log {
+                            message: format!("批次 {} API 错误，将进入重试: {}", batch_num + 1, e),
+                        },
+                    );
                 }
             }
-
-            if !srcs.is_empty() {
-                let (fixed, failed) = check_and_fix_translations(
-                    &checker,
-                    &fixer,
-                    &srcs,
-                    &dsts,
-                    &indices,
-                    &error_records,
-                    0,
-                );
-                for (idx, translated) in fixed {
-                    translations.insert(idx, translated);
-                    translated_count += 1;
-                }
-                all_failed_indices.extend(failed);
-            }
-            all_failed_indices.extend(missing_indices);
 
             pb.inc(1);
             emit_progress(
                 &progress_cb,
-                ProgressEvent::BatchProgress {
-                    completed: batch_num + 1,
-                    total: total_batches,
-                    total_lines: data.len(),
-                    translated: translated_count,
-                    failed: all_failed_indices.len(),
-                },
+                batch_progress_event(
+                    batch_num + 1,
+                    total_batches,
+                    data.len(),
+                    translated_count,
+                    corrected_count,
+                    quality_failed_indices.len(),
+                    api_failed_indices.len(),
+                ),
             );
         }
     } else {
@@ -993,13 +1527,15 @@ pub async fn translate_epub(
                 completed_batches += 1;
                 emit_progress(
                     &progress_cb,
-                    ProgressEvent::BatchProgress {
-                        completed: completed_batches,
-                        total: total_batches,
-                        total_lines: data.len(),
-                        translated: translated_count,
-                        failed: all_failed_indices.len(),
-                    },
+                    batch_progress_event(
+                        completed_batches,
+                        total_batches,
+                        data.len(),
+                        translated_count,
+                        corrected_count,
+                        quality_failed_indices.len(),
+                        api_failed_indices.len(),
+                    ),
                 );
                 continue;
             }
@@ -1017,53 +1553,41 @@ pub async fn translate_epub(
             let context_lines = config.context_lines;
 
             join_set.spawn(async move {
-                let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
-
                 let end_idx = (start_idx + batch_size).min(data_c.len());
-                let texts: Vec<String> = data_c[start_idx..end_idx]
-                    .iter()
-                    .map(|b| b.src_text.clone())
-                    .collect();
+                let result = async {
+                    let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
-                let context = build_context_for_batch_precomputed(
-                    pc.as_ref().as_ref(),
-                    &src_lines,
-                    start_idx,
-                    end_idx,
-                    context_lines,
-                    data_c.len(),
-                );
+                    let texts: Vec<String> = data_c[start_idx..end_idx]
+                        .iter()
+                        .map(|b| b.src_text.clone())
+                        .collect();
 
-                let raw_results = llm
-                    .translate_batch(&texts, &context, &batch_num.to_string())
-                    .await?;
+                    let context = build_context_for_batch_precomputed(
+                        pc.as_ref().as_ref(),
+                        &src_lines,
+                        start_idx,
+                        end_idx,
+                        context_lines,
+                        data_c.len(),
+                    );
 
-                let mut srcs = Vec::new();
-                let mut dsts = Vec::new();
-                let mut indices = Vec::new();
-                let mut missing_indices = Vec::new();
+                    let response = llm
+                        .translate_batch_detailed(&texts, &context, &batch_num.to_string())
+                        .await?;
 
-                for idx in start_idx..end_idx {
-                    let jsonl_idx = idx - start_idx + 1;
-                    if let Some(translated) = raw_results.get(&jsonl_idx) {
-                        srcs.push(data_c[idx].src_text.clone());
-                        dsts.push(translated.clone());
-                        indices.push(idx);
-                    } else {
-                        missing_indices.push(idx);
-                    }
+                    Ok::<_, anyhow::Error>(process_batch_response(
+                        response,
+                        start_idx,
+                        end_idx,
+                        |idx| data_c[idx].src_text.clone(),
+                        &chk,
+                        &fix,
+                        &err_rec,
+                    ))
                 }
+                .await;
 
-                let (fixed, failed) = if !srcs.is_empty() {
-                    check_and_fix_translations(&chk, &fix, &srcs, &dsts, &indices, &err_rec, 0)
-                } else {
-                    (HashMap::new(), Vec::new())
-                };
-
-                let mut all_failed: Vec<usize> = failed;
-                all_failed.extend(missing_indices);
-
-                Ok::<_, anyhow::Error>((fixed, all_failed))
+                (start_idx, end_idx, result)
             });
         }
 
@@ -1093,25 +1617,41 @@ pub async fn translate_epub(
             pb.inc(1);
 
             match join_result {
-                Ok(Ok((fixed, failed))) => {
-                    for (idx, translated) in fixed {
+                Ok((_start_idx, _end_idx, Ok(outcome))) => {
+                    for (idx, translated) in outcome.fixed {
                         translations.insert(idx, translated);
                         translated_count += 1;
                     }
-                    all_failed_indices.extend(failed);
+                    corrected_count += outcome.corrected_count;
+                    extend_failure_causes(&mut failure_causes, outcome.failure_causes);
+                    extend_unique(&mut quality_failed_indices, outcome.quality_failed.clone());
+                    extend_unique(&mut api_failed_indices, outcome.api_failed.clone());
+                    extend_unique(&mut all_failed_indices, outcome.quality_failed);
+                    extend_unique(&mut all_failed_indices, outcome.api_failed);
                     emit_progress(
                         &progress_cb,
-                        ProgressEvent::BatchProgress {
-                            completed: completed_batches,
-                            total: total_batches,
-                            total_lines: data.len(),
-                            translated: translated_count,
-                            failed: all_failed_indices.len(),
-                        },
+                        batch_progress_event(
+                            completed_batches,
+                            total_batches,
+                            data.len(),
+                            translated_count,
+                            corrected_count,
+                            quality_failed_indices.len(),
+                            api_failed_indices.len(),
+                        ),
                     );
                 }
-                Ok(Err(e)) => {
+                Ok((start_idx, end_idx, Err(e))) => {
                     warn!("批次处理错误: {}", e);
+                    let failed_range: Vec<usize> = (start_idx..end_idx).collect();
+                    for idx in &failed_range {
+                        failure_causes.insert(
+                            *idx,
+                            FailureCause::new("API_ERROR", e.to_string(), "first_pass_api", 0),
+                        );
+                    }
+                    extend_unique(&mut api_failed_indices, failed_range.clone());
+                    extend_unique(&mut all_failed_indices, failed_range);
                     emit_progress(
                         &progress_cb,
                         ProgressEvent::Log {
@@ -1120,26 +1660,30 @@ pub async fn translate_epub(
                     );
                     emit_progress(
                         &progress_cb,
-                        ProgressEvent::BatchProgress {
-                            completed: completed_batches,
-                            total: total_batches,
-                            total_lines: data.len(),
-                            translated: translated_count,
-                            failed: all_failed_indices.len(),
-                        },
+                        batch_progress_event(
+                            completed_batches,
+                            total_batches,
+                            data.len(),
+                            translated_count,
+                            corrected_count,
+                            quality_failed_indices.len(),
+                            api_failed_indices.len(),
+                        ),
                     );
                 }
                 Err(e) => {
                     warn!("Task join error: {}", e);
                     emit_progress(
                         &progress_cb,
-                        ProgressEvent::BatchProgress {
-                            completed: completed_batches,
-                            total: total_batches,
-                            total_lines: data.len(),
-                            translated: translated_count,
-                            failed: all_failed_indices.len(),
-                        },
+                        batch_progress_event(
+                            completed_batches,
+                            total_batches,
+                            data.len(),
+                            translated_count,
+                            corrected_count,
+                            quality_failed_indices.len(),
+                            api_failed_indices.len(),
+                        ),
                     );
                 }
             }
@@ -1155,6 +1699,7 @@ pub async fn translate_epub(
         &data,
         &translations,
         &all_failed_indices,
+        &failure_causes,
     )?;
 
     // Also save intermediate translation_data.json for crash recovery
@@ -1214,6 +1759,7 @@ pub async fn translate_epub(
         )?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");
+        let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
 
         let retry_results = retry_failed_with_context(
             &llm_retry,
@@ -1225,12 +1771,17 @@ pub async fn translate_epub(
             &all_failed_indices,
             config.context_lines,
             &error_records,
+            &failure_causes_shared,
             config.max_retry,
             1,
             config.workers,
             &cancel_flag,
         )
         .await?;
+        failure_causes = failure_causes_shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         for (idx, translated) in &retry_results {
             translations.insert(*idx, translated.clone());
@@ -1270,6 +1821,7 @@ pub async fn translate_epub(
             &data,
             &translations,
             &remaining_failed,
+            &failure_causes,
         )?;
     }
 
@@ -1328,7 +1880,8 @@ pub async fn translate_epub(
         let records = error_records.lock().unwrap_or_else(|e| e.into_inner());
         if !records.is_empty() {
             println!("\n生成错误报告...");
-            let summary = generate_error_report(&records, &work_dir)?;
+            let metadata = epub_report_metadata(&data);
+            let summary = generate_error_report(&records, &work_dir, Some(&metadata))?;
             summary
         } else {
             HashMap::new()
@@ -1341,6 +1894,7 @@ pub async fn translate_epub(
     println!("{}", "=".repeat(60));
     println!("总文本块: {}", data.len());
     println!("已翻译: {}", translated_count);
+    println!("自动纠正: {}", corrected_count);
     println!("重试修复: {}", fixed_count);
     println!("失败: {}", failed_count);
     println!("输出 EPUB: {}", output_epub.display());
@@ -1369,15 +1923,20 @@ pub async fn translate_epub(
         );
     }
 
+    let error_report_path = error_summary
+        .get("report_path")
+        .and_then(|v| v.as_str())
+        .map(|path| path.to_string());
     emit_progress(
         &progress_cb,
-        ProgressEvent::Completed {
-            total: data.len(),
-            translated: translated_count,
-            fixed: fixed_count,
-            failed: failed_count,
-            output_path: output_epub.display().to_string(),
-        },
+        completion_event(
+            data.len(),
+            translated_count,
+            fixed_count + corrected_count,
+            failed_count,
+            output_epub.display().to_string(),
+            error_report_path,
+        ),
     );
 
     Ok(true)
@@ -1459,6 +2018,8 @@ pub async fn translate_txt(
     progress_cb: ProgressCallback,
     cancel_flag: CancelFlag,
 ) -> Result<bool> {
+    config.validate()?;
+
     // Early cancel check before any work
     if is_cancelled(&cancel_flag) {
         return Ok(false);
@@ -1519,10 +2080,12 @@ pub async fn translate_txt(
         .join("translation_data.json")
         .to_string_lossy()
         .to_string();
+    let resume_manifest = build_resume_manifest("txt", input_txt, config)?;
+    let resume_allowed = can_resume_from_manifest(&work_dir, &resume_manifest)?;
 
     // Check for existing translation data (resume support, same as EPUB)
     let mut translations: HashMap<usize, String> = HashMap::new();
-    if std::path::Path::new(&txt_json_path).exists() {
+    if resume_allowed && std::path::Path::new(&txt_json_path).exists() {
         if let Ok(existing_data) = load_txt_translation_data(&txt_json_path) {
             let mut resumed = 0usize;
             for (i, block) in existing_data.iter().enumerate() {
@@ -1548,6 +2111,7 @@ pub async fn translate_txt(
     // Save initial data to disk (crash recovery)
     let json_str_init = serde_json::to_string_pretty(&data)?;
     std::fs::write(&txt_json_path, &json_str_init)?;
+    save_resume_manifest(&work_dir, &resume_manifest)?;
 
     // Step 2: Translate
     println!("\n[Step 2/5] 调用 LLM 进行翻译...");
@@ -1593,10 +2157,14 @@ pub async fn translate_txt(
             .map(|det| precompute_context(det, &all_src_lines)),
     );
 
-    let mut translated_count = translations.len();
+    let mut translated_count = 0usize;
     let mut fixed_count = 0usize;
     let mut failed_count = 0usize;
     let mut all_failed_indices: Vec<usize> = Vec::new();
+    let mut quality_failed_indices: Vec<usize> = Vec::new();
+    let mut api_failed_indices: Vec<usize> = Vec::new();
+    let mut failure_causes: HashMap<usize, FailureCause> = HashMap::new();
+    let mut corrected_count = 0usize;
 
     if config.workers <= 1 {
         // Sequential processing
@@ -1637,54 +2205,63 @@ pub async fn translate_txt(
                 data.len(),
             );
 
-            let raw_results = llm
-                .translate_batch(&texts, &context, &batch_num.to_string())
-                .await?;
-
-            let mut srcs = Vec::new();
-            let mut dsts = Vec::new();
-            let mut indices = Vec::new();
-            let mut missing = Vec::new();
-
-            for idx in start_idx..end_idx {
-                let jsonl_idx = idx - start_idx + 1;
-                if let Some(translated) = raw_results.get(&jsonl_idx) {
-                    srcs.push(data[idx].src_text.clone());
-                    dsts.push(translated.clone());
-                    indices.push(idx);
-                } else {
-                    missing.push(idx);
+            match llm
+                .translate_batch_detailed(&texts, &context, &batch_num.to_string())
+                .await
+            {
+                Ok(response) => {
+                    let outcome = process_batch_response(
+                        response,
+                        start_idx,
+                        end_idx,
+                        |idx| data[idx].src_text.clone(),
+                        &checker,
+                        &fixer,
+                        &error_records,
+                    );
+                    for (idx, translated) in outcome.fixed {
+                        translations.insert(idx, translated);
+                        translated_count += 1;
+                    }
+                    corrected_count += outcome.corrected_count;
+                    extend_failure_causes(&mut failure_causes, outcome.failure_causes);
+                    extend_unique(&mut quality_failed_indices, outcome.quality_failed.clone());
+                    extend_unique(&mut api_failed_indices, outcome.api_failed.clone());
+                    extend_unique(&mut all_failed_indices, outcome.quality_failed);
+                    extend_unique(&mut all_failed_indices, outcome.api_failed);
+                }
+                Err(e) => {
+                    warn!("TXT 批次 {} API 错误: {}", batch_num, e);
+                    let failed_range: Vec<usize> = (start_idx..end_idx).collect();
+                    for idx in &failed_range {
+                        failure_causes.insert(
+                            *idx,
+                            FailureCause::new("API_ERROR", e.to_string(), "first_pass_api", 0),
+                        );
+                    }
+                    extend_unique(&mut api_failed_indices, failed_range.clone());
+                    extend_unique(&mut all_failed_indices, failed_range);
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::Log {
+                            message: format!("批次 {} API 错误，将进入重试: {}", batch_num + 1, e),
+                        },
+                    );
                 }
             }
-
-            if !srcs.is_empty() {
-                let (fixed, failed) = check_and_fix_translations(
-                    &checker,
-                    &fixer,
-                    &srcs,
-                    &dsts,
-                    &indices,
-                    &error_records,
-                    0,
-                );
-                for (idx, translated) in fixed {
-                    translations.insert(idx, translated);
-                    translated_count += 1;
-                }
-                all_failed_indices.extend(failed);
-            }
-            all_failed_indices.extend(missing);
 
             pb.inc(1);
             emit_progress(
                 &progress_cb,
-                ProgressEvent::BatchProgress {
-                    completed: batch_num + 1,
-                    total: total_batches,
-                    total_lines: data.len(),
-                    translated: translated_count,
-                    failed: all_failed_indices.len(),
-                },
+                batch_progress_event(
+                    batch_num + 1,
+                    total_batches,
+                    data.len(),
+                    translated_count,
+                    corrected_count,
+                    quality_failed_indices.len(),
+                    api_failed_indices.len(),
+                ),
             );
         }
     } else {
@@ -1710,13 +2287,15 @@ pub async fn translate_txt(
                 completed_batches += 1;
                 emit_progress(
                     &progress_cb,
-                    ProgressEvent::BatchProgress {
-                        completed: completed_batches,
-                        total: total_batches,
-                        total_lines: data.len(),
-                        translated: translated_count,
-                        failed: all_failed_indices.len(),
-                    },
+                    batch_progress_event(
+                        completed_batches,
+                        total_batches,
+                        data.len(),
+                        translated_count,
+                        corrected_count,
+                        quality_failed_indices.len(),
+                        api_failed_indices.len(),
+                    ),
                 );
                 continue;
             }
@@ -1733,53 +2312,41 @@ pub async fn translate_txt(
             let context_lines = config.context_lines;
 
             join_set.spawn(async move {
-                let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
-
                 let end_idx = (start_idx + batch_size).min(data_c.len());
-                let texts: Vec<String> = data_c[start_idx..end_idx]
-                    .iter()
-                    .map(|b| b.src_text.clone())
-                    .collect();
+                let result = async {
+                    let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
-                let context = build_context_for_batch_precomputed(
-                    pc.as_ref().as_ref(),
-                    &src_lines,
-                    start_idx,
-                    end_idx,
-                    context_lines,
-                    data_c.len(),
-                );
+                    let texts: Vec<String> = data_c[start_idx..end_idx]
+                        .iter()
+                        .map(|b| b.src_text.clone())
+                        .collect();
 
-                let raw_results = llm
-                    .translate_batch(&texts, &context, &batch_num.to_string())
-                    .await?;
+                    let context = build_context_for_batch_precomputed(
+                        pc.as_ref().as_ref(),
+                        &src_lines,
+                        start_idx,
+                        end_idx,
+                        context_lines,
+                        data_c.len(),
+                    );
 
-                let mut srcs = Vec::new();
-                let mut dsts = Vec::new();
-                let mut indices = Vec::new();
-                let mut missing = Vec::new();
+                    let response = llm
+                        .translate_batch_detailed(&texts, &context, &batch_num.to_string())
+                        .await?;
 
-                for idx in start_idx..end_idx {
-                    let jsonl_idx = idx - start_idx + 1;
-                    if let Some(translated) = raw_results.get(&jsonl_idx) {
-                        srcs.push(data_c[idx].src_text.clone());
-                        dsts.push(translated.clone());
-                        indices.push(idx);
-                    } else {
-                        missing.push(idx);
-                    }
+                    Ok::<_, anyhow::Error>(process_batch_response(
+                        response,
+                        start_idx,
+                        end_idx,
+                        |idx| data_c[idx].src_text.clone(),
+                        &chk,
+                        &fix,
+                        &err_rec,
+                    ))
                 }
+                .await;
 
-                let (fixed, failed) = if !srcs.is_empty() {
-                    check_and_fix_translations(&chk, &fix, &srcs, &dsts, &indices, &err_rec, 0)
-                } else {
-                    (HashMap::new(), Vec::new())
-                };
-
-                let mut all_failed: Vec<usize> = failed;
-                all_failed.extend(missing);
-
-                Ok::<_, anyhow::Error>((fixed, all_failed))
+                (start_idx, end_idx, result)
             });
         }
 
@@ -1809,25 +2376,41 @@ pub async fn translate_txt(
             pb.inc(1);
 
             match join_result {
-                Ok(Ok((fixed, failed))) => {
-                    for (idx, translated) in fixed {
+                Ok((_start_idx, _end_idx, Ok(outcome))) => {
+                    for (idx, translated) in outcome.fixed {
                         translations.insert(idx, translated);
                         translated_count += 1;
                     }
-                    all_failed_indices.extend(failed);
+                    corrected_count += outcome.corrected_count;
+                    extend_failure_causes(&mut failure_causes, outcome.failure_causes);
+                    extend_unique(&mut quality_failed_indices, outcome.quality_failed.clone());
+                    extend_unique(&mut api_failed_indices, outcome.api_failed.clone());
+                    extend_unique(&mut all_failed_indices, outcome.quality_failed);
+                    extend_unique(&mut all_failed_indices, outcome.api_failed);
                     emit_progress(
                         &progress_cb,
-                        ProgressEvent::BatchProgress {
-                            completed: completed_batches,
-                            total: total_batches,
-                            total_lines: data.len(),
-                            translated: translated_count,
-                            failed: all_failed_indices.len(),
-                        },
+                        batch_progress_event(
+                            completed_batches,
+                            total_batches,
+                            data.len(),
+                            translated_count,
+                            corrected_count,
+                            quality_failed_indices.len(),
+                            api_failed_indices.len(),
+                        ),
                     );
                 }
-                Ok(Err(e)) => {
+                Ok((start_idx, end_idx, Err(e))) => {
                     warn!("TXT 批次处理错误: {}", e);
+                    let failed_range: Vec<usize> = (start_idx..end_idx).collect();
+                    for idx in &failed_range {
+                        failure_causes.insert(
+                            *idx,
+                            FailureCause::new("API_ERROR", e.to_string(), "first_pass_api", 0),
+                        );
+                    }
+                    extend_unique(&mut api_failed_indices, failed_range.clone());
+                    extend_unique(&mut all_failed_indices, failed_range);
                     emit_progress(
                         &progress_cb,
                         ProgressEvent::Log {
@@ -1836,26 +2419,30 @@ pub async fn translate_txt(
                     );
                     emit_progress(
                         &progress_cb,
-                        ProgressEvent::BatchProgress {
-                            completed: completed_batches,
-                            total: total_batches,
-                            total_lines: data.len(),
-                            translated: translated_count,
-                            failed: all_failed_indices.len(),
-                        },
+                        batch_progress_event(
+                            completed_batches,
+                            total_batches,
+                            data.len(),
+                            translated_count,
+                            corrected_count,
+                            quality_failed_indices.len(),
+                            api_failed_indices.len(),
+                        ),
                     );
                 }
                 Err(e) => {
                     warn!("Task join error: {}", e);
                     emit_progress(
                         &progress_cb,
-                        ProgressEvent::BatchProgress {
-                            completed: completed_batches,
-                            total: total_batches,
-                            total_lines: data.len(),
-                            translated: translated_count,
-                            failed: all_failed_indices.len(),
-                        },
+                        batch_progress_event(
+                            completed_batches,
+                            total_batches,
+                            data.len(),
+                            translated_count,
+                            corrected_count,
+                            quality_failed_indices.len(),
+                            api_failed_indices.len(),
+                        ),
                     );
                 }
             }
@@ -1871,6 +2458,7 @@ pub async fn translate_txt(
         &data,
         &translations,
         &all_failed_indices,
+        &failure_causes,
     )?;
 
     // Also save intermediate translation_data.json for crash recovery
@@ -1928,6 +2516,7 @@ pub async fn translate_txt(
         )?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");
+        let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
 
         let retry_results = retry_failed_with_context(
             &llm_retry,
@@ -1939,12 +2528,17 @@ pub async fn translate_txt(
             &all_failed_indices,
             config.context_lines,
             &error_records,
+            &failure_causes_shared,
             config.max_retry,
             1,
             config.workers,
             &cancel_flag,
         )
         .await?;
+        failure_causes = failure_causes_shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         for (idx, translated) in &retry_results {
             translations.insert(*idx, translated.clone());
@@ -1984,6 +2578,7 @@ pub async fn translate_txt(
             &data,
             &translations,
             &remaining_failed,
+            &failure_causes,
         )?;
     }
 
@@ -2032,22 +2627,28 @@ pub async fn translate_txt(
     let error_summary = {
         let records = error_records.lock().unwrap_or_else(|e| e.into_inner());
         if !records.is_empty() {
-            let summary = generate_error_report(&records, &work_dir)?;
+            let metadata = txt_report_metadata(&data);
+            let summary = generate_error_report(&records, &work_dir, Some(&metadata))?;
             summary
         } else {
             HashMap::new()
         }
     };
 
+    let error_report_path = error_summary
+        .get("report_path")
+        .and_then(|v| v.as_str())
+        .map(|path| path.to_string());
     emit_progress(
         &progress_cb,
-        ProgressEvent::Completed {
-            total: data.len(),
-            translated: translated_count,
-            fixed: fixed_count,
-            failed: failed_count,
-            output_path: output_txt.display().to_string(),
-        },
+        completion_event(
+            data.len(),
+            translated_count,
+            fixed_count + corrected_count,
+            failed_count,
+            output_txt.display().to_string(),
+            error_report_path,
+        ),
     );
 
     // Summary
@@ -2056,6 +2657,7 @@ pub async fn translate_txt(
     println!("{}", "=".repeat(60));
     println!("总文本行: {}", data.len());
     println!("已翻译: {}", translated_count);
+    println!("自动纠正: {}", corrected_count);
     println!("重试修复: {}", fixed_count);
     println!("失败: {}", failed_count);
     println!("输出 TXT: {}", output_txt.display());

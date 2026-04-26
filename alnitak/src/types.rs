@@ -15,6 +15,7 @@ pub enum TranslationStatus {
     Idle,
     Running,
     Completed,
+    CompletedWithErrors,
     Cancelled,
     Failed,
 }
@@ -52,21 +53,21 @@ impl ModelPreset {
 
     pub fn label(self) -> &'static str {
         match self {
-            ModelPreset::DeepSeek => "deepseek-chat",
+            ModelPreset::DeepSeek => "deepseek-v4-flash",
             ModelPreset::Orion => "Orion",
         }
     }
 
     pub fn llm_url(self) -> &'static str {
         match self {
-            ModelPreset::DeepSeek => "https://api.deepseek.com/v1",
+            ModelPreset::DeepSeek => "https://api.deepseek.com/",
             ModelPreset::Orion => "http://127.0.0.1:9633/v1",
         }
     }
 
     pub fn model_name(self) -> &'static str {
         match self {
-            ModelPreset::DeepSeek => "deepseek-chat",
+            ModelPreset::DeepSeek => "deepseek-v4-flash",
             ModelPreset::Orion => "Orion-Qwen3-1.7B-SFT",
         }
     }
