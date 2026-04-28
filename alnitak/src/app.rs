@@ -69,31 +69,32 @@ pub struct OrionApp {
 impl OrionApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         use alnilam::config::*;
+        let default_preset = ModelPreset::DeepSeek;
 
         let llm_url_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("LLM API BASE_URL")
-                .default_value(DEFAULT_LLM_URL)
+                .default_value(default_preset.llm_url())
         });
         let model_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("模型名称")
-                .default_value(DEFAULT_MODEL)
+                .default_value(default_preset.model_name())
         });
         let batch_size_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("批次大小")
-                .default_value(&DEFAULT_BATCH_SIZE.to_string())
+                .default_value(&default_preset.batch_size().to_string())
         });
         let workers_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("并行数")
-                .default_value(&DEFAULT_WORKERS.to_string())
+                .default_value(&default_preset.workers().to_string())
         });
         let context_lines_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("上下文行数")
-                .default_value(&DEFAULT_CONTEXT_LINES.to_string())
+                .default_value(&default_preset.context_lines().to_string())
         });
         let max_retry_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -139,7 +140,7 @@ impl OrionApp {
             top_k_input,
             output_bilingual: true,
             output_mono: false,
-            model_preset: ModelPreset::DeepSeek,
+            model_preset: default_preset,
             status: TranslationStatus::Idle,
             progress: 0.0,
             progress_detail: "等待开始".into(),

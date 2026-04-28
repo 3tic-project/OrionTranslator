@@ -43,13 +43,13 @@ cargo build --release -p alnitak
 
 **2. 配置 LLM**
 
-在界面顶部填写以下信息，内置了三个预设，默认为deepseek-v4-flash：
+在界面顶部填写以下信息，内置了三个预设：Deepseek、火山引擎、Orion。默认使用 Deepseek 预设（模型 `deepseek-v4-flash`，上下文行数 16）：
 
 `API URL` 直接填写 OpenAI-compatible 的 `BASE_URL`，例如 `https://api.deepseek.com/v1`、`https://ark.cn-beijing.volces.com/api/v3`。
 
 | 字段 | 示例值 | 说明 |
 |------|--------|------|
-| API URL | `https://api.deepseek.com/v1` | 直接填写 OpenAI-compatible `BASE_URL` |
+| API URL | `https://api.deepseek.com/` | 直接填写 OpenAI-compatible `BASE_URL` |
 | 模型名称 | `deepseek-v4-flash` | 填入 `orion` 系列名称可启用专用格式 |
 | API Key | `sk-xxx` | 对应服务的密钥 |
 
