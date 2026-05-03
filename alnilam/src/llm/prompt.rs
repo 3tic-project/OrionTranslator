@@ -117,6 +117,53 @@ pub fn build_single_prompt_with_context(
 
 /// 通用模型的 prompt 模板（编译期嵌入）
 const COMMON_PROMPT_TEMPLATE: &str = include_str!("../../common_prompt.txt");
+const TRANSLATION_BLOCK_START: &str = "<待翻译内容开始>";
+const TRANSLATION_BLOCK_END: &str = "<待翻译内容结束>";
+
+fn template_line_ending(template: &str) -> &'static str {
+    if template.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn replace_translation_block(template: &str, input_jsonl: &str) -> String {
+    let fallback = || {
+        template
+            .replace("{\"1\": \"\"}\r\n{\"2\": \"\"}", input_jsonl)
+            .replace("{\"1\": \"\"}\n{\"2\": \"\"}", input_jsonl)
+    };
+
+    let Some(start_idx) = template.find(TRANSLATION_BLOCK_START) else {
+        return fallback();
+    };
+    let block_content_start = start_idx + TRANSLATION_BLOCK_START.len();
+    let Some(end_rel_idx) = template[block_content_start..].find(TRANSLATION_BLOCK_END) else {
+        return fallback();
+    };
+    let block_content_end = block_content_start + end_rel_idx;
+    let line_ending = template_line_ending(template);
+
+    let mut result = String::with_capacity(template.len() + input_jsonl.len());
+    result.push_str(&template[..block_content_start]);
+    result.push_str(line_ending);
+    result.push_str(input_jsonl);
+    result.push_str(line_ending);
+    result.push_str(&template[block_content_end..]);
+    result
+}
+
+fn fill_common_prompt_template(
+    input_jsonl: &str,
+    context_text: &str,
+    glossary_text: &str,
+) -> String {
+    let prompt = COMMON_PROMPT_TEMPLATE
+        .replace("{{context}}", context_text)
+        .replace("{{glossary}}", glossary_text);
+    replace_translation_block(&prompt, input_jsonl)
+}
 
 /// 为通用模型构建批量翻译 prompt
 /// - texts: 待翻译文本数组
@@ -134,10 +181,7 @@ pub fn build_common_prompt_with_context(
         context.join("\n")
     };
 
-    COMMON_PROMPT_TEMPLATE
-        .replace("{{context}}", &context_text)
-        .replace("{{glossary}}", glossary_text)
-        .replace("{\"1\": \"\"}\n{\"2\": \"\"}", &input_jsonl)
+    fill_common_prompt_template(&input_jsonl, &context_text, glossary_text)
 }
 
 /// 为通用模型构建单行翻译 prompt（重试时使用）
@@ -154,10 +198,7 @@ pub fn build_common_single_prompt_with_context(
         context.join("\n")
     };
 
-    COMMON_PROMPT_TEMPLATE
-        .replace("{{context}}", &context_text)
-        .replace("{{glossary}}", glossary_text)
-        .replace("{\"1\": \"\"}\n{\"2\": \"\"}", &input_jsonl)
+    fill_common_prompt_template(&input_jsonl, &context_text, glossary_text)
 }
 
 #[cfg(test)]
@@ -177,6 +218,35 @@ mod tests {
         let jsonl = build_input_jsonl(&texts);
         assert!(jsonl.contains("{\"1\":\"こんにちは\"}"));
         assert!(jsonl.contains("{\"2\":\"ありがとう\"}"));
+    }
+
+    #[test]
+    fn test_common_prompt_replaces_translation_block() {
+        let texts = vec![
+            "セーブしますか？".to_string(),
+            "ロードしますか？".to_string(),
+        ];
+        let prompt = build_common_prompt_with_context(&texts, &[], "");
+        assert!(prompt.contains("{\"1\":\"セーブしますか？\"}"));
+        assert!(prompt.contains("{\"2\":\"ロードしますか？\"}"));
+        assert!(!prompt.contains("{\"1\": \"\"}"));
+        assert!(!prompt.contains("{\"2\": \"\"}"));
+    }
+
+    #[test]
+    fn test_common_prompt_replaces_crlf_translation_block() {
+        let template = concat!(
+            "A\r\n",
+            "<待翻译内容开始>\r\n",
+            "{\"1\": \"\"}\r\n",
+            "{\"2\": \"\"}\r\n",
+            "<待翻译内容结束>\r\n",
+            "B"
+        );
+        let prompt = replace_translation_block(template, "{\"1\":\"テスト\"}");
+        assert!(prompt.contains("<待翻译内容开始>\r\n{\"1\":\"テスト\"}\r\n<待翻译内容结束>"));
+        assert!(!prompt.contains("{\"1\": \"\"}"));
+        assert!(!prompt.contains("{\"2\": \"\"}"));
     }
 
     #[test]

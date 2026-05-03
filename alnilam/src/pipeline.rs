@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -23,6 +23,8 @@ use crate::epub::{EpubHandler, TranslationBlock};
 use crate::llm::{BatchTranslationResponse, LlmClient};
 use crate::txt;
 
+const STEP2_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
+
 // ============================================================================
 // Progress Reporting
 // ============================================================================
@@ -42,6 +44,14 @@ pub enum ProgressEvent {
         corrected: usize,
         quality_failed: usize,
         api_failed: usize,
+    },
+    /// Retry progress update
+    RetryProgress {
+        attempt: usize,
+        completed: usize,
+        total: usize,
+        fixed: usize,
+        failed: usize,
     },
     /// Log message
     Log { message: String },
@@ -85,6 +95,22 @@ fn is_cancelled(cancel_flag: &CancelFlag) -> bool {
     cancel_flag
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+fn emit_step2_autosave_log(
+    progress_cb: &ProgressCallback,
+    saved_count: usize,
+    total_count: usize,
+) {
+    emit_progress(
+        progress_cb,
+        ProgressEvent::Log {
+            message: format!(
+                "已保存可恢复进度: {}/{}",
+                saved_count, total_count
+            ),
+        },
+    );
 }
 
 fn batch_progress_event(
@@ -971,6 +997,85 @@ fn build_context_for_batch_precomputed(
 // Retry Failed Translations
 // ============================================================================
 
+fn is_likely_unretryable_llm_error(details: &str) -> bool {
+    let lower = details.to_ascii_lowercase();
+
+    lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("404")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("authentication")
+        || lower.contains("invalid api key")
+        || lower.contains("incorrect api key")
+        || lower.contains("model not found")
+        || lower.contains("model_not_found")
+        || lower.contains("does not exist")
+        || lower.contains("insufficient_quota")
+        || lower.contains("billing")
+        || lower.contains("top_k")
+        || ((lower.contains("unsupported")
+            || lower.contains("unrecognized")
+            || lower.contains("unknown")
+            || lower.contains("invalid"))
+            && (lower.contains("parameter")
+                || lower.contains("argument")
+                || lower.contains("field")))
+}
+
+fn split_retryable_failed_indices(
+    failed_indices: &[usize],
+    failure_causes: &HashMap<usize, FailureCause>,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut retryable = Vec::new();
+    let mut skipped = Vec::new();
+
+    for &idx in failed_indices {
+        let skip = failure_causes.get(&idx).is_some_and(|cause| {
+            cause.stage == "first_pass_api"
+                && cause.error_type == "API_ERROR"
+                && is_likely_unretryable_llm_error(&cause.details)
+        });
+        if skip {
+            skipped.push(idx);
+        } else {
+            retryable.push(idx);
+        }
+    }
+
+    (retryable, skipped)
+}
+
+fn record_skipped_retry_errors(
+    data: &[(String, Option<String>)],
+    skipped_indices: &[usize],
+    error_records: &Arc<Mutex<Vec<ErrorRecord>>>,
+    failure_causes: &HashMap<usize, FailureCause>,
+) {
+    if skipped_indices.is_empty() {
+        return;
+    }
+
+    let mut records = error_records.lock().unwrap_or_else(|e| e.into_inner());
+    for &idx in skipped_indices {
+        let last_cause = failure_causes.get(&idx).cloned();
+        records.push(ErrorRecord {
+            index: idx,
+            src_text: data[idx].0.clone(),
+            dst_text: data[idx].1.clone().unwrap_or_default(),
+            error_type: "UNRETRYABLE_API_ERROR".to_string(),
+            fixed: false,
+            fix_details: "Skipped retry because the first-pass API error is not retryable"
+                .to_string(),
+            retry_count: 0,
+            stage: Some("retry".to_string()),
+            details: last_cause.as_ref().map(|cause| cause.details.clone()),
+            last_error_type: last_cause.as_ref().map(|cause| cause.error_type.clone()),
+            last_error_details: last_cause.as_ref().map(|cause| cause.details.clone()),
+        });
+    }
+}
+
 async fn retry_failed_with_context(
     llm: &LlmClient,
     checker: &ResponseChecker,
@@ -986,6 +1091,7 @@ async fn retry_failed_with_context(
     current_retry: usize,
     workers: usize,
     cancel_flag: &CancelFlag,
+    progress_cb: &ProgressCallback,
 ) -> Result<HashMap<usize, String>> {
     if is_cancelled(cancel_flag) {
         info!("重试被用户取消");
@@ -1019,6 +1125,20 @@ async fn retry_failed_with_context(
 
     let mut results = HashMap::new();
     let mut still_failed = Vec::new();
+    let retry_total = failed_indices.len();
+    let mut retry_completed = 0usize;
+    let mut retry_fixed = 0usize;
+
+    emit_progress(
+        progress_cb,
+        ProgressEvent::RetryProgress {
+            attempt: current_retry,
+            completed: 0,
+            total: retry_total,
+            fixed: 0,
+            failed: 0,
+        },
+    );
 
     // Pre-build context for each failed index
     let mut retry_items: Vec<(usize, Vec<String>)> = Vec::new();
@@ -1137,6 +1257,8 @@ async fn retry_failed_with_context(
             return Ok(results);
         }
 
+        retry_completed += 1;
+
         match join_result {
             Ok((idx, src_text, Ok(Some(translated)), _err_rec)) if !translated.is_empty() => {
                 let (fixed_results, _retry_failed, _corrected, retry_failure_causes) =
@@ -1156,6 +1278,7 @@ async fn retry_failed_with_context(
 
                 if let Some(fixed) = fixed_results.get(&idx) {
                     results.insert(idx, fixed.clone());
+                    retry_fixed += 1;
                     info!(
                         "[#{}] 重试{}成功: '{:.30}...'",
                         idx, current_retry, src_text
@@ -1190,6 +1313,17 @@ async fn retry_failed_with_context(
                 warn!("重试任务 join 错误: {}", e);
             }
         }
+
+        emit_progress(
+            progress_cb,
+            ProgressEvent::RetryProgress {
+                attempt: current_retry,
+                completed: retry_completed,
+                total: retry_total,
+                fixed: retry_fixed,
+                failed: retry_completed.saturating_sub(retry_fixed),
+            },
+        );
     }
 
     if !still_failed.is_empty() && current_retry < max_retry && !is_cancelled(cancel_flag) {
@@ -1208,6 +1342,7 @@ async fn retry_failed_with_context(
             current_retry + 1,
             workers,
             cancel_flag,
+            progress_cb,
         ))
         .await?;
         results.extend(more);
@@ -1738,6 +1873,17 @@ pub async fn translate_epub(
                 detail: format!("重试 {} 个失败的翻译...", all_failed_indices.len()),
             },
         );
+        emit_progress(
+            &progress_cb,
+            ProgressEvent::Log {
+                message: format!(
+                    "重试阶段将按行重新请求，失败项 {} 个，并发 {}，最多 {} 轮",
+                    all_failed_indices.len(),
+                    config.workers,
+                    config.max_retry
+                ),
+            },
+        );
 
         // Build data pairs for retry
         let data_pairs: Vec<(String, Option<String>)> = data
@@ -1745,6 +1891,25 @@ pub async fn translate_epub(
             .enumerate()
             .map(|(i, b)| (b.src_text.clone(), translations.get(&i).cloned()))
             .collect();
+        let (retry_indices, skipped_retry_indices) =
+            split_retryable_failed_indices(&all_failed_indices, &failure_causes);
+        if !skipped_retry_indices.is_empty() {
+            emit_progress(
+                &progress_cb,
+                ProgressEvent::Log {
+                    message: format!(
+                        "跳过 {} 个不可重试的 API 错误项，请先检查 API Key、模型名称、URL 或采样参数",
+                        skipped_retry_indices.len()
+                    ),
+                },
+            );
+            record_skipped_retry_errors(
+                &data_pairs,
+                &skipped_retry_indices,
+                &error_records,
+                &failure_causes,
+            );
+        }
 
         let llm_retry = LlmClient::with_params(
             &config.llm_url,
@@ -1761,23 +1926,28 @@ pub async fn translate_epub(
         let fixer_retry = AutoFixer::new("ja", "zh");
         let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
 
-        let retry_results = retry_failed_with_context(
-            &llm_retry,
-            &checker_retry,
-            &fixer_retry,
-            detector.as_ref().as_ref(),
-            &all_src_lines,
-            &data_pairs,
-            &all_failed_indices,
-            config.context_lines,
-            &error_records,
-            &failure_causes_shared,
-            config.max_retry,
-            1,
-            config.workers,
-            &cancel_flag,
-        )
-        .await?;
+        let retry_results = if retry_indices.is_empty() {
+            HashMap::new()
+        } else {
+            retry_failed_with_context(
+                &llm_retry,
+                &checker_retry,
+                &fixer_retry,
+                detector.as_ref().as_ref(),
+                &all_src_lines,
+                &data_pairs,
+                &retry_indices,
+                config.context_lines,
+                &error_records,
+                &failure_causes_shared,
+                config.max_retry,
+                1,
+                config.workers,
+                &cancel_flag,
+                &progress_cb,
+            )
+            .await?
+        };
         failure_causes = failure_causes_shared
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2496,12 +2666,42 @@ pub async fn translate_txt(
                 detail: format!("重试 {} 个失败的翻译...", all_failed_indices.len()),
             },
         );
+        emit_progress(
+            &progress_cb,
+            ProgressEvent::Log {
+                message: format!(
+                    "重试阶段将按行重新请求，失败项 {} 个，并发 {}，最多 {} 轮",
+                    all_failed_indices.len(),
+                    config.workers,
+                    config.max_retry
+                ),
+            },
+        );
 
         let data_pairs: Vec<(String, Option<String>)> = data
             .iter()
             .enumerate()
             .map(|(i, b)| (b.src_text.clone(), translations.get(&i).cloned()))
             .collect();
+        let (retry_indices, skipped_retry_indices) =
+            split_retryable_failed_indices(&all_failed_indices, &failure_causes);
+        if !skipped_retry_indices.is_empty() {
+            emit_progress(
+                &progress_cb,
+                ProgressEvent::Log {
+                    message: format!(
+                        "跳过 {} 个不可重试的 API 错误项，请先检查 API Key、模型名称、URL 或采样参数",
+                        skipped_retry_indices.len()
+                    ),
+                },
+            );
+            record_skipped_retry_errors(
+                &data_pairs,
+                &skipped_retry_indices,
+                &error_records,
+                &failure_causes,
+            );
+        }
 
         let llm_retry = LlmClient::with_params(
             &config.llm_url,
@@ -2518,23 +2718,28 @@ pub async fn translate_txt(
         let fixer_retry = AutoFixer::new("ja", "zh");
         let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
 
-        let retry_results = retry_failed_with_context(
-            &llm_retry,
-            &checker_retry,
-            &fixer_retry,
-            detector.as_ref().as_ref(),
-            &all_src_lines,
-            &data_pairs,
-            &all_failed_indices,
-            config.context_lines,
-            &error_records,
-            &failure_causes_shared,
-            config.max_retry,
-            1,
-            config.workers,
-            &cancel_flag,
-        )
-        .await?;
+        let retry_results = if retry_indices.is_empty() {
+            HashMap::new()
+        } else {
+            retry_failed_with_context(
+                &llm_retry,
+                &checker_retry,
+                &fixer_retry,
+                detector.as_ref().as_ref(),
+                &all_src_lines,
+                &data_pairs,
+                &retry_indices,
+                config.context_lines,
+                &error_records,
+                &failure_causes_shared,
+                config.max_retry,
+                1,
+                config.workers,
+                &cancel_flag,
+                &progress_cb,
+            )
+            .await?
+        };
         failure_causes = failure_causes_shared
             .lock()
             .unwrap_or_else(|e| e.into_inner())

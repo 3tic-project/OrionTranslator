@@ -147,8 +147,8 @@ impl LlmClient {
         Self {
             client,
             api_url: normalize_chat_completions_endpoint(api_url),
-            api_key: api_key.to_string(),
-            model: model.to_string(),
+            api_key: api_key.trim().to_string(),
+            model: model.trim().to_string(),
         }
     }
 

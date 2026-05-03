@@ -24,8 +24,14 @@ pub fn load_glossary(path: &std::path::Path) -> Result<Vec<GlossaryEntry>> {
 pub fn format_glossary(entries: &[GlossaryEntry]) -> String {
     entries
         .iter()
-        .filter(|e| !e.dst.is_empty())
-        .map(|e| format!("{} -> {}   #{}", e.src, e.dst, e.info))
+        .filter_map(|e| {
+            let src = e.src.trim();
+            let dst = e.dst.trim();
+            if src.is_empty() || dst.is_empty() {
+                return None;
+            }
+            Some(format!("{} -> {}   #{}", src, dst, e.info.trim()))
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -40,8 +46,15 @@ pub fn format_glossary(entries: &[GlossaryEntry]) -> String {
 pub fn format_glossary_for_orion(entries: &[GlossaryEntry]) -> Option<String> {
     let mut pairs: Vec<(&str, &str)> = entries
         .iter()
-        .filter(|e| !e.dst.is_empty())
-        .map(|e| (e.src.as_str(), e.dst.as_str()))
+        .filter_map(|e| {
+            let src = e.src.trim();
+            let dst = e.dst.trim();
+            if src.is_empty() || dst.is_empty() {
+                None
+            } else {
+                Some((src, dst))
+            }
+        })
         .collect();
 
     if pairs.is_empty() {
@@ -90,6 +103,24 @@ mod tests {
     }
 
     #[test]
+    fn test_format_glossary_trims_and_skips_blank_dst() {
+        let entries = vec![
+            GlossaryEntry {
+                src: "  由紀  ".to_string(),
+                dst: "  由纪  ".to_string(),
+                info: "  女性  ".to_string(),
+            },
+            GlossaryEntry {
+                src: "テスト".to_string(),
+                dst: "  ".to_string(),
+                info: String::new(),
+            },
+        ];
+        let text = format_glossary(&entries);
+        assert_eq!(text, "由紀 -> 由纪   #女性");
+    }
+
+    #[test]
     fn test_format_glossary_for_orion() {
         let entries = vec![
             GlossaryEntry {
@@ -115,6 +146,16 @@ mod tests {
         let entries = vec![GlossaryEntry {
             src: "テスト".to_string(),
             dst: String::new(),
+            info: String::new(),
+        }];
+        assert!(format_glossary_for_orion(&entries).is_none());
+    }
+
+    #[test]
+    fn test_format_glossary_for_orion_skips_whitespace_dst() {
+        let entries = vec![GlossaryEntry {
+            src: "テスト".to_string(),
+            dst: "  ".to_string(),
             info: String::new(),
         }];
         assert!(format_glossary_for_orion(&entries).is_none());

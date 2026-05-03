@@ -444,6 +444,19 @@ impl OrionApp {
                             )
                             .into();
                         }
+                        ProgressEvent::RetryProgress {
+                            attempt,
+                            completed,
+                            total,
+                            fixed,
+                            failed,
+                        } => {
+                            this.progress_detail = format!(
+                                "重试第 {} 轮 {}/{} | 修复 {} | 未通过 {}",
+                                attempt, completed, total, fixed, failed
+                            )
+                            .into();
+                        }
                         ProgressEvent::Log { message } => {
                             this.add_log(message);
                         }
@@ -689,8 +702,8 @@ impl OrionApp {
     }
 
     pub fn test_model(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let llm_url = self.llm_url_input.read(cx).value().to_string();
-        let model = self.model_input.read(cx).value().to_string();
+        let llm_url = self.llm_url_input.read(cx).value().trim().to_string();
+        let model = self.model_input.read(cx).value().trim().to_string();
         let api_key_raw = self.api_key_input.read(cx).value().to_string();
         let url = if llm_url.is_empty() {
             DEFAULT_LLM_URL.to_string()
@@ -943,7 +956,7 @@ impl OrionApp {
         };
 
         // 2. Read model name and determine if we skip LLM translation
-        let model = self.model_input.read(cx).value().to_string();
+        let model = self.model_input.read(cx).value().trim().to_string();
         let model_name = if model.is_empty() {
             alnilam::config::DEFAULT_MODEL.to_string()
         } else {
@@ -957,7 +970,7 @@ impl OrionApp {
         }
 
         // 3. Read LLM config
-        let llm_url_raw = self.llm_url_input.read(cx).value().to_string();
+        let llm_url_raw = self.llm_url_input.read(cx).value().trim().to_string();
         let llm_url = if llm_url_raw.is_empty() {
             alnilam::config::DEFAULT_LLM_URL.to_string()
         } else {
@@ -972,7 +985,7 @@ impl OrionApp {
             }
             String::new()
         } else {
-            api_key_raw
+            api_key_raw.trim().to_string()
         };
 
         // Update state

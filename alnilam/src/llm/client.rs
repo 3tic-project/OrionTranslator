@@ -108,15 +108,22 @@ impl LlmClient {
 
         Ok(Self {
             client,
-            llm_url: llm_url.to_string(),
-            model: model.to_string(),
+            llm_url: llm_url.trim().to_string(),
+            model: model.trim().to_string(),
             max_retries,
             temperature,
             top_p,
             top_k,
             glossary_text,
             orion_glossary_text,
-            api_key,
+            api_key: api_key.and_then(|key| {
+                let key = key.trim().to_string();
+                if key.is_empty() {
+                    None
+                } else {
+                    Some(key)
+                }
+            }),
         })
     }
 
