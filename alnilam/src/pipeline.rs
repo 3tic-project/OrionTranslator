@@ -97,18 +97,11 @@ fn is_cancelled(cancel_flag: &CancelFlag) -> bool {
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
-fn emit_step2_autosave_log(
-    progress_cb: &ProgressCallback,
-    saved_count: usize,
-    total_count: usize,
-) {
+fn emit_step2_autosave_log(progress_cb: &ProgressCallback, saved_count: usize, total_count: usize) {
     emit_progress(
         progress_cb,
         ProgressEvent::Log {
-            message: format!(
-                "已保存可恢复进度: {}/{}",
-                saved_count, total_count
-            ),
+            message: format!("已保存可恢复进度: {}/{}", saved_count, total_count),
         },
     );
 }
@@ -410,6 +403,70 @@ fn can_resume_from_manifest(work_dir: &Path, current: &ResumeManifest) -> Result
             Ok(false)
         }
     }
+}
+
+fn save_epub_translation_snapshot(
+    data: &[TranslationBlock],
+    translations: &HashMap<usize, String>,
+    json_path: &str,
+) -> Result<()> {
+    let mut snapshot: Vec<TranslationBlock> = data.to_vec();
+    for (idx, translated) in translations {
+        if *idx < snapshot.len() {
+            snapshot[*idx].dst_text = Some(translated.clone());
+        }
+    }
+    EpubHandler::save_translation_data(&snapshot, json_path)?;
+    Ok(())
+}
+
+fn save_txt_translation_snapshot(
+    data: &[txt::TxtBlock],
+    translations: &HashMap<usize, String>,
+    json_path: &str,
+) -> Result<()> {
+    let mut snapshot = data.to_vec();
+    for (idx, translated) in translations {
+        if *idx < snapshot.len() {
+            snapshot[*idx].dst_text = Some(translated.clone());
+        }
+    }
+    std::fs::write(json_path, serde_json::to_string_pretty(&snapshot)?)?;
+    Ok(())
+}
+
+fn maybe_autosave_epub_step2(
+    last_autosave: &mut Instant,
+    data: &[TranslationBlock],
+    translations: &HashMap<usize, String>,
+    json_path: &str,
+    progress_cb: &ProgressCallback,
+) -> Result<()> {
+    if last_autosave.elapsed() < STEP2_AUTOSAVE_INTERVAL {
+        return Ok(());
+    }
+
+    save_epub_translation_snapshot(data, translations, json_path)?;
+    *last_autosave = Instant::now();
+    emit_step2_autosave_log(progress_cb, translations.len(), data.len());
+    Ok(())
+}
+
+fn maybe_autosave_txt_step2(
+    last_autosave: &mut Instant,
+    data: &[txt::TxtBlock],
+    translations: &HashMap<usize, String>,
+    json_path: &str,
+    progress_cb: &ProgressCallback,
+) -> Result<()> {
+    if last_autosave.elapsed() < STEP2_AUTOSAVE_INTERVAL {
+        return Ok(());
+    }
+
+    save_txt_translation_snapshot(data, translations, json_path)?;
+    *last_autosave = Instant::now();
+    emit_step2_autosave_log(progress_cb, translations.len(), data.len());
+    Ok(())
 }
 
 /// Save a stage snapshot (EPUB) into the work directory.
@@ -1247,7 +1304,7 @@ async fn retry_failed_with_context(
         });
     }
 
-    while let Some(join_result) = join_set.join_next().await {
+    while !join_set.is_empty() {
         // Check cancel flag before processing each result
         if is_cancelled(cancel_flag) {
             info!("重试过程中收到取消请求，中止剩余任务");
@@ -1256,6 +1313,15 @@ async fn retry_failed_with_context(
             while join_set.join_next().await.is_some() {}
             return Ok(results);
         }
+
+        let maybe_joined = tokio::time::timeout(Duration::from_millis(120), join_set.join_next())
+            .await
+            .ok()
+            .flatten();
+
+        let Some(join_result) = maybe_joined else {
+            continue;
+        };
 
         retry_completed += 1;
 
@@ -1537,11 +1603,14 @@ pub async fn translate_epub(
     let mut api_failed_indices: Vec<usize> = Vec::new();
     let mut failure_causes: HashMap<usize, FailureCause> = HashMap::new();
     let mut corrected_count = 0usize;
+    let mut last_step2_autosave = Instant::now();
 
     // Process batches (concurrent with semaphore for workers > 1)
     if config.workers <= 1 {
         for (batch_num, &start_idx) in batch_indices.iter().enumerate() {
             if is_cancelled(&cancel_flag) {
+                save_epub_translation_snapshot(&data, &translations, &json_path)?;
+                emit_step2_autosave_log(&progress_cb, translations.len(), data.len());
                 emit_progress(
                     &progress_cb,
                     ProgressEvent::Error {
@@ -1560,6 +1629,13 @@ pub async fn translate_epub(
             if untranslated.is_empty() {
                 translated_count += end_idx - start_idx;
                 pb.inc(1);
+                maybe_autosave_epub_step2(
+                    &mut last_step2_autosave,
+                    &data,
+                    &translations,
+                    &json_path,
+                    &progress_cb,
+                )?;
                 continue;
             }
 
@@ -1635,6 +1711,13 @@ pub async fn translate_epub(
                     api_failed_indices.len(),
                 ),
             );
+            maybe_autosave_epub_step2(
+                &mut last_step2_autosave,
+                &data,
+                &translations,
+                &json_path,
+                &progress_cb,
+            )?;
         }
     } else {
         // Concurrent processing
@@ -1672,6 +1755,13 @@ pub async fn translate_epub(
                         api_failed_indices.len(),
                     ),
                 );
+                maybe_autosave_epub_step2(
+                    &mut last_step2_autosave,
+                    &data,
+                    &translations,
+                    &json_path,
+                    &progress_cb,
+                )?;
                 continue;
             }
 
@@ -1729,6 +1819,9 @@ pub async fn translate_epub(
         while !join_set.is_empty() {
             if is_cancelled(&cancel_flag) {
                 join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                save_epub_translation_snapshot(&data, &translations, &json_path)?;
+                emit_step2_autosave_log(&progress_cb, translations.len(), data.len());
                 emit_progress(
                     &progress_cb,
                     ProgressEvent::Error {
@@ -1745,6 +1838,13 @@ pub async fn translate_epub(
                     .flatten();
 
             let Some(join_result) = maybe_joined else {
+                maybe_autosave_epub_step2(
+                    &mut last_step2_autosave,
+                    &data,
+                    &translations,
+                    &json_path,
+                    &progress_cb,
+                )?;
                 continue;
             };
 
@@ -1822,6 +1922,13 @@ pub async fn translate_epub(
                     );
                 }
             }
+            maybe_autosave_epub_step2(
+                &mut last_step2_autosave,
+                &data,
+                &translations,
+                &json_path,
+                &progress_cb,
+            )?;
         }
     }
 
@@ -1838,15 +1945,7 @@ pub async fn translate_epub(
     )?;
 
     // Also save intermediate translation_data.json for crash recovery
-    {
-        let mut mid_data: Vec<TranslationBlock> = data.clone();
-        for (idx, translated) in &translations {
-            if *idx < mid_data.len() {
-                mid_data[*idx].dst_text = Some(translated.clone());
-            }
-        }
-        EpubHandler::save_translation_data(&mid_data, &json_path)?;
-    }
+    save_epub_translation_snapshot(&data, &translations, &json_path)?;
 
     // ========================================================================
     // Step 3: Retry failed translations
@@ -1959,21 +2058,29 @@ pub async fn translate_epub(
             fixed_count += 1;
         }
 
+        if is_cancelled(&cancel_flag) {
+            save_epub_translation_snapshot(&data, &translations, &json_path)?;
+            emit_progress(
+                &progress_cb,
+                ProgressEvent::Error {
+                    message: "用户已取消翻译".into(),
+                },
+            );
+            println!("重试被用户取消");
+            return Ok(false);
+        }
+
         for &idx in &all_failed_indices {
             if !retry_results.contains_key(&idx) {
                 failed_count += 1;
             }
         }
 
-        if is_cancelled(&cancel_flag) {
-            println!("重试被用户取消");
-        } else {
-            println!(
-                "重试完成: {} 个修复, {} 个仍失败",
-                retry_results.len(),
-                all_failed_indices.len() - retry_results.len()
-            );
-        }
+        println!(
+            "重试完成: {} 个修复, {} 个仍失败",
+            retry_results.len(),
+            all_failed_indices.len() - retry_results.len()
+        );
     } else {
         println!("\n[Step 3/5] 无需重试");
     }
@@ -2335,11 +2442,14 @@ pub async fn translate_txt(
     let mut api_failed_indices: Vec<usize> = Vec::new();
     let mut failure_causes: HashMap<usize, FailureCause> = HashMap::new();
     let mut corrected_count = 0usize;
+    let mut last_step2_autosave = Instant::now();
 
     if config.workers <= 1 {
         // Sequential processing
         for (batch_num, &start_idx) in batch_indices.iter().enumerate() {
             if is_cancelled(&cancel_flag) {
+                save_txt_translation_snapshot(&data, &translations, &txt_json_path)?;
+                emit_step2_autosave_log(&progress_cb, translations.len(), data.len());
                 emit_progress(
                     &progress_cb,
                     ProgressEvent::Error {
@@ -2358,6 +2468,13 @@ pub async fn translate_txt(
             if untranslated.is_empty() {
                 translated_count += end_idx - start_idx;
                 pb.inc(1);
+                maybe_autosave_txt_step2(
+                    &mut last_step2_autosave,
+                    &data,
+                    &translations,
+                    &txt_json_path,
+                    &progress_cb,
+                )?;
                 continue;
             }
 
@@ -2433,6 +2550,13 @@ pub async fn translate_txt(
                     api_failed_indices.len(),
                 ),
             );
+            maybe_autosave_txt_step2(
+                &mut last_step2_autosave,
+                &data,
+                &translations,
+                &txt_json_path,
+                &progress_cb,
+            )?;
         }
     } else {
         // Concurrent processing with JoinSet
@@ -2467,6 +2591,13 @@ pub async fn translate_txt(
                         api_failed_indices.len(),
                     ),
                 );
+                maybe_autosave_txt_step2(
+                    &mut last_step2_autosave,
+                    &data,
+                    &translations,
+                    &txt_json_path,
+                    &progress_cb,
+                )?;
                 continue;
             }
 
@@ -2523,6 +2654,9 @@ pub async fn translate_txt(
         while !join_set.is_empty() {
             if is_cancelled(&cancel_flag) {
                 join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                save_txt_translation_snapshot(&data, &translations, &txt_json_path)?;
+                emit_step2_autosave_log(&progress_cb, translations.len(), data.len());
                 emit_progress(
                     &progress_cb,
                     ProgressEvent::Error {
@@ -2539,6 +2673,13 @@ pub async fn translate_txt(
                     .flatten();
 
             let Some(join_result) = maybe_joined else {
+                maybe_autosave_txt_step2(
+                    &mut last_step2_autosave,
+                    &data,
+                    &translations,
+                    &txt_json_path,
+                    &progress_cb,
+                )?;
                 continue;
             };
 
@@ -2616,6 +2757,13 @@ pub async fn translate_txt(
                     );
                 }
             }
+            maybe_autosave_txt_step2(
+                &mut last_step2_autosave,
+                &data,
+                &translations,
+                &txt_json_path,
+                &progress_cb,
+            )?;
         }
     }
 
@@ -2632,16 +2780,7 @@ pub async fn translate_txt(
     )?;
 
     // Also save intermediate translation_data.json for crash recovery
-    {
-        let mut mid_data = data.clone();
-        for (idx, translated) in &translations {
-            if *idx < mid_data.len() {
-                mid_data[*idx].dst_text = Some(translated.clone());
-            }
-        }
-        let json_str_mid = serde_json::to_string_pretty(&mid_data)?;
-        std::fs::write(&txt_json_path, &json_str_mid)?;
-    }
+    save_txt_translation_snapshot(&data, &translations, &txt_json_path)?;
 
     // Step 3: Retry
     if !all_failed_indices.is_empty() {
@@ -2751,21 +2890,29 @@ pub async fn translate_txt(
             fixed_count += 1;
         }
 
+        if is_cancelled(&cancel_flag) {
+            save_txt_translation_snapshot(&data, &translations, &txt_json_path)?;
+            emit_progress(
+                &progress_cb,
+                ProgressEvent::Error {
+                    message: "用户已取消翻译".into(),
+                },
+            );
+            println!("重试被用户取消");
+            return Ok(false);
+        }
+
         for &idx in &all_failed_indices {
             if !retry_results.contains_key(&idx) {
                 failed_count += 1;
             }
         }
 
-        if is_cancelled(&cancel_flag) {
-            println!("重试被用户取消");
-        } else {
-            println!(
-                "重试完成: {} 个修复, {} 个仍失败",
-                retry_results.len(),
-                all_failed_indices.len() - retry_results.len()
-            );
-        }
+        println!(
+            "重试完成: {} 个修复, {} 个仍失败",
+            retry_results.len(),
+            all_failed_indices.len() - retry_results.len()
+        );
     } else {
         println!("\n[Step 3/5] 无需重试");
     }
