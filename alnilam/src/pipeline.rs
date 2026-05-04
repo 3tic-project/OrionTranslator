@@ -1137,7 +1137,7 @@ async fn retry_failed_with_context(
     llm: &LlmClient,
     checker: &ResponseChecker,
     fixer: &AutoFixer,
-    detector: Option<&ContextDetector>,
+    precomputed: Option<&PrecomputedContext>,
     all_src_lines: &[String],
     data: &[(String, Option<String>)], // (src_text, dst_text)
     failed_indices: &[usize],
@@ -1198,13 +1198,37 @@ async fn retry_failed_with_context(
     );
 
     // Pre-build context for each failed index
+    emit_progress(
+        progress_cb,
+        ProgressEvent::Log {
+            message: format!("正在准备重试上下文: {} 个失败项", retry_total),
+        },
+    );
     let mut retry_items: Vec<(usize, Vec<String>)> = Vec::new();
     for &idx in failed_indices {
-        let context_before = if let Some(det) = detector {
+        if is_cancelled(cancel_flag) {
+            info!("重试上下文准备被用户取消");
+            emit_progress(
+                progress_cb,
+                ProgressEvent::Log {
+                    message: "重试上下文准备已取消".into(),
+                },
+            );
+            return Ok(results);
+        }
+
+        let context_before = if let Some(pc) = precomputed {
             if idx > 0 {
                 let window = (context_lines * DEFAULT_CONTEXT_WINDOW_MULTIPLIER)
                     .max(DEFAULT_CONTEXT_WINDOW_MIN);
-                match select_context(det, all_src_lines, idx + 1, idx + 1, window, context_lines) {
+                match select_context_precomputed(
+                    all_src_lines,
+                    pc,
+                    idx + 1,
+                    idx + 1,
+                    window,
+                    context_lines,
+                ) {
                     Ok(sel) => sel
                         .selected
                         .iter()
@@ -1212,10 +1236,17 @@ async fn retry_failed_with_context(
                             let line_idx = s.line_number - 1;
                             data.get(line_idx)
                                 .and_then(|(_, dst)| dst.clone())
-                                .unwrap_or_else(|| s.text.clone())
+                                .unwrap_or_else(|| {
+                                    if s.text.is_empty() {
+                                        all_src_lines[line_idx].clone()
+                                    } else {
+                                        s.text.clone()
+                                    }
+                                })
                         })
                         .collect::<Vec<_>>(),
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::debug!("Retry context precomputed fallback: {}", e);
                         let start = idx.saturating_sub(context_lines);
                         (start..idx)
                             .map(|i| data[i].1.clone().unwrap_or_else(|| data[i].0.clone()))
@@ -1245,6 +1276,16 @@ async fn retry_failed_with_context(
     // Concurrent retry using semaphore (same concurrency as main translation)
     let semaphore = Arc::new(tokio::sync::Semaphore::new(workers.max(1)));
     let mut join_set = tokio::task::JoinSet::new();
+    emit_progress(
+        progress_cb,
+        ProgressEvent::Log {
+            message: format!(
+                "已发起重试任务: {} 个，并发 {}",
+                retry_items.len(),
+                workers.max(1)
+            ),
+        },
+    );
 
     for (idx, full_context) in retry_items {
         let sem = semaphore.clone();
@@ -1397,7 +1438,7 @@ async fn retry_failed_with_context(
             llm,
             checker,
             fixer,
-            detector,
+            precomputed,
             all_src_lines,
             data,
             &still_failed,
@@ -2032,7 +2073,7 @@ pub async fn translate_epub(
                 &llm_retry,
                 &checker_retry,
                 &fixer_retry,
-                detector.as_ref().as_ref(),
+                precomputed.as_ref().as_ref(),
                 &all_src_lines,
                 &data_pairs,
                 &retry_indices,
@@ -2864,7 +2905,7 @@ pub async fn translate_txt(
                 &llm_retry,
                 &checker_retry,
                 &fixer_retry,
-                detector.as_ref().as_ref(),
+                precomputed.as_ref().as_ref(),
                 &all_src_lines,
                 &data_pairs,
                 &retry_indices,
