@@ -20,7 +20,7 @@ use crate::context::{
     PrecomputedContext,
 };
 use crate::epub::{EpubHandler, TranslationBlock};
-use crate::llm::{BatchTranslationResponse, LlmClient};
+use crate::llm::{glossary, BatchTranslationResponse, LlmClient};
 use crate::txt;
 
 const STEP2_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -633,32 +633,19 @@ fn load_context_detector(config: &PipelineConfig) -> Option<ContextDetector> {
 // Glossary Loading
 // ============================================================================
 
-fn load_glossary_text(config: &PipelineConfig) -> String {
-    use crate::llm::glossary;
+fn load_glossary_entries(config: &PipelineConfig) -> Vec<glossary::GlossaryEntry> {
     match &config.glossary_path {
         Some(path) if path.exists() => match glossary::load_glossary(path) {
             Ok(entries) => {
                 info!("已加载术语表: {} 条", entries.len());
-                glossary::format_glossary(&entries)
+                entries
             }
             Err(e) => {
                 warn!("加载术语表失败: {}", e);
-                String::new()
+                Vec::new()
             }
         },
-        _ => String::new(),
-    }
-}
-
-/// 加载术语表并格式化为 Orion 模型专用格式（与 SFT 训练一致）
-fn load_orion_glossary_text(config: &PipelineConfig) -> Option<String> {
-    use crate::llm::glossary;
-    match &config.glossary_path {
-        Some(path) if path.exists() => match glossary::load_glossary(path) {
-            Ok(entries) => glossary::format_glossary_for_orion(&entries),
-            Err(_) => None,
-        },
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -1304,6 +1291,7 @@ async fn retry_failed_with_context(
         let top_k = llm.top_k();
         let glossary_text = llm.glossary_text().to_string();
         let orion_glossary_text = llm.orion_glossary_text().map(|s| s.to_string());
+        let glossary_entries = llm.glossary_entries().to_vec();
         let api_key = llm.api_key().cloned();
         let err_rec = error_records.clone();
         let task_cancel = cancel_flag.clone();
@@ -1325,7 +1313,7 @@ async fn retry_failed_with_context(
                 {
                     return Ok(None);
                 }
-                let retry_llm = LlmClient::with_params(
+                let retry_llm = LlmClient::with_params_and_glossary_entries(
                     &llm_url,
                     &model,
                     1,
@@ -1335,6 +1323,7 @@ async fn retry_failed_with_context(
                     glossary_text,
                     orion_glossary_text,
                     api_key,
+                    glossary_entries,
                 )?;
                 retry_llm
                     .translate_single(&src_text, &full_context, &batch_id)
@@ -1612,9 +1601,10 @@ pub async fn translate_epub(
         },
     );
 
-    let glossary_text = load_glossary_text(config);
-    let orion_glossary_text = load_orion_glossary_text(config);
-    let llm = LlmClient::with_params(
+    let glossary_entries = load_glossary_entries(config);
+    let glossary_text = glossary::format_glossary(&glossary_entries);
+    let orion_glossary_text = glossary::format_glossary_for_orion(&glossary_entries);
+    let llm = LlmClient::with_params_and_glossary_entries(
         &config.llm_url,
         &config.model,
         3,
@@ -1624,6 +1614,7 @@ pub async fn translate_epub(
         glossary_text.clone(),
         orion_glossary_text.clone(),
         config.api_key.clone(),
+        glossary_entries.clone(),
     )?;
     let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
@@ -2051,7 +2042,7 @@ pub async fn translate_epub(
             );
         }
 
-        let llm_retry = LlmClient::with_params(
+        let llm_retry = LlmClient::with_params_and_glossary_entries(
             &config.llm_url,
             &config.model,
             1,
@@ -2061,6 +2052,7 @@ pub async fn translate_epub(
             glossary_text.clone(),
             orion_glossary_text.clone(),
             config.api_key.clone(),
+            glossary_entries.clone(),
         )?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");
@@ -2440,9 +2432,10 @@ pub async fn translate_txt(
             detail: "调用 LLM 进行翻译...".into(),
         },
     );
-    let glossary_text = load_glossary_text(config);
-    let orion_glossary_text = load_orion_glossary_text(config);
-    let llm = LlmClient::with_params(
+    let glossary_entries = load_glossary_entries(config);
+    let glossary_text = glossary::format_glossary(&glossary_entries);
+    let orion_glossary_text = glossary::format_glossary_for_orion(&glossary_entries);
+    let llm = LlmClient::with_params_and_glossary_entries(
         &config.llm_url,
         &config.model,
         3,
@@ -2452,6 +2445,7 @@ pub async fn translate_txt(
         glossary_text.clone(),
         orion_glossary_text.clone(),
         config.api_key.clone(),
+        glossary_entries.clone(),
     )?;
     let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
@@ -2883,7 +2877,7 @@ pub async fn translate_txt(
             );
         }
 
-        let llm_retry = LlmClient::with_params(
+        let llm_retry = LlmClient::with_params_and_glossary_entries(
             &config.llm_url,
             &config.model,
             1,
@@ -2893,6 +2887,7 @@ pub async fn translate_txt(
             glossary_text.clone(),
             orion_glossary_text.clone(),
             config.api_key.clone(),
+            glossary_entries.clone(),
         )?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");

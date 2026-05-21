@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 use crate::config;
 
+use super::glossary::{self, GlossaryEntry};
 use super::parser::{parse_jsonl_response, parse_jsonl_response_detailed, ParseDiagnostics};
 use super::prompt;
 
@@ -66,6 +67,7 @@ pub struct LlmClient {
     glossary_text: String,
     /// Orion 模型专用术语表（与 SFT 训练格式一致：术语表：\nJA→ZH\n）
     orion_glossary_text: Option<String>,
+    glossary_entries: Vec<GlossaryEntry>,
     api_key: Option<String>,
 }
 
@@ -101,6 +103,32 @@ impl LlmClient {
         orion_glossary_text: Option<String>,
         api_key: Option<String>,
     ) -> Result<Self> {
+        Self::with_params_and_glossary_entries(
+            llm_url,
+            model,
+            max_retries,
+            temperature,
+            top_p,
+            top_k,
+            glossary_text,
+            orion_glossary_text,
+            api_key,
+            Vec::new(),
+        )
+    }
+
+    pub fn with_params_and_glossary_entries(
+        llm_url: &str,
+        model: &str,
+        max_retries: usize,
+        temperature: f64,
+        top_p: Option<f64>,
+        top_k: Option<u32>,
+        glossary_text: String,
+        orion_glossary_text: Option<String>,
+        api_key: Option<String>,
+        glossary_entries: Vec<GlossaryEntry>,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -116,6 +144,7 @@ impl LlmClient {
             top_k,
             glossary_text,
             orion_glossary_text,
+            glossary_entries,
             api_key: api_key.and_then(|key| {
                 let key = key.trim().to_string();
                 if key.is_empty() {
@@ -159,6 +188,10 @@ impl LlmClient {
         self.orion_glossary_text.as_deref()
     }
 
+    pub fn glossary_entries(&self) -> &[GlossaryEntry] {
+        &self.glossary_entries
+    }
+
     pub fn api_key(&self) -> Option<&String> {
         self.api_key.as_ref()
     }
@@ -173,15 +206,39 @@ impl LlmClient {
         text
     }
 
-    fn estimate_translation_max_tokens(&self, texts: &[String], context: &[String]) -> u32 {
+    fn request_glossary_scope(texts: &[String], context: &[String]) -> Vec<String> {
+        let mut scope = Vec::with_capacity(context.len() + texts.len());
+        scope.extend(context.iter().cloned());
+        scope.extend(texts.iter().cloned());
+        scope
+    }
+
+    fn common_glossary_for_request(&self, texts: &[String], context: &[String]) -> String {
+        if self.glossary_entries.is_empty() {
+            return self.glossary_text.clone();
+        }
+
+        let scope = Self::request_glossary_scope(texts, context);
+        glossary::format_matched_glossary(&self.glossary_entries, &scope)
+    }
+
+    fn orion_glossary_for_request(&self, texts: &[String], context: &[String]) -> Option<String> {
+        if self.glossary_entries.is_empty() {
+            return self.orion_glossary_text.clone();
+        }
+
+        let scope = Self::request_glossary_scope(texts, context);
+        glossary::format_matched_glossary_for_orion(&self.glossary_entries, &scope)
+    }
+
+    fn estimate_translation_max_tokens(
+        &self,
+        texts: &[String],
+        context: &[String],
+        glossary_chars: usize,
+    ) -> u32 {
         let source_chars: usize = texts.iter().map(|text| text.chars().count()).sum();
         let context_chars: usize = context.iter().map(|text| text.chars().count()).sum();
-        let glossary_chars = self.glossary_text.chars().count()
-            + self
-                .orion_glossary_text
-                .as_deref()
-                .map(|text| text.chars().count())
-                .unwrap_or(0);
 
         let source_budget = (source_chars as u32).saturating_mul(2);
         let structure_budget = (texts.len() as u32).saturating_mul(48).saturating_add(512);
@@ -314,13 +371,11 @@ impl LlmClient {
         let context: Vec<String> = vec![];
 
         let prompt_text = if self.is_orion_model() {
-            prompt::build_prompt_with_context(
-                &test_texts,
-                &context,
-                self.orion_glossary_text.as_deref(),
-            )
+            let glossary_text = self.orion_glossary_for_request(&test_texts, &context);
+            prompt::build_prompt_with_context(&test_texts, &context, glossary_text.as_deref())
         } else {
-            prompt::build_common_prompt_with_context(&test_texts, &context, &self.glossary_text)
+            let glossary_text = self.common_glossary_for_request(&test_texts, &context);
+            prompt::build_common_prompt_with_context(&test_texts, &context, &glossary_text)
         };
 
         let response = self.call(&prompt_text, "model-test").await?;
@@ -361,12 +416,25 @@ impl LlmClient {
         context: &[String],
         batch_id: &str,
     ) -> Result<BatchTranslationResponse> {
-        let prompt_text = if self.is_orion_model() {
-            prompt::build_prompt_with_context(texts, context, self.orion_glossary_text.as_deref())
+        let (prompt_text, glossary_chars) = if self.is_orion_model() {
+            let glossary_text = self.orion_glossary_for_request(texts, context);
+            let glossary_chars = glossary_text
+                .as_deref()
+                .map(|text| text.chars().count())
+                .unwrap_or(0);
+            (
+                prompt::build_prompt_with_context(texts, context, glossary_text.as_deref()),
+                glossary_chars,
+            )
         } else {
-            prompt::build_common_prompt_with_context(texts, context, &self.glossary_text)
+            let glossary_text = self.common_glossary_for_request(texts, context);
+            let glossary_chars = glossary_text.chars().count();
+            (
+                prompt::build_common_prompt_with_context(texts, context, &glossary_text),
+                glossary_chars,
+            )
         };
-        let max_tokens = self.estimate_translation_max_tokens(texts, context);
+        let max_tokens = self.estimate_translation_max_tokens(texts, context, glossary_chars);
         let response = self
             .call_with_max_tokens(&prompt_text, batch_id, max_tokens)
             .await?;
@@ -399,16 +467,26 @@ impl LlmClient {
         context: &[String],
         batch_id: &str,
     ) -> Result<Option<String>> {
-        let prompt_text = if self.is_orion_model() {
-            prompt::build_single_prompt_with_context(
-                text,
-                context,
-                self.orion_glossary_text.as_deref(),
+        let texts = vec![text.to_string()];
+        let (prompt_text, glossary_chars) = if self.is_orion_model() {
+            let glossary_text = self.orion_glossary_for_request(&texts, context);
+            let glossary_chars = glossary_text
+                .as_deref()
+                .map(|text| text.chars().count())
+                .unwrap_or(0);
+            (
+                prompt::build_single_prompt_with_context(text, context, glossary_text.as_deref()),
+                glossary_chars,
             )
         } else {
-            prompt::build_common_single_prompt_with_context(text, context, &self.glossary_text)
+            let glossary_text = self.common_glossary_for_request(&texts, context);
+            let glossary_chars = glossary_text.chars().count();
+            (
+                prompt::build_common_single_prompt_with_context(text, context, &glossary_text),
+                glossary_chars,
+            )
         };
-        let max_tokens = self.estimate_translation_max_tokens(&[text.to_string()], context);
+        let max_tokens = self.estimate_translation_max_tokens(&texts, context, glossary_chars);
         let response = self
             .call_with_max_tokens(&prompt_text, batch_id, max_tokens)
             .await?;
@@ -420,5 +498,48 @@ impl LlmClient {
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn glossary_entry(src: &str, dst: &str) -> GlossaryEntry {
+        GlossaryEntry {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            info: String::new(),
+        }
+    }
+
+    #[test]
+    fn orion_glossary_for_request_filters_to_current_scope() {
+        let entries = vec![
+            glossary_entry("ネギ", "涅吉"),
+            glossary_entry("茶々丸", "茶茶丸"),
+            glossary_entry("なのは", "奈叶"),
+        ];
+        let llm = LlmClient::with_params_and_glossary_entries(
+            "http://127.0.0.1:9633/v1",
+            "Orion-Qwen3-1.7B_SFT_v2605",
+            1,
+            0.3,
+            Some(0.9),
+            Some(20),
+            glossary::format_glossary(&entries),
+            glossary::format_glossary_for_orion(&entries),
+            None,
+            entries,
+        )
+        .unwrap();
+        let texts = vec!["「茶々丸か？」".to_string()];
+        let context = vec!["なぜネギとニンニク？".to_string()];
+
+        let glossary_text = llm.orion_glossary_for_request(&texts, &context).unwrap();
+
+        assert!(glossary_text.contains("ネギ→涅吉\n"));
+        assert!(glossary_text.contains("茶々丸→茶茶丸\n"));
+        assert!(!glossary_text.contains("なのは"));
     }
 }

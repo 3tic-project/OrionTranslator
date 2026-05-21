@@ -36,6 +36,30 @@ pub fn format_glossary(entries: &[GlossaryEntry]) -> String {
         .join("\n")
 }
 
+pub fn filter_glossary_for_texts(
+    entries: &[GlossaryEntry],
+    texts: &[String],
+) -> Vec<GlossaryEntry> {
+    if entries.is_empty() || texts.is_empty() {
+        return Vec::new();
+    }
+
+    let haystack = texts.join("\n").to_lowercase();
+    entries
+        .iter()
+        .filter(|e| {
+            let src = e.src.trim();
+            let dst = e.dst.trim();
+            !src.is_empty() && !dst.is_empty() && haystack.contains(&src.to_lowercase())
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn format_matched_glossary(entries: &[GlossaryEntry], texts: &[String]) -> String {
+    format_glossary(&filter_glossary_for_texts(entries, texts))
+}
+
 /// 将术语表格式化为 Orion 模型 prompt 中的格式（与 SFT 训练数据一致）
 /// 输出格式：
 /// 术语表：
@@ -71,6 +95,13 @@ pub fn format_glossary_for_orion(entries: &[GlossaryEntry]) -> Option<String> {
         result.push('\n');
     }
     Some(result)
+}
+
+pub fn format_matched_glossary_for_orion(
+    entries: &[GlossaryEntry],
+    texts: &[String],
+) -> Option<String> {
+    format_glossary_for_orion(&filter_glossary_for_texts(entries, texts))
 }
 
 #[cfg(test)]
@@ -118,6 +149,55 @@ mod tests {
         ];
         let text = format_glossary(&entries);
         assert_eq!(text, "由紀 -> 由纪   #女性");
+    }
+
+    #[test]
+    fn test_filter_glossary_for_texts_matches_current_text_only() {
+        let entries = vec![
+            GlossaryEntry {
+                src: "ネギ".to_string(),
+                dst: "涅吉".to_string(),
+                info: "男".to_string(),
+            },
+            GlossaryEntry {
+                src: "茶々丸".to_string(),
+                dst: "茶茶丸".to_string(),
+                info: "女".to_string(),
+            },
+            GlossaryEntry {
+                src: "なのは".to_string(),
+                dst: "奈叶".to_string(),
+                info: "女".to_string(),
+            },
+            GlossaryEntry {
+                src: "空白".to_string(),
+                dst: " ".to_string(),
+                info: String::new(),
+            },
+        ];
+        let texts = vec![
+            "なぜネギとニンニク？".to_string(),
+            "「茶々丸か？」".to_string(),
+        ];
+
+        let matched = filter_glossary_for_texts(&entries, &texts);
+        let sources: Vec<&str> = matched.iter().map(|entry| entry.src.as_str()).collect();
+
+        assert_eq!(sources, vec!["ネギ", "茶々丸"]);
+    }
+
+    #[test]
+    fn test_format_matched_glossary_is_case_insensitive() {
+        let entries = vec![GlossaryEntry {
+            src: "saber".to_string(),
+            dst: "Saber".to_string(),
+            info: String::new(),
+        }];
+        let texts = vec!["SABER が現れた。".to_string()];
+
+        let text = format_matched_glossary(&entries, &texts);
+
+        assert_eq!(text, "saber -> Saber   #");
     }
 
     #[test]
@@ -181,5 +261,27 @@ mod tests {
         assert_eq!(lines[0], "术语表：");
         assert_eq!(lines[1], "グレン→格伦");
         assert_eq!(lines[2], "ネメア→涅米亚");
+    }
+
+    #[test]
+    fn test_format_matched_glossary_for_orion_filters_unmatched() {
+        let entries = vec![
+            GlossaryEntry {
+                src: "ネギ".to_string(),
+                dst: "涅吉".to_string(),
+                info: String::new(),
+            },
+            GlossaryEntry {
+                src: "なのは".to_string(),
+                dst: "奈叶".to_string(),
+                info: String::new(),
+            },
+        ];
+        let texts = vec!["「ネギとニンニクは……」".to_string()];
+
+        let result = format_matched_glossary_for_orion(&entries, &texts).unwrap();
+
+        assert!(result.contains("ネギ→涅吉\n"));
+        assert!(!result.contains("なのは"));
     }
 }
