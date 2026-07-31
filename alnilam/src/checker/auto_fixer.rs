@@ -54,24 +54,35 @@ impl AutoFixer {
         }
     }
 
+    /// 安全正规化：标点/引号对齐，**不**删除假名。
+    /// 用于质检已通过的译文，避免“修复”本身引入语义变化。
+    pub fn fix_safe(&self, src: &str, dst: &str) -> String {
+        self.fix_with(src, dst, false)
+    }
+
+    /// 完整修复：在安全正规化基础上可删除孤立拟声假名（用于假名残留等失败项）。
     pub fn fix(&self, src: &str, dst: &str) -> String {
+        self.fix_with(src, dst, true)
+    }
+
+    fn fix_with(&self, src: &str, dst: &str, aggressive_kana: bool) -> String {
         if dst.is_empty() {
             return dst.to_string();
         }
 
         let mut result = dst.to_string();
 
-        // 1. Fix isolated kana (Japanese source)
-        if self.fix_kana && self.source_lang == "ja" {
+        // 1. 仅在 aggressive 路径删除孤立小假名（可能改变语义，默认不对已通过项使用）
+        if aggressive_kana && self.fix_kana && self.source_lang == "ja" {
             result = self.fix_isolated_kana(&result);
         }
 
-        // 2. Fix punctuation
+        // 2. Fix punctuation（仅当原文计数可对齐时替换）
         if self.fix_punctuation {
             result = self.fix_punctuation_fn(src, &result);
         }
 
-        // 3. Fix quotes
+        // 3. Fix quotes（中文引号 → 日文引号）
         if self.fix_quotes {
             result = self.fix_quotes_fn(src, &result);
         }
@@ -232,5 +243,14 @@ mod tests {
         let fixer = AutoFixer::new("ja", "zh");
         let fixed = fixer.fix("テスト", "测试っ结果");
         assert_eq!(fixed, "测试结果");
+    }
+
+    #[test]
+    fn fix_safe_does_not_strip_isolated_kana() {
+        let fixer = AutoFixer::new("ja", "zh");
+        // 成功路径只用 safe：不删っ
+        assert_eq!(fixer.fix_safe("テスト", "测试っ结果"), "测试っ结果");
+        // aggressive 仍可删
+        assert_eq!(fixer.fix("テスト", "测试っ结果"), "测试结果");
     }
 }

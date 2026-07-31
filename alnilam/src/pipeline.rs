@@ -801,31 +801,49 @@ fn check_and_fix_translations(
         let dst = &dsts[i];
 
         if result.error == ErrorType::None {
-            let fixed_dst = fixer.fix(src, dst);
-            fixed_results.insert(orig_idx, fixed_dst.clone());
-
-            if fixed_dst != *dst {
-                corrected_count += 1;
-                info!(
-                    "[#{}] 自动修复: '{:.30}...' -> '{:.30}...'",
-                    orig_idx, dst, fixed_dst
-                );
-                let mut records = error_records.lock().unwrap_or_else(|e| e.into_inner());
-                records.push(ErrorRecord {
-                    index: orig_idx,
-                    src_text: src.clone(),
-                    dst_text: dst.clone(),
-                    error_type: "AUTO_FIX".to_string(),
-                    fixed: true,
-                    fix_details: format!("Auto-fixed: '{}' -> '{}'", dst, fixed_dst),
-                    retry_count,
-                    stage: Some("normalization".to_string()),
-                    details: Some("标点/引号自动正规化".to_string()),
-                    last_error_type: None,
-                    last_error_details: None,
-                });
+            // 已通过质检：仅安全正规化（引号/标点），不做假名删除
+            let fixed_dst = fixer.fix_safe(src, dst);
+            if fixed_dst == *dst {
+                fixed_results.insert(orig_idx, fixed_dst);
+            } else {
+                // 修复后强制复检，防止“修好了又坏了”
+                let recheck = checker.check(&[src.clone()], &[fixed_dst.clone()], retry_count);
+                if !recheck.is_empty() && recheck[0].error == ErrorType::None {
+                    fixed_results.insert(orig_idx, fixed_dst.clone());
+                    corrected_count += 1;
+                    info!(
+                        "[#{}] 自动正规化: '{:.30}...' -> '{:.30}...'",
+                        orig_idx, dst, fixed_dst
+                    );
+                    let mut records = error_records.lock().unwrap_or_else(|e| e.into_inner());
+                    records.push(ErrorRecord {
+                        index: orig_idx,
+                        src_text: src.clone(),
+                        dst_text: dst.clone(),
+                        error_type: "AUTO_FIX".to_string(),
+                        fixed: true,
+                        fix_details: format!("Safe-normalized: '{}' -> '{}'", dst, fixed_dst),
+                        retry_count,
+                        stage: Some("normalization".to_string()),
+                        details: Some("标点/引号自动正规化".to_string()),
+                        last_error_type: None,
+                        last_error_details: None,
+                    });
+                } else {
+                    // 正规化反而破坏质检时回退原文通过结果
+                    fixed_results.insert(orig_idx, dst.clone());
+                    warn!(
+                        "[#{}] 安全正规化后复检失败，保留原译文: {}",
+                        orig_idx,
+                        recheck
+                            .first()
+                            .map(|r| r.details.as_str())
+                            .unwrap_or("unknown")
+                    );
+                }
             }
         } else {
+            // 质检失败：允许更积极的修复（含孤立假名删除），复检通过才接受
             let fixed_dst = fixer.fix(src, dst);
             let recheck = checker.check(&[src.clone()], &[fixed_dst.clone()], retry_count);
 
