@@ -287,6 +287,14 @@ cargo run --release -p mintaka -- glossary novel.epub
 
 DeepSeek、Qwen、GPT 等模型使用翻译提示词模板，支持术语表注入、上下文规则检测。
 
+DeepSeek / 火山引擎默认关闭思考模式（`thinking.type=disabled`），并关闭中文弯引号（统一为「」『』）。
+
+### 断点与术语注意
+
+- 恢复翻译时仅对未完成行/段请求模型，避免重复计费与覆盖已译文本。
+- Orion 模型生成的术语表可无中文译名：翻译时会以「人物候选」进入 prompt，而非被静默丢弃。
+- EPUB 未注入译文的章节写回时保持原 ZIP 字节，降低 HTML5 归一化污染 XHTML 的风险。
+
 ## 输出文件
 
 | 文件 | 说明 |
