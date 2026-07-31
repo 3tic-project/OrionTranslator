@@ -84,22 +84,29 @@ impl ModelPreset {
 
     pub fn batch_size(self) -> usize {
         match self {
-            ModelPreset::DeepSeek | ModelPreset::Volcengine => 20,
+            ModelPreset::DeepSeek | ModelPreset::Volcengine => 15,
             ModelPreset::Orion => 10,
         }
     }
 
     pub fn workers(self) -> usize {
         match self {
-            ModelPreset::DeepSeek | ModelPreset::Volcengine => 16,
+            ModelPreset::DeepSeek | ModelPreset::Volcengine => 32,
             ModelPreset::Orion => 16,
         }
     }
 
     pub fn context_lines(self) -> usize {
         match self {
-            ModelPreset::DeepSeek | ModelPreset::Volcengine => 16,
+            ModelPreset::DeepSeek | ModelPreset::Volcengine => 10,
             ModelPreset::Orion => 5,
+        }
+    }
+
+    pub fn temperature(self) -> f64 {
+        match self {
+            ModelPreset::DeepSeek | ModelPreset::Volcengine => 0.7,
+            ModelPreset::Orion => 0.8,
         }
     }
 }

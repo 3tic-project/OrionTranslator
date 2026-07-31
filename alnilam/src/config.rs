@@ -8,15 +8,15 @@ use anyhow::{bail, Result};
 
 pub const DEFAULT_LLM_URL: &str = "https://api.deepseek.com/";
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
-pub const DEFAULT_BATCH_SIZE: usize = 20;
+pub const DEFAULT_BATCH_SIZE: usize = 15;
 pub const DEFAULT_CONTEXT_LINES: usize = 10;
-pub const DEFAULT_WORKERS: usize = 16;
+pub const DEFAULT_WORKERS: usize = 32;
 pub const DEFAULT_MAX_RETRY: usize = 3;
 pub const DEFAULT_CONTEXT_WINDOW_MULTIPLIER: usize = 3;
 pub const DEFAULT_CONTEXT_WINDOW_MIN: usize = 30;
 pub const TARGET_LANG: &str = "简体中文";
 pub const DEFAULT_TRANSLATION_GAP: &str = "1rem";
-pub const DEFAULT_TEMPERATURE: f64 = 0.8;
+pub const DEFAULT_TEMPERATURE: f64 = 0.7;
 pub const DEFAULT_TOP_P: f64 = 0.9;
 pub const DEFAULT_TOP_K: u32 = 20;
 

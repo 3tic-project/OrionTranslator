@@ -103,18 +103,23 @@ impl OrionApp {
         self.context_lines_input.update(cx, |state, cx| {
             state.set_value(preset.context_lines().to_string(), window, cx)
         });
+        self.temperature_input.update(cx, |state, cx| {
+            state.set_value(preset.temperature().to_string(), window, cx)
+        });
 
         // Reset model test status since model changed
         self.model_test_ok = None;
         self.model_test_message = "未测试".into();
 
         self.add_log(&format!(
-            "已切换预设: {} (URL: {}, 模型: {}, 批次: {}, 上下文: {})",
+            "已切换预设: {} (URL: {}, 模型: {}, 批次: {}, 并行: {}, 上下文: {}, 温度: {})",
             preset.label(),
             preset.llm_url(),
             preset.model_name(),
             preset.batch_size(),
+            preset.workers(),
             preset.context_lines(),
+            preset.temperature(),
         ));
         cx.notify();
     }

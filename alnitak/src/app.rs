@@ -104,7 +104,7 @@ impl OrionApp {
         let temperature_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("温度")
-                .default_value(&DEFAULT_TEMPERATURE.to_string())
+                .default_value(&default_preset.temperature().to_string())
         });
         let top_p_input = cx.new(|cx| {
             InputState::new(window, cx)
