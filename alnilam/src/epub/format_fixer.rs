@@ -180,6 +180,7 @@ mod tests {
             id: "chapter".to_string(),
             name: "Text/chapter.xhtml".to_string(),
             content: r#"<html><body><svg viewBox='0 0 640 480'><image href='../Images/pic.jpg' width='640' height='480'/></svg></body></html>"#.to_string(),
+            modified: false,
         }];
 
         simplify_svg_images(&mut documents);
@@ -290,6 +291,7 @@ fn simplify_svg_images(documents: &mut [DocumentItem]) {
 
         if changed {
             doc.content = new_content;
+            doc.modified = true;
         }
     }
 }
@@ -308,6 +310,7 @@ fn fix_html_inline_styles(documents: &mut [DocumentItem]) {
                 .to_string();
             if new_content != doc.content {
                 doc.content = new_content;
+                doc.modified = true;
             }
         }
     }

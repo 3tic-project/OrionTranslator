@@ -317,6 +317,32 @@ pub fn normalize_void_elements(content: &str) -> String {
     re.replace_all(content, "<$1$2>").to_string()
 }
 
+/// 将 HTML5 风格 void 元素还原为 XHTML 自闭合形式，便于写回 EPUB3。
+/// e.g., `<br>` → `<br />`, `<img src="a">` → `<img src="a" />`
+///
+/// 已是 `.../>` 的标签保持不变。
+pub fn restore_xhtml_void_elements(content: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)<(br|hr|img|input|meta|link|col|area|base|embed|param|source|track|wbr)\b([^>]*?)>"#,
+        )
+        .unwrap()
+    });
+    re.replace_all(content, |caps: &regex::Captures| {
+        let tag = &caps[1];
+        let attrs = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        if attrs.trim_end().ends_with('/') {
+            format!("<{}{}>", tag, attrs)
+        } else if attrs.is_empty() {
+            format!("<{} />", tag)
+        } else {
+            format!("<{}{} />", tag, attrs.trim_end())
+        }
+    })
+    .to_string()
+}
+
 // ── Text Extraction ─────────────────────────────────────────────────────
 
 /// Extract text lines from an HTML/XHTML document.
@@ -448,6 +474,22 @@ mod tests {
             Some(&"OPS/Text/ch1.xhtml".to_string())
         );
         assert_eq!(package.spine_ids, vec!["chap"]);
+    }
+
+    #[test]
+    fn restore_xhtml_void_elements_roundtrip() {
+        let xhtml = r#"<p>a<br/>b<img src="x.png"/>c</p>"#;
+        let html5 = normalize_void_elements(xhtml);
+        assert!(html5.contains("<br>"));
+        assert!(html5.contains(r#"<img src="x.png">"#));
+        let restored = restore_xhtml_void_elements(&html5);
+        assert!(restored.contains("<br />"));
+        assert!(restored.contains(r#"<img src="x.png" />"#));
+        // already self-closing should not double slash
+        assert_eq!(
+            restore_xhtml_void_elements("<br />"),
+            "<br />"
+        );
     }
 }
 

@@ -6,7 +6,7 @@ use betelgeuse::{
     extract_attr, extract_leaf_blocks_from_html, find_item_content as find_epub_item_content,
     find_opf_path as find_epub_opf_path, fix_xhtml_for_html5,
     get_clean_text as get_epub_clean_text, normalize_void_elements, parse_opf_package,
-    resolve_epub_href,
+    resolve_epub_href, restore_xhtml_void_elements,
 };
 use regex::Regex;
 use roxmltree::Document as XmlDocument;
@@ -41,7 +41,11 @@ fn default_page_type() -> String {
 pub(crate) struct DocumentItem {
     pub(crate) id: String,
     pub(crate) name: String,
+    /// 工作副本：加载时为 HTML5 兼容归一化结果，供解析/注入使用。
     pub(crate) content: String,
+    /// 是否在本会话中被注入译文或格式修复改写。
+    /// 未修改时 save 不写回 raw_items，保留 ZIP 原始 XHTML 字节。
+    pub(crate) modified: bool,
 }
 
 struct MatchedElement {
@@ -125,12 +129,14 @@ impl EpubHandler {
                     // Preprocess XHTML for html5ever compatibility:
                     // 1. Convert self-closing non-void tags (<script/>, <style/>)
                     // 2. Normalize void elements (<br/> -> <br>) to match html5ever output
+                    // 仅对 parse/inject 使用归一化视图；未改文档写回时不覆盖 ZIP 原件
                     let content_str = fix_xhtml_for_html5(&content_str);
                     let content_str = normalize_void_elements(&content_str);
                     self.documents.push(DocumentItem {
                         id: id.clone(),
                         name: name.clone(),
                         content: content_str,
+                        modified: false,
                     });
                 }
             }
@@ -539,8 +545,12 @@ impl EpubHandler {
                 }
             }
             replacements.sort_by(|a, b| b.0.cmp(&a.0));
-            for (start, end, replacement) in replacements {
-                new_content.replace_range(start..end, &replacement);
+            if !replacements.is_empty() {
+                for (start, end, replacement) in replacements {
+                    new_content.replace_range(start..end, &replacement);
+                }
+                doc.content = new_content;
+                doc.modified = true;
             }
             if match_failures > 0 {
                 tracing::warn!(
@@ -558,8 +568,6 @@ impl EpubHandler {
                     matched_elements.len() + position_failures
                 );
             }
-
-            doc.content = new_content;
         }
 
         tracing::info!("Injected {} translations.", count);
@@ -576,19 +584,26 @@ impl EpubHandler {
             self.apply_format_fixes();
         }
 
-        // Update raw_items with modified documents
+        // 只把本会话改动过的文档写回；未改章节保留 ZIP 原始 XHTML（避免 <br/>→<br> 污染）
         let updates: Vec<(String, Vec<u8>)> = self
             .documents
             .iter()
+            .filter(|doc| doc.modified)
             .filter_map(|doc| {
+                let xhtml = restore_xhtml_void_elements(&doc.content);
                 self.raw_item_key_for_document(&doc.name)
-                    .map(|key| (key, doc.content.as_bytes().to_vec()))
+                    .map(|key| (key, xhtml.into_bytes()))
                     .or_else(|| {
                         tracing::warn!("Could not find raw EPUB item for document '{}'", doc.name);
                         None
                     })
             })
             .collect();
+        tracing::info!(
+            "Writing {} modified document(s); {} unchanged document(s) keep original ZIP bytes",
+            updates.len(),
+            self.documents.iter().filter(|d| !d.modified).count()
+        );
         for (key, content) in updates {
             self.raw_items.insert(key, content);
         }
@@ -836,7 +851,11 @@ fn extract_leading_whitespace(raw_text: &str) -> &str {
     }
 }
 
-/// Replace the text content of an HTML tag, preserving leading whitespace from original
+/// Replace the text content of an HTML tag, preserving leading whitespace from original.
+///
+/// - 无子标签时：直接替换 inner HTML（与旧行为一致）
+/// - 有 `ruby`/`em`/`a` 等内联结构时：优先在标记内替换连续原文；否则保留标签骨架，
+///   把译文写入第一个非空白文本节点并清空后续文本节点（避免丢失链接/ruby 外壳）
 fn replace_tag_content(html: &str, new_text: &str, raw_text: &str) -> String {
     if let (Some(open_end), Some(close_start)) = (html.find('>'), html.rfind('<')) {
         if open_end < close_start {
@@ -846,15 +865,82 @@ fn replace_tag_content(html: &str, new_text: &str, raw_text: &str) -> String {
             } else {
                 new_text.to_string()
             };
-            return format!(
-                "{}{}{}",
-                &html[..=open_end],
-                escape_html_text(&final_text),
-                &html[close_start..]
-            );
+            let escaped = escape_html_text(&final_text);
+            let inner = &html[open_end + 1..close_start];
+
+            // 纯文本叶子：整段替换
+            if !inner.contains('<') {
+                return format!("{}{}{}", &html[..=open_end], escaped, &html[close_start..]);
+            }
+
+            // 内联结构：先尝试把连续原文替换为译文（保留周围标签）
+            let src_plain = raw_text.trim();
+            if !src_plain.is_empty() {
+                if html.contains(src_plain) {
+                    return html.replacen(src_plain, &escaped, 1);
+                }
+                let esc_src = escape_html_text(src_plain);
+                if html.contains(&esc_src) {
+                    return html.replacen(&esc_src, &escaped, 1);
+                }
+            }
+
+            // 回退：保留标签，仅改写文本节点
+            return replace_text_nodes_preserving_markup(html, &escaped);
         }
     }
     html.to_string()
+}
+
+/// 保留所有标签属性与嵌套结构，将首个非空白文本节点替换为 `escaped_text`，
+/// 其余非空白文本节点清空（空白文本原样保留）。
+fn replace_text_nodes_preserving_markup(html: &str, escaped_text: &str) -> String {
+    let mut out = String::with_capacity(html.len() + escaped_text.len());
+    let mut in_tag = false;
+    let mut text_buf = String::new();
+    let mut first_text_done = false;
+
+    let flush_text = |buf: &mut String, out: &mut String, first_done: &mut bool, text: &str| {
+        if buf.is_empty() {
+            return;
+        }
+        let only_ws = buf.chars().all(|c| c.is_whitespace());
+        if only_ws {
+            out.push_str(buf);
+        } else if !*first_done {
+            out.push_str(text);
+            *first_done = true;
+        }
+        // 后续非空白文本丢弃，标签仍保留
+        buf.clear();
+    };
+
+    for ch in html.chars() {
+        match ch {
+            '<' => {
+                flush_text(&mut text_buf, &mut out, &mut first_text_done, escaped_text);
+                in_tag = true;
+                out.push(ch);
+            }
+            '>' if in_tag => {
+                in_tag = false;
+                out.push(ch);
+            }
+            c if in_tag => out.push(c),
+            c => text_buf.push(c),
+        }
+    }
+    flush_text(&mut text_buf, &mut out, &mut first_text_done, escaped_text);
+
+    if !first_text_done {
+        // 没有可用文本节点时回退为整段 inner 替换
+        if let (Some(open_end), Some(close_start)) = (out.find('>'), out.rfind('<')) {
+            if open_end < close_start {
+                return format!("{}{}{}", &out[..=open_end], escaped_text, &out[close_start..]);
+            }
+        }
+    }
+    out
 }
 
 /// Replace tag content for ToC pages: "original / translation" format.
@@ -980,6 +1066,7 @@ mod tests {
                 id: "chapter".to_string(),
                 name: "Text/chapter.xhtml".to_string(),
                 content: content.to_string(),
+                modified: false,
             }],
             toc_map: HashMap::new(),
             raw_items: HashMap::new(),
@@ -1013,6 +1100,27 @@ mod tests {
             std::process::id(),
             nonce
         ))
+    }
+
+    #[test]
+    fn replace_tag_content_preserves_nested_inline_tags() {
+        let html = "<p><ruby>星<rt>ほし</rt></ruby>を<em>見た</em><a href=\"#n1\">※</a></p>";
+        let raw = "星を見た※";
+        let out = replace_tag_content(html, "看见了星星※", raw);
+        // 链接与 ruby 外壳必须保留
+        assert!(out.contains("href=\"#n1\""), "link attr lost: {out}");
+        assert!(out.contains("<ruby>"), "ruby lost: {out}");
+        assert!(out.contains("<em>"), "em lost: {out}");
+        assert!(out.contains("看见了星星※"), "translation missing: {out}");
+        // 不应再变成纯文本 inner
+        assert!(out.contains('<'), "structure flattened: {out}");
+    }
+
+    #[test]
+    fn replace_tag_content_plain_inner_still_works() {
+        let html = "<p>こんにちは</p>";
+        let out = replace_tag_content(html, "你好", "こんにちは");
+        assert_eq!(out, "<p>你好</p>");
     }
 
     fn write_epub_entry(
