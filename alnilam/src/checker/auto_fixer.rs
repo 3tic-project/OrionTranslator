@@ -122,24 +122,14 @@ impl AutoFixer {
         result
     }
 
-    /// 将译文中的中文/西文引号规范为日文引号，覆盖段中嵌套与首尾。
+    /// 将译文中的中文/西文引号统一为日文引号，覆盖段中嵌套与首尾。
     ///
-    /// 约定（与轻小说日→中常见写法对齐）：
+    /// 策略：译文一律不使用中文引号（与原文是否含「」『』无关）。
     /// - 大引号「」 ← 中文双引号 “ ”、ASCII `"`、全角 ＂
-    /// - 小引号『』 ← 中文单引号 ‘ ’、ASCII `'`（仅在原文含『』时）、全角 ＇
-    ///
-    /// 仅当原文出现对应日文引号时才转换，避免改写正文里本就合理的中文引号。
+    /// - 小引号『』 ← 中文单引号 ‘ ’、全角 ＇
+    /// - ASCII `'`：仅在原文含『』时改写，避免误伤英文撇号
     fn fix_quotes_fn(&self, src: &str, dst: &str) -> String {
-        let src_has_kagi = src.contains('「') || src.contains('」');
         let src_has_nijuu = src.contains('『') || src.contains('』');
-
-        if !src_has_kagi && !src_has_nijuu {
-            return dst.to_string();
-        }
-
-        // 原文只有「」时，中文单引号也归入大引号（LLM 偶发只用 ‘’）
-        let single_to_nijuu = src_has_nijuu;
-        let single_to_kagi = src_has_kagi && !src_has_nijuu;
 
         let mut out = String::with_capacity(dst.len());
         let mut ascii_double_open = true;
@@ -150,38 +140,31 @@ impl AutoFixer {
         for ch in dst.chars() {
             let mapped = match ch {
                 // 中文弯双引号 → 「」
-                '\u{201C}' if src_has_kagi => Some('「'),
-                '\u{201D}' if src_has_kagi => Some('」'),
-                // 中文弯单引号 → 『』 或 「」（取决于原文是否有小引号）
-                '\u{2018}' if single_to_nijuu => Some('『'),
-                '\u{2019}' if single_to_nijuu => Some('』'),
-                '\u{2018}' if single_to_kagi => Some('「'),
-                '\u{2019}' if single_to_kagi => Some('」'),
+                '\u{201C}' => Some('「'),
+                '\u{201D}' => Some('」'),
+                // 中文弯单引号 → 『』（嵌套层级）
+                '\u{2018}' => Some('『'),
+                '\u{2019}' => Some('』'),
                 // ASCII 双引号：按开合交替映射
-                '"' if src_has_kagi => {
+                '"' => {
                     let q = if ascii_double_open { '「' } else { '」' };
                     ascii_double_open = !ascii_double_open;
                     Some(q)
                 }
-                // ASCII 单引号：仅在原文有『』时改写，避免误伤英文撇号
-                '\'' if single_to_nijuu => {
+                // ASCII 单引号：仅在原文有『』时改写
+                '\'' if src_has_nijuu => {
                     let q = if ascii_single_open { '『' } else { '』' };
                     ascii_single_open = !ascii_single_open;
                     Some(q)
                 }
                 // 全角引号
-                '＂' if src_has_kagi => {
+                '＂' => {
                     let q = if fullwidth_double_open { '「' } else { '」' };
                     fullwidth_double_open = !fullwidth_double_open;
                     Some(q)
                 }
-                '＇' if single_to_nijuu => {
+                '＇' => {
                     let q = if fullwidth_single_open { '『' } else { '』' };
-                    fullwidth_single_open = !fullwidth_single_open;
-                    Some(q)
-                }
-                '＇' if single_to_kagi => {
-                    let q = if fullwidth_single_open { '「' } else { '」' };
                     fullwidth_single_open = !fullwidth_single_open;
                     Some(q)
                 }
@@ -237,11 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn test_no_quote_rewrite_when_src_has_no_japanese_quotes() {
+    fn test_always_rewrite_chinese_quotes_even_without_src_quotes() {
         let fixer = AutoFixer::new("ja", "zh");
-        let dst = "他说\u{201C}你好\u{201D}。";
+        let dst = "他说\u{201C}你好\u{201D}，又道\u{2018}再见\u{2019}。";
         let fixed = fixer.fix("彼は挨拶した。", dst);
-        assert_eq!(fixed, dst);
+        assert_eq!(fixed, "他说「你好」，又道『再见』。");
     }
 
     #[test]
