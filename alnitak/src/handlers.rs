@@ -998,8 +998,10 @@ impl OrionApp {
 
         let is_orion = !bellatrix::is_generic_model(&model_name);
         if is_orion {
-            self.add_log("检测到Orion模型：将只执行NER识别，不执行LLM翻译");
-            self.add_log("生成的术语表将不包含译名和说明（dst和info为空）");
+            self.add_log("检测到Orion模型：将只执行NER识别，不执行LLM译名");
+            self.add_log(
+                "生成的术语表 dst 为空，翻译时会以「人物候选」注入 Orion prompt（非 src→dst 强制译名）",
+            );
         }
 
         // 3. Read LLM config
