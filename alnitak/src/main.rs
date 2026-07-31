@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod app;
+mod credentials;
 mod handlers;
 mod types;
 mod ui;
@@ -97,8 +98,11 @@ fn main() {
 
                 Theme::change(ThemeMode::Dark, Some(window), cx);
 
-                // Register close confirmation dialog
-                window.on_window_should_close(cx, |window, cx| {
+                let view = cx.new(|cx| OrionApp::new(window, cx));
+                let view_for_close = view.clone();
+
+                // Register close confirmation dialog; 退出前落盘当前预设凭证
+                window.on_window_should_close(cx, move |window, cx| {
                     let answer = window.prompt(
                         PromptLevel::Warning,
                         "确认退出",
@@ -106,8 +110,12 @@ fn main() {
                         &[PromptButton::ok("确认退出"), PromptButton::cancel("取消")],
                         cx,
                     );
+                    let view_for_close = view_for_close.clone();
                     cx.spawn(async move |cx| {
                         if answer.await == Ok(0) {
+                            let _ = view_for_close.update(cx, |app, cx| {
+                                app.persist_current_credentials(cx);
+                            });
                             let _ = cx.update(|cx| cx.quit());
                         }
                     })
@@ -116,7 +124,6 @@ fn main() {
                     false
                 });
 
-                let view = cx.new(|cx| OrionApp::new(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })?;
 

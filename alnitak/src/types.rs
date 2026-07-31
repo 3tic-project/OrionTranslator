@@ -109,4 +109,21 @@ impl ModelPreset {
             ModelPreset::Orion => 0.8,
         }
     }
+
+    /// 持久化文件中的预设键名（见 `credentials` 模块）。
+    pub fn storage_key(self) -> &'static str {
+        match self {
+            ModelPreset::DeepSeek => "deepseek",
+            ModelPreset::Volcengine => "volcengine",
+            ModelPreset::Orion => "orion",
+        }
+    }
+
+    pub fn from_storage_key(key: &str) -> Self {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "volcengine" | "volc" | "ark" => ModelPreset::Volcengine,
+            "orion" => ModelPreset::Orion,
+            _ => ModelPreset::DeepSeek,
+        }
+    }
 }

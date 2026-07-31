@@ -85,41 +85,62 @@ impl OrionApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let preset = ModelPreset::from_index(*selected_ix);
-        self.model_preset = preset;
+        let next = ModelPreset::from_index(*selected_ix);
+        if next == self.model_preset {
+            return;
+        }
 
-        self.llm_url_input.update(cx, |state, cx| {
-            state.set_value(preset.llm_url(), window, cx)
-        });
-        self.model_input.update(cx, |state, cx| {
-            state.set_value(preset.model_name(), window, cx)
-        });
+        // 切换前先把当前预设的 URL / 模型 / Key 写回内存并落盘
+        self.persist_current_credentials(cx);
+
+        self.model_preset = next;
+        self.credential_store.set_active_preset(next);
+        self.apply_preset_credentials(next, window, cx);
+
         self.batch_size_input.update(cx, |state, cx| {
-            state.set_value(preset.batch_size().to_string(), window, cx)
+            state.set_value(next.batch_size().to_string(), window, cx)
         });
         self.workers_input.update(cx, |state, cx| {
-            state.set_value(preset.workers().to_string(), window, cx)
+            state.set_value(next.workers().to_string(), window, cx)
         });
         self.context_lines_input.update(cx, |state, cx| {
-            state.set_value(preset.context_lines().to_string(), window, cx)
+            state.set_value(next.context_lines().to_string(), window, cx)
         });
         self.temperature_input.update(cx, |state, cx| {
-            state.set_value(preset.temperature().to_string(), window, cx)
+            state.set_value(next.temperature().to_string(), window, cx)
         });
+
+        // 同步 active_preset 到磁盘（凭证内容已在上面保存）
+        if let Err(e) = crate::credentials::save_store(&self.credential_store) {
+            self.add_log(&format!("更新活动预设失败: {}", e));
+        }
 
         // Reset model test status since model changed
         self.model_test_ok = None;
         self.model_test_message = "未测试".into();
 
+        let creds = self
+            .credential_store
+            .get(next)
+            .clone()
+            .filled_with_defaults(next);
         self.add_log(&format!(
             "已切换预设: {} (URL: {}, 模型: {}, 批次: {}, 并行: {}, 上下文: {}, 温度: {})",
-            preset.label(),
-            preset.llm_url(),
-            preset.model_name(),
-            preset.batch_size(),
-            preset.workers(),
-            preset.context_lines(),
-            preset.temperature(),
+            next.label(),
+            if creds.llm_url.is_empty() {
+                next.llm_url()
+            } else {
+                &creds.llm_url
+            },
+            if creds.model.is_empty() {
+                next.model_name()
+            } else {
+                &creds.model
+            },
+            next.batch_size(),
+            next.workers(),
+            next.context_lines(),
+            next.temperature(),
         ));
         cx.notify();
     }
@@ -274,6 +295,9 @@ impl OrionApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 记住当前预设的 URL / 模型 / API Key
+        self.persist_current_credentials(cx);
+
         let input_path = match &self.input_path {
             Some(p) => p.clone(),
             None => {
@@ -707,6 +731,8 @@ impl OrionApp {
     }
 
     pub fn test_model(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.persist_current_credentials(cx);
+
         let llm_url = self.llm_url_input.read(cx).value().trim().to_string();
         let model = self.model_input.read(cx).value().trim().to_string();
         let api_key_raw = self.api_key_input.read(cx).value().to_string();
@@ -950,6 +976,8 @@ impl OrionApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.persist_current_credentials(cx);
+
         // 1. Check input file
         let input_path = match &self.input_path {
             Some(p) => p.clone(),
