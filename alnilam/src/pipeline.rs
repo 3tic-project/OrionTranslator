@@ -877,10 +877,11 @@ fn check_and_fix_translations(
     )
 }
 
+/// 处理一批 LLM 响应。`unit_indices` 为本次实际提交的全局单元下标（请求顺序 = JSONL 1..N）。
+/// 允许稀疏下标，从而在断点恢复时只重发未完成项。
 fn process_batch_response(
     response: BatchTranslationResponse,
-    start_idx: usize,
-    end_idx: usize,
+    unit_indices: &[usize],
     src_text_at: impl Fn(usize) -> String,
     checker: &ResponseChecker,
     fixer: &AutoFixer,
@@ -893,8 +894,8 @@ fn process_batch_response(
     let mut failure_causes = HashMap::new();
     let diagnostic_summary = parser_diagnostic_summary(&response);
 
-    for idx in start_idx..end_idx {
-        let jsonl_idx = idx - start_idx + 1;
+    for (local_i, &idx) in unit_indices.iter().enumerate() {
+        let jsonl_idx = local_i + 1;
         if let Some(translated) = response.translations.get(&jsonl_idx) {
             srcs.push(src_text_at(idx));
             dsts.push(translated.clone());
@@ -917,9 +918,14 @@ fn process_batch_response(
     }
 
     if response.diagnostics.has_issues() {
+        let first = unit_indices.first().copied().unwrap_or(0);
+        let last = unit_indices.last().copied().unwrap_or(first);
         warn!(
-            "批次 {}..{} 响应结构异常: {}",
-            start_idx, end_idx, diagnostic_summary
+            "批次 units={:?} ({}..{}) 响应结构异常: {}",
+            unit_indices.len(),
+            first,
+            last,
+            diagnostic_summary
         );
     }
 
@@ -942,6 +948,35 @@ fn process_batch_response(
         failure_causes,
         corrected_count,
     }
+}
+
+/// 批次窗口内尚未翻译的全局下标（用于断点恢复时只提交 pending）。
+fn pending_indices_in_range(
+    start_idx: usize,
+    end_idx: usize,
+    translations: &HashMap<usize, String>,
+) -> Vec<usize> {
+    (start_idx..end_idx)
+        .filter(|i| !translations.contains_key(i))
+        .collect()
+}
+
+fn mark_indices_api_failed(
+    indices: &[usize],
+    error: &str,
+    stage: &str,
+    failure_causes: &mut HashMap<usize, FailureCause>,
+    api_failed_indices: &mut Vec<usize>,
+    all_failed_indices: &mut Vec<usize>,
+) {
+    for &idx in indices {
+        failure_causes.insert(
+            idx,
+            FailureCause::new("API_ERROR", error.to_string(), stage, 0),
+        );
+    }
+    extend_unique(api_failed_indices, indices.to_vec());
+    extend_unique(all_failed_indices, indices.to_vec());
 }
 
 // ============================================================================
@@ -1406,7 +1441,9 @@ async fn retry_failed_with_context(
                 still_failed.push(idx);
             }
             Err(e) => {
-                warn!("重试任务 join 错误: {}", e);
+                // JoinError 无 payload；在任务内部避免 panic，此处只能记日志。
+                // 若能拿到 idx 的路径已在 Ok 分支处理。
+                warn!("重试任务 join 错误 (panic/cancel): {}", e);
             }
         }
 
@@ -1655,10 +1692,8 @@ pub async fn translate_epub(
             let end_idx = (start_idx + config.batch_size).min(data.len());
 
             // Skip batch if all blocks already translated (resume support)
-            let untranslated: Vec<usize> = (start_idx..end_idx)
-                .filter(|i| !translations.contains_key(i))
-                .collect();
-            if untranslated.is_empty() {
+            let pending = pending_indices_in_range(start_idx, end_idx, &translations);
+            if pending.is_empty() {
                 translated_count += end_idx - start_idx;
                 pb.inc(1);
                 maybe_autosave_epub_step2(
@@ -1671,10 +1706,8 @@ pub async fn translate_epub(
                 continue;
             }
 
-            let texts: Vec<String> = data[start_idx..end_idx]
-                .iter()
-                .map(|b| b.src_text.clone())
-                .collect();
+            // 只提交未完成单元，避免断点恢复时整批重发覆盖已译内容
+            let texts: Vec<String> = pending.iter().map(|&i| data[i].src_text.clone()).collect();
 
             let context = build_context_for_batch_precomputed(
                 precomputed.as_ref().as_ref(),
@@ -1692,8 +1725,7 @@ pub async fn translate_epub(
                 Ok(response) => {
                     let outcome = process_batch_response(
                         response,
-                        start_idx,
-                        end_idx,
+                        &pending,
                         |idx| data[idx].src_text.clone(),
                         &checker,
                         &fixer,
@@ -1712,15 +1744,14 @@ pub async fn translate_epub(
                 }
                 Err(e) => {
                     warn!("批次 {} API 错误: {}", batch_num, e);
-                    let failed_range: Vec<usize> = (start_idx..end_idx).collect();
-                    for idx in &failed_range {
-                        failure_causes.insert(
-                            *idx,
-                            FailureCause::new("API_ERROR", e.to_string(), "first_pass_api", 0),
-                        );
-                    }
-                    extend_unique(&mut api_failed_indices, failed_range.clone());
-                    extend_unique(&mut all_failed_indices, failed_range);
+                    mark_indices_api_failed(
+                        &pending,
+                        &e.to_string(),
+                        "first_pass_api",
+                        &mut failure_causes,
+                        &mut api_failed_indices,
+                        &mut all_failed_indices,
+                    );
                     emit_progress(
                         &progress_cb,
                         ProgressEvent::Log {
@@ -1770,8 +1801,8 @@ pub async fn translate_epub(
             let end_idx = (start_idx + config.batch_size).min(data.len());
 
             // Skip batch if all blocks already translated (resume support)
-            let all_done = (start_idx..end_idx).all(|i| translations.contains_key(&i));
-            if all_done {
+            let pending = pending_indices_in_range(start_idx, end_idx, &translations);
+            if pending.is_empty() {
                 translated_count += end_idx - start_idx;
                 pb.inc(1);
                 completed_batches += 1;
@@ -1808,16 +1839,16 @@ pub async fn translate_epub(
             let err_rec = error_records_clone.clone();
             let batch_size = config.batch_size;
             let context_lines = config.context_lines;
+            let pending_for_task = pending.clone();
 
             join_set.spawn(async move {
                 let end_idx = (start_idx + batch_size).min(data_c.len());
+                let pending = pending_for_task;
                 let result = async {
                     let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
-                    let texts: Vec<String> = data_c[start_idx..end_idx]
-                        .iter()
-                        .map(|b| b.src_text.clone())
-                        .collect();
+                    let texts: Vec<String> =
+                        pending.iter().map(|&i| data_c[i].src_text.clone()).collect();
 
                     let context = build_context_for_batch_precomputed(
                         pc.as_ref().as_ref(),
@@ -1834,8 +1865,7 @@ pub async fn translate_epub(
 
                     Ok::<_, anyhow::Error>(process_batch_response(
                         response,
-                        start_idx,
-                        end_idx,
+                        &pending,
                         |idx| data_c[idx].src_text.clone(),
                         &chk,
                         &fix,
@@ -1844,7 +1874,8 @@ pub async fn translate_epub(
                 }
                 .await;
 
-                (start_idx, end_idx, result)
+                // 始终带回 pending，便于 join 失败/API 失败时落失败集
+                (pending, result)
             });
         }
 
@@ -1884,7 +1915,7 @@ pub async fn translate_epub(
             pb.inc(1);
 
             match join_result {
-                Ok((_start_idx, _end_idx, Ok(outcome))) => {
+                Ok((pending, Ok(outcome))) => {
                     for (idx, translated) in outcome.fixed {
                         translations.insert(idx, translated);
                         translated_count += 1;
@@ -1895,6 +1926,7 @@ pub async fn translate_epub(
                     extend_unique(&mut api_failed_indices, outcome.api_failed.clone());
                     extend_unique(&mut all_failed_indices, outcome.quality_failed);
                     extend_unique(&mut all_failed_indices, outcome.api_failed);
+                    let _ = pending;
                     emit_progress(
                         &progress_cb,
                         batch_progress_event(
@@ -1908,17 +1940,16 @@ pub async fn translate_epub(
                         ),
                     );
                 }
-                Ok((start_idx, end_idx, Err(e))) => {
+                Ok((pending, Err(e))) => {
                     warn!("批次处理错误: {}", e);
-                    let failed_range: Vec<usize> = (start_idx..end_idx).collect();
-                    for idx in &failed_range {
-                        failure_causes.insert(
-                            *idx,
-                            FailureCause::new("API_ERROR", e.to_string(), "first_pass_api", 0),
-                        );
-                    }
-                    extend_unique(&mut api_failed_indices, failed_range.clone());
-                    extend_unique(&mut all_failed_indices, failed_range);
+                    mark_indices_api_failed(
+                        &pending,
+                        &e.to_string(),
+                        "first_pass_api",
+                        &mut failure_causes,
+                        &mut api_failed_indices,
+                        &mut all_failed_indices,
+                    );
                     emit_progress(
                         &progress_cb,
                         ProgressEvent::Log {
@@ -1939,7 +1970,15 @@ pub async fn translate_epub(
                     );
                 }
                 Err(e) => {
-                    warn!("Task join error: {}", e);
+                    // JoinError 表示任务 panic；无返回值可取，只能记录日志。
+                    // 正常 API 失败路径走 Ok((pending, Err))，索引已覆盖。
+                    warn!("Task join error (panic/cancel): {}", e);
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::Log {
+                            message: format!("任务异常中断: {}", e),
+                        },
+                    );
                     emit_progress(
                         &progress_cb,
                         batch_progress_event(
@@ -2497,10 +2536,8 @@ pub async fn translate_txt(
             let end_idx = (start_idx + config.batch_size).min(data.len());
 
             // Skip batch if all lines already translated (resume support)
-            let untranslated: Vec<usize> = (start_idx..end_idx)
-                .filter(|i| !translations.contains_key(i))
-                .collect();
-            if untranslated.is_empty() {
+            let pending = pending_indices_in_range(start_idx, end_idx, &translations);
+            if pending.is_empty() {
                 translated_count += end_idx - start_idx;
                 pb.inc(1);
                 maybe_autosave_txt_step2(
@@ -2513,10 +2550,7 @@ pub async fn translate_txt(
                 continue;
             }
 
-            let texts: Vec<String> = data[start_idx..end_idx]
-                .iter()
-                .map(|b| b.src_text.clone())
-                .collect();
+            let texts: Vec<String> = pending.iter().map(|&i| data[i].src_text.clone()).collect();
 
             let context = build_context_for_batch_precomputed(
                 precomputed.as_ref().as_ref(),
@@ -2534,8 +2568,7 @@ pub async fn translate_txt(
                 Ok(response) => {
                     let outcome = process_batch_response(
                         response,
-                        start_idx,
-                        end_idx,
+                        &pending,
                         |idx| data[idx].src_text.clone(),
                         &checker,
                         &fixer,
@@ -2554,15 +2587,14 @@ pub async fn translate_txt(
                 }
                 Err(e) => {
                     warn!("TXT 批次 {} API 错误: {}", batch_num, e);
-                    let failed_range: Vec<usize> = (start_idx..end_idx).collect();
-                    for idx in &failed_range {
-                        failure_causes.insert(
-                            *idx,
-                            FailureCause::new("API_ERROR", e.to_string(), "first_pass_api", 0),
-                        );
-                    }
-                    extend_unique(&mut api_failed_indices, failed_range.clone());
-                    extend_unique(&mut all_failed_indices, failed_range);
+                    mark_indices_api_failed(
+                        &pending,
+                        &e.to_string(),
+                        "first_pass_api",
+                        &mut failure_causes,
+                        &mut api_failed_indices,
+                        &mut all_failed_indices,
+                    );
                     emit_progress(
                         &progress_cb,
                         ProgressEvent::Log {
@@ -2609,8 +2641,8 @@ pub async fn translate_txt(
             let end_idx = (start_idx + config.batch_size).min(data.len());
 
             // Skip batch if all lines already translated (resume support)
-            let all_done = (start_idx..end_idx).all(|i| translations.contains_key(&i));
-            if all_done {
+            let pending = pending_indices_in_range(start_idx, end_idx, &translations);
+            if pending.is_empty() {
                 translated_count += end_idx - start_idx;
                 pb.inc(1);
                 completed_batches += 1;
@@ -2646,16 +2678,16 @@ pub async fn translate_txt(
             let err_rec = error_records_clone.clone();
             let batch_size = config.batch_size;
             let context_lines = config.context_lines;
+            let pending_for_task = pending.clone();
 
             join_set.spawn(async move {
                 let end_idx = (start_idx + batch_size).min(data_c.len());
+                let pending = pending_for_task;
                 let result = async {
                     let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
-                    let texts: Vec<String> = data_c[start_idx..end_idx]
-                        .iter()
-                        .map(|b| b.src_text.clone())
-                        .collect();
+                    let texts: Vec<String> =
+                        pending.iter().map(|&i| data_c[i].src_text.clone()).collect();
 
                     let context = build_context_for_batch_precomputed(
                         pc.as_ref().as_ref(),
@@ -2672,8 +2704,7 @@ pub async fn translate_txt(
 
                     Ok::<_, anyhow::Error>(process_batch_response(
                         response,
-                        start_idx,
-                        end_idx,
+                        &pending,
                         |idx| data_c[idx].src_text.clone(),
                         &chk,
                         &fix,
@@ -2682,7 +2713,7 @@ pub async fn translate_txt(
                 }
                 .await;
 
-                (start_idx, end_idx, result)
+                (pending, result)
             });
         }
 
@@ -2722,7 +2753,7 @@ pub async fn translate_txt(
             pb.inc(1);
 
             match join_result {
-                Ok((_start_idx, _end_idx, Ok(outcome))) => {
+                Ok((_pending, Ok(outcome))) => {
                     for (idx, translated) in outcome.fixed {
                         translations.insert(idx, translated);
                         translated_count += 1;
@@ -2746,17 +2777,16 @@ pub async fn translate_txt(
                         ),
                     );
                 }
-                Ok((start_idx, end_idx, Err(e))) => {
+                Ok((pending, Err(e))) => {
                     warn!("TXT 批次处理错误: {}", e);
-                    let failed_range: Vec<usize> = (start_idx..end_idx).collect();
-                    for idx in &failed_range {
-                        failure_causes.insert(
-                            *idx,
-                            FailureCause::new("API_ERROR", e.to_string(), "first_pass_api", 0),
-                        );
-                    }
-                    extend_unique(&mut api_failed_indices, failed_range.clone());
-                    extend_unique(&mut all_failed_indices, failed_range);
+                    mark_indices_api_failed(
+                        &pending,
+                        &e.to_string(),
+                        "first_pass_api",
+                        &mut failure_causes,
+                        &mut api_failed_indices,
+                        &mut all_failed_indices,
+                    );
                     emit_progress(
                         &progress_cb,
                         ProgressEvent::Log {
@@ -2777,7 +2807,13 @@ pub async fn translate_txt(
                     );
                 }
                 Err(e) => {
-                    warn!("Task join error: {}", e);
+                    warn!("Task join error (panic/cancel): {}", e);
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::Log {
+                            message: format!("任务异常中断: {}", e),
+                        },
+                    );
                     emit_progress(
                         &progress_cb,
                         batch_progress_event(
@@ -3075,4 +3111,76 @@ pub async fn translate_txt(
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::ParseDiagnostics;
+
+    #[test]
+    fn pending_indices_skips_already_translated() {
+        let mut done = HashMap::new();
+        done.insert(1usize, "已译".to_string());
+        done.insert(3usize, "已译".to_string());
+        assert_eq!(pending_indices_in_range(0, 5, &done), vec![0, 2, 4]);
+        assert!(pending_indices_in_range(1, 2, &done).is_empty());
+    }
+
+    #[test]
+    fn process_batch_response_maps_sparse_unit_indices() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 3);
+        let fixer = AutoFixer::new("ja", "zh");
+        let error_records = Arc::new(Mutex::new(Vec::new()));
+
+        // 请求只含全局 index 2 和 5，JSONL 序号 1/2
+        let mut translations = HashMap::new();
+        translations.insert(1usize, "二号".to_string());
+        translations.insert(2usize, "五号".to_string());
+        let response = BatchTranslationResponse {
+            translations,
+            diagnostics: ParseDiagnostics::default(),
+        };
+
+        let sources = ["零", "一", "二", "三", "四", "五"];
+        let outcome = process_batch_response(
+            response,
+            &[2, 5],
+            |idx| sources[idx].to_string(),
+            &checker,
+            &fixer,
+            &error_records,
+        );
+
+        assert_eq!(outcome.fixed.get(&2).map(String::as_str), Some("二号"));
+        assert_eq!(outcome.fixed.get(&5).map(String::as_str), Some("五号"));
+        assert!(outcome.api_failed.is_empty());
+    }
+
+    #[test]
+    fn process_batch_response_marks_missing_jsonl_on_pending_only() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 3);
+        let fixer = AutoFixer::new("ja", "zh");
+        let error_records = Arc::new(Mutex::new(Vec::new()));
+
+        let mut translations = HashMap::new();
+        translations.insert(1usize, "仅第一项".to_string());
+        let response = BatchTranslationResponse {
+            translations,
+            diagnostics: ParseDiagnostics::default(),
+        };
+
+        let outcome = process_batch_response(
+            response,
+            &[10, 11],
+            |idx| format!("src{idx}"),
+            &checker,
+            &fixer,
+            &error_records,
+        );
+
+        assert!(outcome.fixed.contains_key(&10));
+        assert_eq!(outcome.api_failed, vec![11]);
+        assert!(outcome.failure_causes.contains_key(&11));
+    }
 }
