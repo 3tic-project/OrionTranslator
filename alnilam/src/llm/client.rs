@@ -23,6 +23,20 @@ struct ChatMessage {
     content: String,
 }
 
+/// DeepSeek / 火山方舟思考模式开关。
+/// 文档：`{"thinking": {"type": "enabled"|"disabled"}}`
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    thinking_type: &'static str,
+}
+
+impl ThinkingConfig {
+    const DISABLED: Self = Self {
+        thinking_type: "disabled",
+    };
+}
+
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
@@ -33,6 +47,9 @@ struct ChatRequest {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_k: Option<u32>,
+    /// 仅对 DeepSeek / 火山方舟等支持该字段的提供商发送，默认关闭思考以降低延迟与成本。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +275,14 @@ impl LlmClient {
             .await
     }
 
+    fn thinking_for_request(&self) -> Option<ThinkingConfig> {
+        if config::should_disable_thinking(&self.llm_url, &self.model) {
+            Some(ThinkingConfig::DISABLED)
+        } else {
+            None
+        }
+    }
+
     async fn call_with_max_tokens(
         &self,
         prompt: &str,
@@ -265,6 +290,7 @@ impl LlmClient {
         max_tokens: u32,
     ) -> Result<Option<String>> {
         let endpoint = config::resolve_chat_completions_endpoint(&self.llm_url);
+        let thinking = self.thinking_for_request();
 
         let payload = ChatRequest {
             model: self.model.clone(),
@@ -276,11 +302,16 @@ impl LlmClient {
             max_tokens,
             top_p: self.top_p,
             top_k: self.top_k,
+            thinking,
         };
 
         debug!(
-            "REQUEST [Batch {}]: endpoint={}, model={}, max_tokens={}",
-            batch_id, endpoint, self.model, max_tokens
+            "REQUEST [Batch {}]: endpoint={}, model={}, max_tokens={}, thinking={:?}",
+            batch_id,
+            endpoint,
+            self.model,
+            max_tokens,
+            payload.thinking.as_ref().map(|t| t.thinking_type)
         );
 
         for attempt in 0..self.max_retries {
@@ -541,5 +572,59 @@ mod tests {
         assert!(glossary_text.contains("ネギ→涅吉\n"));
         assert!(glossary_text.contains("茶々丸→茶茶丸\n"));
         assert!(!glossary_text.contains("なのは"));
+    }
+
+    #[test]
+    fn deepseek_request_disables_thinking_by_default() {
+        let llm = LlmClient::new("https://api.deepseek.com/v1", "deepseek-v4-flash", 1).unwrap();
+        assert_eq!(llm.thinking_for_request(), Some(ThinkingConfig::DISABLED));
+
+        let payload = ChatRequest {
+            model: llm.model().to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            temperature: 0.8,
+            max_tokens: 100,
+            top_p: None,
+            top_k: None,
+            thinking: llm.thinking_for_request(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn volcengine_request_disables_thinking_by_default() {
+        let llm = LlmClient::new(
+            "https://ark.cn-beijing.volces.com/api/v3",
+            "ep-20250101-xxxxx",
+            1,
+        )
+        .unwrap();
+        assert_eq!(llm.thinking_for_request(), Some(ThinkingConfig::DISABLED));
+    }
+
+    #[test]
+    fn orion_request_omits_thinking_field() {
+        let llm =
+            LlmClient::new("http://127.0.0.1:9633/v1", "Orion-Qwen3-1.7B-SFT", 1).unwrap();
+        assert_eq!(llm.thinking_for_request(), None);
+
+        let payload = ChatRequest {
+            model: llm.model().to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+            temperature: 0.3,
+            max_tokens: 100,
+            top_p: None,
+            top_k: None,
+            thinking: llm.thinking_for_request(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json.get("thinking").is_none());
     }
 }

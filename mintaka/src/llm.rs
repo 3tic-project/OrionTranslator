@@ -72,11 +72,37 @@ const PURE_TITLE_CORES: &[&str] = &[
     "お姉ちゃん",
 ];
 
+/// DeepSeek / 火山方舟思考模式开关：`{"thinking":{"type":"disabled"}}`
+#[derive(Debug, Clone, Serialize)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    thinking_type: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f32,
+    /// 仅对 DeepSeek / 火山方舟发送，默认关闭思考。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
+}
+
+fn thinking_for_provider(api_url: &str, model: &str) -> Option<ThinkingConfig> {
+    let model_l = model.trim().to_ascii_lowercase();
+    let url_l = api_url.trim().to_ascii_lowercase();
+    let disable = model_l.contains("deepseek")
+        || url_l.contains("deepseek.com")
+        || url_l.contains("volces.com")
+        || url_l.contains("volcengine.com");
+    if disable {
+        Some(ThinkingConfig {
+            thinking_type: "disabled",
+        })
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -623,6 +649,7 @@ async fn infer_base_name(
                 },
             ],
             temperature: 0.0,
+            thinking: thinking_for_provider(api_url, model),
         };
 
         let resp = client

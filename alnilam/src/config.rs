@@ -192,9 +192,29 @@ pub fn resolve_chat_completions_endpoint(raw_url: &str) -> String {
     format!("{}/chat/completions", trimmed)
 }
 
+/// DeepSeek / 火山方舟等支持思考模式的提供商：默认应显式关闭思考。
+///
+/// - DeepSeek：默认 `thinking.type=enabled`，需传 `{"thinking":{"type":"disabled"}}`
+/// - 火山方舟：通过 `thinking.type` 控制，取值 `enabled` / `disabled`
+///
+/// 本地 Orion 等不支持该字段的兼容接口不应附加，以免 400。
+pub fn should_disable_thinking(llm_url: &str, model: &str) -> bool {
+    let model_l = model.trim().to_ascii_lowercase();
+    if model_l.contains("deepseek") {
+        return true;
+    }
+
+    let url_l = llm_url.trim().to_ascii_lowercase();
+    url_l.contains("deepseek.com")
+        || url_l.contains("volces.com")
+        || url_l.contains("volcengine.com")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resolve_chat_completions_endpoint, validate_css_length};
+    use super::{
+        resolve_chat_completions_endpoint, should_disable_thinking, validate_css_length,
+    };
 
     #[test]
     fn resolves_base_url_to_chat_endpoint() {
@@ -222,6 +242,30 @@ mod tests {
             resolve_chat_completions_endpoint("https://api.deepseek.com"),
             "https://api.deepseek.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn disables_thinking_for_deepseek_and_volcengine() {
+        assert!(should_disable_thinking(
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash"
+        ));
+        assert!(should_disable_thinking(
+            "https://openrouter.ai/api/v1",
+            "deepseek/deepseek-v4-flash"
+        ));
+        assert!(should_disable_thinking(
+            "https://ark.cn-beijing.volces.com/api/v3",
+            "ep-xxxx"
+        ));
+        assert!(!should_disable_thinking(
+            "http://127.0.0.1:9633/v1",
+            "Orion-Qwen3-1.7B-SFT"
+        ));
+        assert!(!should_disable_thinking(
+            "https://api.openai.com/v1",
+            "gpt-4o-mini"
+        ));
     }
 
     #[test]
