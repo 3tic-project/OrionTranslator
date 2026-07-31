@@ -279,8 +279,9 @@ fn simplify_svg_images(documents: &mut [DocumentItem]) {
                 }
                 _ => String::new(),
             };
+            // 使用 XHTML 自闭合，避免写回 EPUB 时残留 HTML5 void 形态
             let replacement = format!(
-                r#"<div class="orion-image-wrapper"><img src="{}" class="orion-responsive-img"{} style="max-width:100%;max-height:100vh;width:auto;height:auto" alt="illustration"></div>"#,
+                r#"<div class="orion-image-wrapper"><img src="{}" class="orion-responsive-img"{} style="max-width:100%;max-height:100vh;width:auto;height:auto" alt="illustration" /></div>"#,
                 escape_attr(&src),
                 dim_attrs
             );

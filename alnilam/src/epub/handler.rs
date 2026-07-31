@@ -591,6 +591,14 @@ impl EpubHandler {
             .filter(|doc| doc.modified)
             .filter_map(|doc| {
                 let xhtml = restore_xhtml_void_elements(&doc.content);
+                // 尽力做 XML 合法性探查（失败不阻断写回，但留下可观测信号）
+                if let Err(e) = roxmltree::Document::parse(&xhtml) {
+                    tracing::warn!(
+                        "Modified document '{}' is not well-formed XML after void restore: {}",
+                        doc.name,
+                        e
+                    );
+                }
                 self.raw_item_key_for_document(&doc.name)
                     .map(|key| (key, xhtml.into_bytes()))
                     .or_else(|| {

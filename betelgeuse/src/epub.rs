@@ -320,27 +320,44 @@ pub fn normalize_void_elements(content: &str) -> String {
 /// 将 HTML5 风格 void 元素还原为 XHTML 自闭合形式，便于写回 EPUB3。
 /// e.g., `<br>` → `<br />`, `<img src="a">` → `<img src="a" />`
 ///
-/// 已是 `.../>` 的标签保持不变。
+/// 已是 `.../>` 的标签保持不变。也会收敛错误的 `</br>` / `</img>` 闭合写法。
 pub fn restore_xhtml_void_elements(content: &str) -> String {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
+    static OPEN_RE: OnceLock<Regex> = OnceLock::new();
+    static CLOSE_RE: OnceLock<Regex> = OnceLock::new();
+    let open_re = OPEN_RE.get_or_init(|| {
         Regex::new(
             r#"(?i)<(br|hr|img|input|meta|link|col|area|base|embed|param|source|track|wbr)\b([^>]*?)>"#,
         )
         .unwrap()
     });
-    re.replace_all(content, |caps: &regex::Captures| {
+    let close_re = CLOSE_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)</(br|hr|img|input|meta|link|col|area|base|embed|param|source|track|wbr)\s*>"#,
+        )
+        .unwrap()
+    });
+
+    let with_open = open_re.replace_all(content, |caps: &regex::Captures| {
         let tag = &caps[1];
         let attrs = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        if attrs.trim_end().ends_with('/') {
-            format!("<{}{}>", tag, attrs)
+        let attrs = attrs.trim_end();
+        if attrs.ends_with('/') {
+            // 已自闭合：规范为 ` />`
+            let attrs_wo = attrs.trim_end_matches('/').trim_end();
+            if attrs_wo.is_empty() {
+                format!("<{} />", tag)
+            } else {
+                format!("<{} {} />", tag, attrs_wo)
+            }
         } else if attrs.is_empty() {
             format!("<{} />", tag)
         } else {
-            format!("<{}{} />", tag, attrs.trim_end())
+            format!("<{} {} />", tag, attrs)
         }
-    })
-    .to_string()
+    });
+
+    // 去掉 void 元素的显式结束标签（HTML5 容错残留）
+    close_re.replace_all(&with_open, "").to_string()
 }
 
 // ── Text Extraction ─────────────────────────────────────────────────────
@@ -484,12 +501,17 @@ mod tests {
         assert!(html5.contains(r#"<img src="x.png">"#));
         let restored = restore_xhtml_void_elements(&html5);
         assert!(restored.contains("<br />"));
-        assert!(restored.contains(r#"<img src="x.png" />"#));
+        assert!(restored.contains(r#"src="x.png""#));
+        assert!(restored.contains("<img "));
+        assert!(restored.contains("/>"));
         // already self-closing should not double slash
-        assert_eq!(
-            restore_xhtml_void_elements("<br />"),
-            "<br />"
-        );
+        assert_eq!(restore_xhtml_void_elements("<br />"), "<br />");
+        // format_fixer 风格的未自闭合 img + 错误闭合
+        let messy = r#"<div><img src="a.jpg" alt="illustration"></div>"#;
+        let fixed = restore_xhtml_void_elements(messy);
+        assert!(fixed.contains("/>"), "expected self-close: {fixed}");
+        assert!(!fixed.contains("<img src=\"a.jpg\" alt=\"illustration\">"));
+        assert_eq!(restore_xhtml_void_elements("<br></br>"), "<br />");
     }
 }
 
