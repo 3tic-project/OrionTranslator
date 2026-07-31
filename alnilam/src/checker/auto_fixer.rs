@@ -19,12 +19,9 @@ const ONOMATOPOEIA_KANA: &[char] = &[
     'ッ', 'っ', 'ぁ', 'ぃ', 'ぅ', 'ぇ', 'ぉ', 'ゃ', 'ゅ', 'ょ', 'ゎ',
 ];
 
-/// Punctuation mapping: Japanese punctuation -> alternatives that LLMs may produce
+/// Punctuation mapping: Japanese punctuation -> alternatives that LLMs may produce.
+/// 引号（「」『』）不在此表：嵌套时计数冲突会导致整段跳过，改由 `fix_quotes_fn` 专门处理。
 const PUNCTUATION_MAP: &[(&str, &[&str])] = &[
-    ("「", &["\u{201C}", "\u{2018}"]), // "" '
-    ("」", &["\u{201D}", "\u{2019}"]), // "" '
-    ("『", &["\u{201C}", "\u{2018}"]),
-    ("』", &["\u{201D}", "\u{2019}"]),
     ("（", &["("]),
     ("）", &[")"]),
     ("【", &["["]),
@@ -125,47 +122,76 @@ impl AutoFixer {
         result
     }
 
+    /// 将译文中的中文/西文引号规范为日文引号，覆盖段中嵌套与首尾。
+    ///
+    /// 约定（与轻小说日→中常见写法对齐）：
+    /// - 大引号「」 ← 中文双引号 “ ”、ASCII `"`、全角 ＂
+    /// - 小引号『』 ← 中文单引号 ‘ ’、ASCII `'`（仅在原文含『』时）、全角 ＇
+    ///
+    /// 仅当原文出现对应日文引号时才转换，避免改写正文里本就合理的中文引号。
     fn fix_quotes_fn(&self, src: &str, dst: &str) -> String {
-        let mut result = dst.to_string();
+        let src_has_kagi = src.contains('「') || src.contains('」');
+        let src_has_nijuu = src.contains('『') || src.contains('』');
 
-        let open_quotes = ['"', '\'', '「', '『', '\u{201C}', '\u{2018}'];
-        let close_quotes = ['"', '\'', '」', '』', '\u{201D}', '\u{2019}'];
-
-        let quote_pairs: &[(&str, &str)] = &[
-            ("「", "」"),
-            ("『", "』"),
-            ("\u{201C}", "\u{201D}"),
-            ("\u{2018}", "\u{2019}"),
-        ];
-
-        for &(open_q, close_q) in quote_pairs {
-            // Fix opening quote
-            if src.starts_with(open_q) {
-                if let Some(first_char) = result.chars().next() {
-                    if open_quotes.contains(&first_char) {
-                        let first_str: String = std::iter::once(first_char).collect();
-                        if first_str != open_q {
-                            result = format!("{}{}", open_q, &result[first_char.len_utf8()..]);
-                        }
-                    }
-                }
-            }
-
-            // Fix closing quote
-            if src.ends_with(close_q) {
-                if let Some(last_char) = result.chars().last() {
-                    if close_quotes.contains(&last_char) {
-                        let last_str: String = std::iter::once(last_char).collect();
-                        if last_str != close_q {
-                            let byte_len = result.len() - last_char.len_utf8();
-                            result = format!("{}{}", &result[..byte_len], close_q);
-                        }
-                    }
-                }
-            }
+        if !src_has_kagi && !src_has_nijuu {
+            return dst.to_string();
         }
 
-        result
+        // 原文只有「」时，中文单引号也归入大引号（LLM 偶发只用 ‘’）
+        let single_to_nijuu = src_has_nijuu;
+        let single_to_kagi = src_has_kagi && !src_has_nijuu;
+
+        let mut out = String::with_capacity(dst.len());
+        let mut ascii_double_open = true;
+        let mut ascii_single_open = true;
+        let mut fullwidth_double_open = true;
+        let mut fullwidth_single_open = true;
+
+        for ch in dst.chars() {
+            let mapped = match ch {
+                // 中文弯双引号 → 「」
+                '\u{201C}' if src_has_kagi => Some('「'),
+                '\u{201D}' if src_has_kagi => Some('」'),
+                // 中文弯单引号 → 『』 或 「」（取决于原文是否有小引号）
+                '\u{2018}' if single_to_nijuu => Some('『'),
+                '\u{2019}' if single_to_nijuu => Some('』'),
+                '\u{2018}' if single_to_kagi => Some('「'),
+                '\u{2019}' if single_to_kagi => Some('」'),
+                // ASCII 双引号：按开合交替映射
+                '"' if src_has_kagi => {
+                    let q = if ascii_double_open { '「' } else { '」' };
+                    ascii_double_open = !ascii_double_open;
+                    Some(q)
+                }
+                // ASCII 单引号：仅在原文有『』时改写，避免误伤英文撇号
+                '\'' if single_to_nijuu => {
+                    let q = if ascii_single_open { '『' } else { '』' };
+                    ascii_single_open = !ascii_single_open;
+                    Some(q)
+                }
+                // 全角引号
+                '＂' if src_has_kagi => {
+                    let q = if fullwidth_double_open { '「' } else { '」' };
+                    fullwidth_double_open = !fullwidth_double_open;
+                    Some(q)
+                }
+                '＇' if single_to_nijuu => {
+                    let q = if fullwidth_single_open { '『' } else { '』' };
+                    fullwidth_single_open = !fullwidth_single_open;
+                    Some(q)
+                }
+                '＇' if single_to_kagi => {
+                    let q = if fullwidth_single_open { '「' } else { '」' };
+                    fullwidth_single_open = !fullwidth_single_open;
+                    Some(q)
+                }
+                _ => None,
+            };
+
+            out.push(mapped.unwrap_or(ch));
+        }
+
+        out
     }
 }
 
@@ -178,6 +204,44 @@ mod tests {
         let fixer = AutoFixer::new("ja", "zh");
         let fixed = fixer.fix("「こんにちは」", "\u{201C}你好\u{201D}");
         assert_eq!(fixed, "「你好」");
+    }
+
+    #[test]
+    fn test_fix_nested_quotes_mid_sentence() {
+        let fixer = AutoFixer::new("ja", "zh");
+        let src = "「謎が解けたらトイレに入れるよ、おにーちゃん！『お漏らしの危機からの脱出』だね！」";
+        let dst = "\u{201C}哥哥！谜题解开了就能进厕所哦！——\u{2018}从漏尿危机中逃脱\u{2019}！\u{201D}";
+        let fixed = fixer.fix(src, dst);
+        assert_eq!(
+            fixed,
+            "「哥哥！谜题解开了就能进厕所哦！——『从漏尿危机中逃脱』！」"
+        );
+    }
+
+    #[test]
+    fn test_fix_quotes_inside_narrative_paragraph() {
+        let fixer = AutoFixer::new("ja", "zh");
+        let src = "なんのことはない。ミリハが「謎が解けたら入れるよ！『脱出』だね！」などと紙を押し付けてきた。";
+        let dst = "说来也没什么大不了。米莉哈把纸塞过来，说什么\u{201C}哥哥！解开就能进！——\u{2018}逃脱\u{2019}！\u{201D}之类的。";
+        let fixed = fixer.fix(src, dst);
+        assert!(fixed.contains("「哥哥！解开就能进！——『逃脱』！」"));
+        assert!(!fixed.contains('\u{201C}'));
+        assert!(!fixed.contains('\u{2018}'));
+    }
+
+    #[test]
+    fn test_fix_ascii_double_quotes_when_src_has_kagi() {
+        let fixer = AutoFixer::new("ja", "zh");
+        let fixed = fixer.fix("「こんにちは」", "\"你好\"");
+        assert_eq!(fixed, "「你好」");
+    }
+
+    #[test]
+    fn test_no_quote_rewrite_when_src_has_no_japanese_quotes() {
+        let fixer = AutoFixer::new("ja", "zh");
+        let dst = "他说\u{201C}你好\u{201D}。";
+        let fixed = fixer.fix("彼は挨拶した。", dst);
+        assert_eq!(fixed, dst);
     }
 
     #[test]
