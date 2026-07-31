@@ -124,9 +124,11 @@ impl ContextDetector {
         }
 
         // ── Position-aware weight adjustment ────────────────────────────
+        // 句首奖励按「字符」计，不能用 UTF-8 字节偏移与 SENTENCE_INITIAL_CHARS 直接比较
         let stripped = line.trim_start_matches(|c: char| "「『【《（(\u{3000} ".contains(c));
-        let initial_offset = line.len() - stripped.len();
-        all_matches = self.apply_position_bonus(all_matches, initial_offset);
+        let prefix_byte_len = line.len() - stripped.len();
+        let initial_char_offset = byte_offset_to_char_index(line, prefix_byte_len);
+        all_matches = self.apply_position_bonus(line, all_matches, initial_char_offset);
 
         // ── Short dialogue auto-detection ───────────────────────────────
         if line_type == LineType::Dialogue {
@@ -453,8 +455,9 @@ impl ContextDetector {
 
     fn apply_position_bonus(
         &self,
+        line: &str,
         matches: Vec<KeywordMatch>,
-        initial_offset: usize,
+        initial_char_offset: usize,
     ) -> Vec<KeywordMatch> {
         let discourse_categories: HashSet<&str> = [
             "discourse_cause_result",
@@ -471,9 +474,11 @@ impl ContextDetector {
             .into_iter()
             .map(|mut m| {
                 if discourse_categories.contains(m.category_id.as_str()) {
-                    if m.start >= initial_offset {
-                        let effective_pos = m.start - initial_offset;
-                        if effective_pos < SENTENCE_INITIAL_CHARS {
+                    // KeywordMatch.start/end 存的是字节偏移；奖励窗口用字符序号
+                    let match_char_start = byte_offset_to_char_index(line, m.start);
+                    if match_char_start >= initial_char_offset {
+                        let effective_chars = match_char_start - initial_char_offset;
+                        if effective_chars < SENTENCE_INITIAL_CHARS {
                             m.weight = (m.weight * SENTENCE_INITIAL_BONUS * 10.0).round() / 10.0;
                         }
                     }
@@ -537,9 +542,73 @@ impl ContextDetector {
     }
 }
 
+/// 将字节偏移转为 Unicode 标量序号；偏移超出或落在码点中间时钳到最近合法位置。
+fn byte_offset_to_char_index(s: &str, byte_offset: usize) -> usize {
+    if byte_offset == 0 {
+        return 0;
+    }
+    if byte_offset >= s.len() {
+        return s.chars().count();
+    }
+    // floor to char boundary
+    let mut end = byte_offset;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].chars().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_offset_to_char_index_handles_multibyte() {
+        // 每个日文假名 3 字节
+        let s = "あいうえお";
+        assert_eq!(byte_offset_to_char_index(s, 0), 0);
+        assert_eq!(byte_offset_to_char_index(s, 3), 1);
+        assert_eq!(byte_offset_to_char_index(s, 9), 3);
+        assert_eq!(byte_offset_to_char_index(s, s.len()), 5);
+    }
+
+    #[test]
+    fn position_bonus_uses_char_window_not_bytes() {
+        // 前缀「」各 3 字节；若误用字节比较，SENTENCE_INITIAL_CHARS=6 只能覆盖 2 个假名
+        let config = serde_json::json!({
+            "boundaries": {
+                "scene_break_regex": [],
+                "chapter_heading_regex": [],
+                "metadata_regex": []
+            },
+            "categories": [{
+                "id": "discourse_cause_result",
+                "label": "因果",
+                "priority": 1,
+                "base_weight": 10.0,
+                "actions": {},
+                "match": {
+                    "keywords": [{"text": "だから", "weight": 10.0}],
+                    "regex": []
+                }
+            }]
+        });
+        let detector = ContextDetector::from_config(&config).expect("config");
+        // 「あああだから…」：だから 在引号后第 4 字符处（字符索引 1+3=4），仍应在 6 字窗口内
+        let line = "「あああだから行った」";
+        let result = detector.detect_line(line, &[]);
+        let hit = result
+            .matches
+            .iter()
+            .find(|m| m.category_id == "discourse_cause_result")
+            .expect("keyword should match");
+        // 基础 10 * 1.4 = 14
+        assert!(
+            (hit.weight - 14.0).abs() < 0.01,
+            "expected sentence-initial bonus, got {}",
+            hit.weight
+        );
+    }
 
     #[test]
     fn test_classify_line() {
