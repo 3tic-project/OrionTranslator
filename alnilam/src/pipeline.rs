@@ -997,6 +997,44 @@ fn mark_indices_api_failed(
     extend_unique(all_failed_indices, indices.to_vec());
 }
 
+/// 任务 panic/abort 时 Drop 会把 pending 索引登记到共享列表，供 JoinError 分支回收。
+/// 正常返回前调用 [`FlightIndexGuard::disarm`] 解除登记。
+struct FlightIndexGuard {
+    sink: Arc<Mutex<Vec<usize>>>,
+    pending: Option<Vec<usize>>,
+}
+
+impl FlightIndexGuard {
+    fn arm(sink: Arc<Mutex<Vec<usize>>>, pending: Vec<usize>) -> Self {
+        Self {
+            sink,
+            pending: Some(pending),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pending = None;
+    }
+}
+
+impl Drop for FlightIndexGuard {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            if let Ok(mut sink) = self.sink.lock() {
+                sink.extend(pending);
+            }
+        }
+    }
+}
+
+fn drain_orphaned_flight_indices(sink: &Arc<Mutex<Vec<usize>>>) -> Vec<usize> {
+    let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+    let mut drained = std::mem::take(&mut *guard);
+    drained.sort_unstable();
+    drained.dedup();
+    drained
+}
+
 // ============================================================================
 // Context Building
 // ============================================================================
@@ -1174,7 +1212,7 @@ fn record_skipped_retry_errors(
 }
 
 async fn retry_failed_with_context(
-    llm: &LlmClient,
+    llm: Arc<LlmClient>,
     checker: &ResponseChecker,
     fixer: &AutoFixer,
     precomputed: Option<&PrecomputedContext>,
@@ -1327,34 +1365,26 @@ async fn retry_failed_with_context(
         },
     );
 
+    let orphan_indices = Arc::new(Mutex::new(Vec::<usize>::new()));
+
     for (idx, full_context) in retry_items {
         let sem = semaphore.clone();
         let src_text = data[idx].0.clone();
         let batch_id = format!("retry_{}_{}", idx, current_retry);
-        // We need to reference the LlmClient, checker, fixer etc.
-        // Since they are borrowed, we use pointers via unsafe or restructure.
-        // Instead, we'll build the prompt and call inline.
-        // But LlmClient is not Send-safe for sharing across tasks easily.
-        // Actually, translate_single takes &self, so we need Arc.
-        // Let's use a simple approach: create a lightweight future per item.
-        let llm_url = llm.llm_url().to_string();
-        let model = llm.model().to_string();
-        let temperature = llm.temperature();
-        let top_p = llm.top_p();
-        let top_k = llm.top_k();
-        let glossary_text = llm.glossary_text().to_string();
-        let orion_glossary_text = llm.orion_glossary_text().map(|s| s.to_string());
-        let glossary_entries = llm.glossary_entries().to_vec();
-        let api_key = llm.api_key().cloned();
+        // 共享同一 LlmClient（含连接池），避免每行重建 HTTP client
+        let llm = llm.clone();
         let err_rec = error_records.clone();
         let task_cancel = cancel_flag.clone();
+        let orphan_sink = orphan_indices.clone();
 
         join_set.spawn(async move {
+            let mut flight = FlightIndexGuard::arm(orphan_sink, vec![idx]);
             // Check cancel before waiting for semaphore
             if task_cancel
                 .as_ref()
                 .is_some_and(|f| f.load(Ordering::Relaxed))
             {
+                flight.disarm();
                 return (idx, src_text, Ok(None), err_rec);
             }
             let result = async {
@@ -1366,23 +1396,11 @@ async fn retry_failed_with_context(
                 {
                     return Ok(None);
                 }
-                let retry_llm = LlmClient::with_params_and_glossary_entries(
-                    &llm_url,
-                    &model,
-                    1,
-                    temperature,
-                    top_p,
-                    top_k,
-                    glossary_text,
-                    orion_glossary_text,
-                    api_key,
-                    glossary_entries,
-                )?;
-                retry_llm
-                    .translate_single(&src_text, &full_context, &batch_id)
+                llm.translate_single(&src_text, &full_context, &batch_id)
                     .await
             }
             .await;
+            flight.disarm();
             (idx, src_text, result, err_rec)
         });
     }
@@ -1459,9 +1477,24 @@ async fn retry_failed_with_context(
                 still_failed.push(idx);
             }
             Err(e) => {
-                // JoinError 无 payload；在任务内部避免 panic，此处只能记日志。
-                // 若能拿到 idx 的路径已在 Ok 分支处理。
+                // panic/abort：FlightIndexGuard Drop 已写入 orphan_indices
                 warn!("重试任务 join 错误 (panic/cancel): {}", e);
+                let orphaned = drain_orphaned_flight_indices(&orphan_indices);
+                if !orphaned.is_empty() {
+                    let mut causes = failure_causes.lock().unwrap_or_else(|e| e.into_inner());
+                    for idx in &orphaned {
+                        causes.insert(
+                            *idx,
+                            FailureCause::new(
+                                "TASK_JOIN_ERROR",
+                                e.to_string(),
+                                "retry_join",
+                                current_retry,
+                            ),
+                        );
+                        still_failed.push(*idx);
+                    }
+                }
             }
         }
 
@@ -1479,7 +1512,7 @@ async fn retry_failed_with_context(
 
     if !still_failed.is_empty() && current_retry < max_retry && !is_cancelled(cancel_flag) {
         let more = Box::pin(retry_failed_with_context(
-            llm,
+            llm.clone(),
             checker,
             fixer,
             precomputed,
@@ -1659,7 +1692,8 @@ pub async fn translate_epub(
     let glossary_entries = load_glossary_entries(config);
     let glossary_text = glossary::format_glossary(&glossary_entries);
     let orion_glossary_text = glossary::format_glossary_for_orion(&glossary_entries);
-    let llm = LlmClient::with_params_and_glossary_entries(
+    // 全程共享同一 LlmClient（含连接池），首轮与重试不再重复建连
+    let llm = Arc::new(LlmClient::with_params_and_glossary_entries(
         &config.llm_url,
         &config.model,
         3,
@@ -1670,7 +1704,7 @@ pub async fn translate_epub(
         orion_glossary_text.clone(),
         config.api_key.clone(),
         glossary_entries.clone(),
-    )?;
+    )?);
     let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
 
@@ -1803,7 +1837,6 @@ pub async fn translate_epub(
     } else {
         // Concurrent processing
         let semaphore = Arc::new(tokio::sync::Semaphore::new(config.workers));
-        let llm = Arc::new(llm);
         let detector_arc = detector.clone();
         let precomputed_arc = precomputed.clone();
         let all_src_lines = Arc::new(all_src_lines.clone());
@@ -1811,6 +1844,7 @@ pub async fn translate_epub(
         let checker = Arc::new(checker);
         let fixer = Arc::new(fixer);
         let error_records_clone = error_records.clone();
+        let orphan_indices = Arc::new(Mutex::new(Vec::<usize>::new()));
 
         let mut join_set = tokio::task::JoinSet::new();
         let mut completed_batches = 0usize;
@@ -1858,10 +1892,12 @@ pub async fn translate_epub(
             let batch_size = config.batch_size;
             let context_lines = config.context_lines;
             let pending_for_task = pending.clone();
+            let orphan_sink = orphan_indices.clone();
 
             join_set.spawn(async move {
                 let end_idx = (start_idx + batch_size).min(data_c.len());
                 let pending = pending_for_task;
+                let mut flight = FlightIndexGuard::arm(orphan_sink, pending.clone());
                 let result = async {
                     let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -1892,6 +1928,7 @@ pub async fn translate_epub(
                 }
                 .await;
 
+                flight.disarm();
                 // 始终带回 pending，便于 join 失败/API 失败时落失败集
                 (pending, result)
             });
@@ -1988,13 +2025,22 @@ pub async fn translate_epub(
                     );
                 }
                 Err(e) => {
-                    // JoinError 表示任务 panic；无返回值可取，只能记录日志。
-                    // 正常 API 失败路径走 Ok((pending, Err))，索引已覆盖。
                     warn!("Task join error (panic/cancel): {}", e);
+                    let orphaned = drain_orphaned_flight_indices(&orphan_indices);
+                    if !orphaned.is_empty() {
+                        mark_indices_api_failed(
+                            &orphaned,
+                            &format!("task join/panic: {e}"),
+                            "first_pass_join",
+                            &mut failure_causes,
+                            &mut api_failed_indices,
+                            &mut all_failed_indices,
+                        );
+                    }
                     emit_progress(
                         &progress_cb,
                         ProgressEvent::Log {
-                            message: format!("任务异常中断: {}", e),
+                            message: format!("任务异常中断: {}（已登记 {} 个单元）", e, orphaned.len()),
                         },
                     );
                     emit_progress(
@@ -2099,18 +2145,6 @@ pub async fn translate_epub(
             );
         }
 
-        let llm_retry = LlmClient::with_params_and_glossary_entries(
-            &config.llm_url,
-            &config.model,
-            1,
-            config.temperature,
-            Some(config.top_p),
-            Some(config.top_k),
-            glossary_text.clone(),
-            orion_glossary_text.clone(),
-            config.api_key.clone(),
-            glossary_entries.clone(),
-        )?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");
         let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
@@ -2119,7 +2153,7 @@ pub async fn translate_epub(
             HashMap::new()
         } else {
             retry_failed_with_context(
-                &llm_retry,
+                llm.clone(),
                 &checker_retry,
                 &fixer_retry,
                 precomputed.as_ref().as_ref(),
@@ -2492,7 +2526,7 @@ pub async fn translate_txt(
     let glossary_entries = load_glossary_entries(config);
     let glossary_text = glossary::format_glossary(&glossary_entries);
     let orion_glossary_text = glossary::format_glossary_for_orion(&glossary_entries);
-    let llm = LlmClient::with_params_and_glossary_entries(
+    let llm = Arc::new(LlmClient::with_params_and_glossary_entries(
         &config.llm_url,
         &config.model,
         3,
@@ -2503,7 +2537,7 @@ pub async fn translate_txt(
         orion_glossary_text.clone(),
         config.api_key.clone(),
         glossary_entries.clone(),
-    )?;
+    )?);
     let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
 
@@ -2646,11 +2680,11 @@ pub async fn translate_txt(
     } else {
         // Concurrent processing with JoinSet
         let semaphore = Arc::new(tokio::sync::Semaphore::new(config.workers));
-        let llm = Arc::new(llm);
         let data_arc = Arc::new(data.clone());
         let checker = Arc::new(checker);
         let fixer = Arc::new(fixer);
         let error_records_clone = error_records.clone();
+        let orphan_indices = Arc::new(Mutex::new(Vec::<usize>::new()));
 
         let mut join_set = tokio::task::JoinSet::new();
         let mut completed_batches = 0usize;
@@ -2697,10 +2731,12 @@ pub async fn translate_txt(
             let batch_size = config.batch_size;
             let context_lines = config.context_lines;
             let pending_for_task = pending.clone();
+            let orphan_sink = orphan_indices.clone();
 
             join_set.spawn(async move {
                 let end_idx = (start_idx + batch_size).min(data_c.len());
                 let pending = pending_for_task;
+                let mut flight = FlightIndexGuard::arm(orphan_sink, pending.clone());
                 let result = async {
                     let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -2731,6 +2767,7 @@ pub async fn translate_txt(
                 }
                 .await;
 
+                flight.disarm();
                 (pending, result)
             });
         }
@@ -2826,10 +2863,25 @@ pub async fn translate_txt(
                 }
                 Err(e) => {
                     warn!("Task join error (panic/cancel): {}", e);
+                    let orphaned = drain_orphaned_flight_indices(&orphan_indices);
+                    if !orphaned.is_empty() {
+                        mark_indices_api_failed(
+                            &orphaned,
+                            &format!("task join/panic: {e}"),
+                            "first_pass_join",
+                            &mut failure_causes,
+                            &mut api_failed_indices,
+                            &mut all_failed_indices,
+                        );
+                    }
                     emit_progress(
                         &progress_cb,
                         ProgressEvent::Log {
-                            message: format!("任务异常中断: {}", e),
+                            message: format!(
+                                "任务异常中断: {}（已登记 {} 个单元）",
+                                e,
+                                orphaned.len()
+                            ),
                         },
                     );
                     emit_progress(
@@ -2931,18 +2983,6 @@ pub async fn translate_txt(
             );
         }
 
-        let llm_retry = LlmClient::with_params_and_glossary_entries(
-            &config.llm_url,
-            &config.model,
-            1,
-            config.temperature,
-            Some(config.top_p),
-            Some(config.top_k),
-            glossary_text.clone(),
-            orion_glossary_text.clone(),
-            config.api_key.clone(),
-            glossary_entries.clone(),
-        )?;
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
         let fixer_retry = AutoFixer::new("ja", "zh");
         let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
@@ -2951,7 +2991,7 @@ pub async fn translate_txt(
             HashMap::new()
         } else {
             retry_failed_with_context(
-                &llm_retry,
+                llm.clone(),
                 &checker_retry,
                 &fixer_retry,
                 precomputed.as_ref().as_ref(),
