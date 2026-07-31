@@ -153,6 +153,22 @@ pub struct GlossaryConfig {
     pub skip_llm_translation: bool,
 }
 
+impl GlossaryConfig {
+    /// 校验会触发 panic/永久等待的参数（`step_by(0)`、0-permit semaphore）。
+    pub fn validate(&self) -> Result<()> {
+        if self.ner_batch_size == 0 {
+            anyhow::bail!("ner_batch_size 必须 >= 1（当前为 0，会导致 step_by panic）");
+        }
+        if !self.skip_llm_translation && self.llm_workers == 0 {
+            anyhow::bail!("llm_workers 必须 >= 1（当前为 0，会导致信号量永久等待）");
+        }
+        if self.min_count == 0 {
+            anyhow::bail!("min_count 必须 >= 1");
+        }
+        Ok(())
+    }
+}
+
 /// Run the full glossary generation pipeline:
 /// 1. Load NER model (wgpu)
 /// 2. Run NER to detect characters from provided text lines
@@ -167,6 +183,8 @@ pub async fn generate_glossary(
     progress: GlossaryProgressCallback,
 ) -> Result<std::path::PathBuf> {
     use burn::backend::wgpu::{Wgpu, WgpuDevice};
+
+    config.validate()?;
 
     emit(
         &progress,
@@ -243,7 +261,8 @@ pub async fn generate_glossary(
         emit(
             &progress,
             GlossaryProgressEvent::Log {
-                message: "Orion模型模式：跳过LLM翻译，生成原始术语表（dst和info为空）".to_string(),
+                message: "Orion模型模式：跳过LLM译名，生成人物候选术语表（dst 为空，翻译时作实体提示）"
+                    .to_string(),
             },
         );
         // Create raw entries with empty dst/info for Orion models
@@ -297,4 +316,50 @@ pub async fn generate_glossary(
 /// Check if a model name is a "generic" (non-Orion) model
 pub fn is_generic_model(model_name: &str) -> bool {
     !model_name.to_lowercase().contains("orion")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn sample_config() -> GlossaryConfig {
+        GlossaryConfig {
+            lines: vec!["テスト".into()],
+            model_dir: ".".into(),
+            ner_batch_size: 8,
+            min_count: 1,
+            llm_url: "http://127.0.0.1/v1".into(),
+            llm_api_key: String::new(),
+            llm_model: "deepseek-v4-flash".into(),
+            llm_workers: 4,
+            output_path: PathBuf::from("/tmp/glossary.json"),
+            skip_llm_translation: false,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_batch_and_workers() {
+        let mut cfg = sample_config();
+        cfg.ner_batch_size = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = sample_config();
+        cfg.llm_workers = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = sample_config();
+        cfg.llm_workers = 0;
+        cfg.skip_llm_translation = true;
+        // Orion 跳过 LLM 时 workers 可为 0
+        assert!(cfg.validate().is_ok());
+
+        assert!(sample_config().validate().is_ok());
+    }
+
+    #[test]
+    fn is_generic_model_detects_orion_substring() {
+        assert!(!is_generic_model("Orion-Qwen3-1.7B-SFT"));
+        assert!(is_generic_model("deepseek-v4-flash"));
+    }
 }

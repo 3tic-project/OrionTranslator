@@ -121,6 +121,10 @@ pub async fn detect_characters_embedded<B: Backend + 'static>(
     min_count: usize,
     progress: GlossaryProgressCallback,
 ) -> Result<HashMap<String, CharacterInfo>> {
+    if batch_size == 0 {
+        anyhow::bail!("NER batch_size 必须 >= 1");
+    }
+
     // Filter valid lines
     let mut valid_lines: Vec<String> = Vec::new();
     let mut line_indices: Vec<usize> = Vec::new();

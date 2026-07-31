@@ -188,6 +188,8 @@ impl LlmClient {
         max_concurrent: usize,
         progress: GlossaryProgressCallback,
     ) -> Vec<TranslationEntry> {
+        // 0 permits 会导致 acquire 永久阻塞
+        let max_concurrent = max_concurrent.max(1);
         let clusters = build_name_clusters(characters);
         let total = clusters.len();
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
