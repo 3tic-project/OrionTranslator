@@ -231,6 +231,13 @@ fn re_digits() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\d+").expect("digits regex"))
 }
 
+fn re_cjk_numbers() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"[〇零一二三四五六七八九十百千万萬億亿兆]+").expect("CJK number regex")
+    })
+}
+
 fn re_placeholder() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
@@ -247,6 +254,127 @@ fn token_multiset(regex: &Regex, text: &str) -> BTreeMap<String, usize> {
         *tokens.entry(matched.as_str().to_string()).or_default() += 1;
     }
     tokens
+}
+
+fn canonical_arabic_numbers(text: &str) -> BTreeMap<String, usize> {
+    let normalized = fullwidth_to_halfwidth(text);
+    let mut numbers = BTreeMap::new();
+    for matched in re_digits().find_iter(&normalized) {
+        let canonical = matched.as_str().trim_start_matches('0');
+        let canonical = if canonical.is_empty() { "0" } else { canonical };
+        *numbers.entry(canonical.to_string()).or_default() += 1;
+    }
+    numbers
+}
+
+fn cjk_numeric_value(token: &str) -> Option<u128> {
+    fn digit(character: char) -> Option<u128> {
+        match character {
+            '〇' | '零' => Some(0),
+            '一' => Some(1),
+            '二' => Some(2),
+            '三' => Some(3),
+            '四' => Some(4),
+            '五' => Some(5),
+            '六' => Some(6),
+            '七' => Some(7),
+            '八' => Some(8),
+            '九' => Some(9),
+            _ => None,
+        }
+    }
+
+    let has_unit = token.chars().any(|character| {
+        matches!(
+            character,
+            '十' | '百' | '千' | '万' | '萬' | '億' | '亿' | '兆'
+        )
+    });
+    if !has_unit {
+        let mut value = 0u128;
+        for character in token.chars() {
+            value = value.checked_mul(10)?.checked_add(digit(character)?)?;
+        }
+        return Some(value);
+    }
+
+    let mut total = 0u128;
+    let mut section = 0u128;
+    let mut current_digit = None;
+    for character in token.chars() {
+        if let Some(value) = digit(character) {
+            current_digit = Some(value);
+            continue;
+        }
+        let unit = match character {
+            '十' => 10,
+            '百' => 100,
+            '千' => 1_000,
+            '万' | '萬' => 10_000,
+            '億' | '亿' => 100_000_000,
+            '兆' => 1_000_000_000_000,
+            _ => return None,
+        };
+        if unit < 10_000 {
+            section = section.checked_add(current_digit.unwrap_or(1).checked_mul(unit)?)?;
+        } else {
+            section = section.checked_add(current_digit.unwrap_or(0))?;
+            let multiplier = if section == 0 { 1 } else { section };
+            total = total.checked_add(multiplier.checked_mul(unit)?)?;
+            section = 0;
+        }
+        current_digit = None;
+    }
+    total
+        .checked_add(section)?
+        .checked_add(current_digit.unwrap_or(0))
+}
+
+fn canonical_cjk_numbers(text: &str) -> BTreeMap<String, usize> {
+    let mut numbers = BTreeMap::new();
+    for matched in re_cjk_numbers().find_iter(text) {
+        if let Some(value) = cjk_numeric_value(matched.as_str()) {
+            *numbers.entry(value.to_string()).or_default() += 1;
+        }
+    }
+    numbers
+}
+
+fn cancel_matching_counts(left: &mut BTreeMap<String, usize>, right: &mut BTreeMap<String, usize>) {
+    let shared = left
+        .keys()
+        .filter(|key| right.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in shared {
+        let cancelled = left[&key].min(right[&key]);
+        if let Some(count) = left.get_mut(&key) {
+            *count -= cancelled;
+        }
+        if let Some(count) = right.get_mut(&key) {
+            *count -= cancelled;
+        }
+    }
+    left.retain(|_, count| *count > 0);
+    right.retain(|_, count| *count > 0);
+}
+
+/// Compare explicit Arabic numerals while accepting equivalent Chinese/Japanese
+/// numeral spellings on the opposite side. CJK-only numerals are not themselves
+/// enforced yet because names and lexicalized expressions need span typing.
+fn unmatched_arabic_numbers(
+    src: &str,
+    dst: &str,
+) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+    let mut src_arabic = canonical_arabic_numbers(src);
+    let mut dst_arabic = canonical_arabic_numbers(dst);
+    cancel_matching_counts(&mut src_arabic, &mut dst_arabic);
+
+    let mut dst_cjk = canonical_cjk_numbers(dst);
+    cancel_matching_counts(&mut src_arabic, &mut dst_cjk);
+    let mut src_cjk = canonical_cjk_numbers(src);
+    cancel_matching_counts(&mut dst_arabic, &mut src_cjk);
+    (src_arabic, dst_arabic)
 }
 
 // ── ResponseChecker ──────────────────────────────────────────────────────
@@ -383,14 +511,14 @@ impl ResponseChecker {
         }
 
         // Arabic numbers are hard QA. Width differences are normalized, counts are preserved.
-        let src_normalized = fullwidth_to_halfwidth(src);
-        let dst_normalized = fullwidth_to_halfwidth(dst);
-        let src_numbers = token_multiset(re_digits(), &src_normalized);
-        let dst_numbers = token_multiset(re_digits(), &dst_normalized);
-        if src_numbers != dst_numbers {
+        let (missing_src_numbers, unexpected_dst_numbers) = unmatched_arabic_numbers(src, dst);
+        if !missing_src_numbers.is_empty() || !unexpected_dst_numbers.is_empty() {
             return CheckResult {
                 error: ErrorType::NumberMismatch,
-                details: format!("数字不一致: src={:?}, dst={:?}", src_numbers, dst_numbers),
+                details: format!(
+                    "数字数值不一致: 源文未覆盖={:?}, 译文新增={:?}",
+                    missing_src_numbers, unexpected_dst_numbers
+                ),
             };
         }
 
@@ -552,14 +680,14 @@ impl ResponseChecker {
             });
         }
 
-        let src_normalized = fullwidth_to_halfwidth(src);
-        let dst_normalized = fullwidth_to_halfwidth(dst);
-        let src_numbers = token_multiset(re_digits(), &src_normalized);
-        let dst_numbers = token_multiset(re_digits(), &dst_normalized);
-        if src_numbers != dst_numbers {
+        let (missing_src_numbers, unexpected_dst_numbers) = unmatched_arabic_numbers(src, dst);
+        if !missing_src_numbers.is_empty() || !unexpected_dst_numbers.is_empty() {
             findings.push(CheckResult {
                 error: ErrorType::NumberMismatch,
-                details: format!("数字不一致: src={:?}, dst={:?}", src_numbers, dst_numbers),
+                details: format!(
+                    "数字数值不一致: 源文未覆盖={:?}, 译文新增={:?}",
+                    missing_src_numbers, unexpected_dst_numbers
+                ),
             });
         }
 
@@ -819,6 +947,36 @@ mod tests {
             5,
         );
         assert_eq!(placeholders_kept[0].error, ErrorType::None);
+    }
+
+    #[test]
+    fn number_check_accepts_equivalent_cjk_and_arabic_styles() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 0);
+        let cases = [
+            ("第４文型", "第四句型"),
+            ("12年前の４月７日", "十二年前的四月七日"),
+            ("一五インチ以上", "15英寸以上"),
+            ("七十二点", "72分"),
+            ("１８０度", "一百八十度"),
+        ];
+
+        for (src, dst) in cases {
+            let result = checker.check(&[src.to_string()], &[dst.to_string()], 0);
+            assert_ne!(result[0].error, ErrorType::NumberMismatch, "{src} -> {dst}");
+        }
+    }
+
+    #[test]
+    fn number_check_still_rejects_changed_values_after_style_normalization() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 0);
+        let result = checker.check(
+            &["第12章、3人".to_string()],
+            &["第十三章，共两人。".to_string()],
+            0,
+        );
+
+        assert_eq!(result[0].error, ErrorType::NumberMismatch);
+        assert!(result[0].details.contains("12"));
     }
 
     #[test]
