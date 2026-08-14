@@ -91,6 +91,8 @@ cargo run -p alnilam -- export novel.epub \
   --mode bilingual
 ```
 
+EPUB 的 `replace` 模式遇到 ruby、链接、媒体或跨节点正文时，不再把译文写进第一个文本节点并清空其余节点。它会用 `display:none !important` 的生成容器保留原内联树，同时显示带 `zh-CN` 标记的译文节点；这样单语视觉输出不会破坏 ruby/链接数据。双语模式仍是跨阅读器兼容性最稳妥的默认选择。
+
 检查现有术语表对 EPUB ruby 读音及后文平/片假名的覆盖情况（不调用模型）：
 
 ```bash

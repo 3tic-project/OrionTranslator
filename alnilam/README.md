@@ -12,7 +12,7 @@ EPUB/TXT 日译中翻译管线核心，同时作为 CLI 工具和库使用。
 - **质量保障**：假名残留、韩文残留、长度异常、相似度检测；通过项仅做安全引号/标点正规化，失败项才激进修复并复检
 - **术语表生成/审核**：内嵌 NER（via bellatrix）；双通道抽取 ruby base/reading，并生成默认不自动提升的别名审核清单
 - **术语匹配**：带假名/ASCII 边界和 leftmost-longest 重叠解析，避免 `アイ` 命中 `アイテム`
-- **EPUB 保真**：未改章节保留 ZIP 原始 XHTML；目录跨节点时在原链接内追加中文节点，保留 ruby/fragment
+- **EPUB 保真**：未改章节保留 ZIP 原始 XHTML；目录跨节点时在原链接内追加中文节点；Replace 遇到复杂内联树时隐藏并保留源节点、另显示中文节点，避免清空 ruby/链接内容
 - **事务输出**：EPUB/TXT/快照原子写入，拒绝输入输出同路径；可从已有翻译数据无模型重导出
 - **格式修复**：纵书→横书、RTL→LTR、SVG 图片简化（可选，默认仍受 CLI `--no-fix` 控制）
 
@@ -77,6 +77,8 @@ alnilam export novel.epub \
 alnilam glossary-audit novel.epub \
   --glossary-path novel_glossary.json
 ```
+
+`replace` 对纯文本块直接替换；对 ruby、链接、媒体或跨文本节点块，保留原 inner tree 到 `orion-source-hidden`（内联 `display:none !important`），并以 `orion-replace-translation` 显示中文。这是单语视觉输出的止损策略，不代表已完成所有阅读器的可访问性/显示兼容验证；发布前仍应执行阅读器冒烟测试。
 
 ## 编译特性
 
