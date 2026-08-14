@@ -49,21 +49,138 @@ pub fn filter_glossary_for_texts_ex(
     }
 
     let haystack = texts.join("\n").to_lowercase();
+    let mut candidates = Vec::new();
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let src = entry.src.trim();
+        let dst = entry.dst.trim();
+        if src.is_empty() || (require_dst && dst.is_empty()) {
+            continue;
+        }
+        let normalized_src = src.to_lowercase();
+        for (start, end) in find_term_spans(&haystack, &normalized_src) {
+            candidates.push((start, end, entry_index, normalized_src.clone()));
+        }
+    }
+
+    // 同一位置优先最长术语；完全相同的 src 保留全部条目，以便后续暴露译名冲突。
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| (right.1 - right.0).cmp(&(left.1 - left.0)))
+            .then(left.2.cmp(&right.2))
+    });
+
+    let mut accepted: Vec<(usize, usize, String)> = Vec::new();
+    let mut matched = vec![false; entries.len()];
+    for (start, end, entry_index, normalized_src) in candidates {
+        let overlapping = accepted.iter().find(|(accepted_start, accepted_end, _)| {
+            start < *accepted_end && *accepted_start < end
+        });
+        match overlapping {
+            None => {
+                accepted.push((start, end, normalized_src));
+                matched[entry_index] = true;
+            }
+            Some((accepted_start, accepted_end, accepted_src))
+                if *accepted_start == start
+                    && *accepted_end == end
+                    && *accepted_src == normalized_src =>
+            {
+                matched[entry_index] = true;
+            }
+            Some(_) => {}
+        }
+    }
+
     entries
         .iter()
-        .filter(|e| {
+        .enumerate()
+        .filter(|(index, e)| {
             let src = e.src.trim();
             let dst = e.dst.trim();
-            if src.is_empty() {
-                return false;
-            }
-            if require_dst && dst.is_empty() {
-                return false;
-            }
-            haystack.contains(&src.to_lowercase())
+            matched[*index] && !src.is_empty() && (!require_dst || !dst.is_empty())
         })
+        .map(|(_, entry)| entry)
         .cloned()
         .collect()
+}
+
+fn find_term_spans(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let shape = term_shape(needle);
+    haystack
+        .match_indices(needle)
+        .filter_map(|(start, _)| {
+            let end = start + needle.len();
+            let previous = haystack[..start].chars().next_back();
+            let next = haystack[end..].chars().next();
+            if has_valid_boundaries(shape, previous, next) {
+                Some((start, end))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum TermShape {
+    Hiragana,
+    Katakana,
+    AsciiWord,
+    Other,
+}
+
+fn term_shape(term: &str) -> TermShape {
+    let chars: Vec<char> = term.chars().collect();
+    if !chars.is_empty()
+        && chars
+            .iter()
+            .all(|character| is_hiragana_term_char(*character))
+    {
+        TermShape::Hiragana
+    } else if !chars.is_empty()
+        && chars
+            .iter()
+            .all(|character| is_katakana_term_char(*character))
+    {
+        TermShape::Katakana
+    } else if !chars.is_empty()
+        && chars
+            .iter()
+            .all(|character| character.is_ascii_alphanumeric() || *character == '_')
+    {
+        TermShape::AsciiWord
+    } else {
+        TermShape::Other
+    }
+}
+
+fn has_valid_boundaries(shape: TermShape, previous: Option<char>, next: Option<char>) -> bool {
+    match shape {
+        TermShape::Hiragana => {
+            !previous.is_some_and(is_hiragana_term_char) && !next.is_some_and(is_hiragana_term_char)
+        }
+        TermShape::Katakana => {
+            !previous.is_some_and(is_katakana_term_char) && !next.is_some_and(is_katakana_term_char)
+        }
+        TermShape::AsciiWord => {
+            let is_word = |character: char| character.is_ascii_alphanumeric() || character == '_';
+            !previous.is_some_and(is_word) && !next.is_some_and(is_word)
+        }
+        TermShape::Other => true,
+    }
+}
+
+fn is_hiragana_term_char(character: char) -> bool {
+    matches!(character as u32, 0x3040..=0x309f) || character == 'ー'
+}
+
+fn is_katakana_term_char(character: char) -> bool {
+    matches!(character as u32, 0x30a0..=0x30ff | 0xff66..=0xff9f)
+        || matches!(character, 'ー' | '・')
 }
 
 pub fn filter_glossary_for_texts(
@@ -218,6 +335,62 @@ mod tests {
         let sources: Vec<&str> = matched.iter().map(|entry| entry.src.as_str()).collect();
 
         assert_eq!(sources, vec!["ネギ", "茶々丸"]);
+    }
+
+    #[test]
+    fn short_katakana_requires_a_surface_boundary() {
+        let entries = vec![GlossaryEntry {
+            src: "アイ".to_string(),
+            dst: "爱".to_string(),
+            info: String::new(),
+        }];
+        let false_positive_texts = vec!["アイテムとアイディアを見て、アイツは帰った。".to_string()];
+        assert!(filter_glossary_for_texts(&entries, &false_positive_texts).is_empty());
+
+        let independent_mention = vec!["アイが示す答え。".to_string()];
+        assert_eq!(
+            filter_glossary_for_texts(&entries, &independent_mention).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn longest_overlapping_surface_wins_unless_short_form_also_appears_alone() {
+        let entries = vec![
+            GlossaryEntry {
+                src: "星園".to_string(),
+                dst: "星园".to_string(),
+                info: String::new(),
+            },
+            GlossaryEntry {
+                src: "星園まなか".to_string(),
+                dst: "星园真中".to_string(),
+                info: String::new(),
+            },
+        ];
+
+        let only_full_name = vec!["星園まなかが来た。".to_string()];
+        let matched = filter_glossary_for_texts(&entries, &only_full_name);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].src, "星園まなか");
+
+        let both = vec!["星園まなかが来た。星園も呼ばれた。".to_string()];
+        let matched = filter_glossary_for_texts(&entries, &both);
+        assert_eq!(matched.len(), 2);
+    }
+
+    #[test]
+    fn ascii_terms_use_word_boundaries_and_remain_case_insensitive() {
+        let entries = vec![GlossaryEntry {
+            src: "saber".to_string(),
+            dst: "Saber".to_string(),
+            info: String::new(),
+        }];
+        assert!(filter_glossary_for_texts(&entries, &["lightsaber".to_string()]).is_empty());
+        assert_eq!(
+            filter_glossary_for_texts(&entries, &["SABER arrived".to_string()]).len(),
+            1
+        );
     }
 
     #[test]
