@@ -241,6 +241,13 @@ pub struct RubyAliasReviewEntry {
     /// Machine/user classification. Unclassified candidates never become constraints.
     #[serde(default)]
     pub classification: RubyAliasClassification,
+    /// Conservative machine suggestion; never activates an alias by itself.
+    #[serde(default)]
+    pub suggested_classification: RubyAliasClassification,
+    #[serde(default)]
+    pub suggestion_confidence: u8,
+    #[serde(default)]
+    pub suggestion_reason: String,
     /// Explicit review decision, preserved when this sidecar is regenerated.
     #[serde(default)]
     pub decision: CandidateDecision,
@@ -662,6 +669,13 @@ pub fn build_ruby_alias_review(
         let existing_reading_dst = reading_entry
             .map(|entry| entry.dst.trim().to_string())
             .filter(|value| !value.is_empty());
+        let (suggested_classification, suggestion_confidence, suggestion_reason) =
+            suggest_ruby_classification(
+                &base,
+                &reading,
+                base_entry.is_some(),
+                independent_mentions,
+            );
 
         let (status, reason) = if !is_kana_surface(&reading) || reading.chars().count() < 2 {
             (
@@ -711,6 +725,9 @@ pub fn build_ruby_alias_review(
             base_dst,
             existing_reading_dst,
             classification: RubyAliasClassification::Unclassified,
+            suggested_classification,
+            suggestion_confidence,
+            suggestion_reason,
             decision: CandidateDecision::Pending,
             target: None,
             decision_note: None,
@@ -728,6 +745,58 @@ pub fn build_ruby_alias_review(
             .then(left.reading.cmp(&right.reading))
     });
     review
+}
+
+fn suggest_ruby_classification(
+    base: &str,
+    reading: &str,
+    base_confirmed: bool,
+    independent_mentions: usize,
+) -> (RubyAliasClassification, u8, String) {
+    let reading_len = reading.chars().count();
+    if !base.chars().any(is_cjk_ideograph) || !is_kana_surface(reading) {
+        return (
+            RubyAliasClassification::Unclassified,
+            0,
+            "base/reading 形态不足，无法提出安全分类建议".to_string(),
+        );
+    }
+    if reading_len <= 2 {
+        return (
+            RubyAliasClassification::Unclassified,
+            25,
+            "短假名歧义过高，必须结合实体上下文人工分类".to_string(),
+        );
+    }
+    if reading.chars().all(is_hiragana_char) {
+        let confidence = match (base_confirmed, independent_mentions > 0) {
+            (true, true) => 90,
+            (true, false) => 72,
+            (false, true) => 60,
+            (false, false) => 45,
+        };
+        return (
+            RubyAliasClassification::PhoneticReading,
+            confidence,
+            "汉字 base 配纯平假名，符合常见发音 ruby；仍需人工确认实体身份".to_string(),
+        );
+    }
+    if reading.chars().all(is_katakana_char) {
+        return (
+            RubyAliasClassification::Unclassified,
+            if independent_mentions > 0 { 40 } else { 20 },
+            "片假名 ruby 可能是发音、昵称或语义标注，禁止仅凭字形自动分类".to_string(),
+        );
+    }
+    (
+        RubyAliasClassification::Unclassified,
+        15,
+        "混合假名结构可能包含特殊表记或文字游戏".to_string(),
+    )
+}
+
+fn is_cjk_ideograph(character: char) -> bool {
+    matches!(character as u32, 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff)
 }
 
 fn review_status_rank(status: &str) -> usize {
@@ -969,6 +1038,11 @@ mod tests {
         assert!(review[0]
             .reading_variants
             .contains(&"シラジノオト".to_string()));
+        assert_eq!(
+            review[0].suggested_classification,
+            RubyAliasClassification::PhoneticReading
+        );
+        assert_eq!(review[0].suggestion_confidence, 90);
     }
 
     #[test]
@@ -993,6 +1067,11 @@ mod tests {
 
         assert_eq!(review[0].status, "review_required");
         assert!(review[0].reason.contains("语义 ruby"));
+        assert_eq!(
+            review[0].suggested_classification,
+            RubyAliasClassification::Unclassified
+        );
+        assert!(review[0].suggestion_reason.contains("片假名 ruby"));
     }
 
     #[test]
