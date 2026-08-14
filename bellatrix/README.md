@@ -30,6 +30,7 @@ use bellatrix::{GlossaryConfig, generate_glossary, GlossaryProgressEvent};
 
 let config = GlossaryConfig {
     lines: text_lines,
+    ruby_annotations, // TXT 可传 Vec::new()
     model_dir: "ner_model".to_string(),
     llm_url: "https://api.deepseek.com".to_string(),
     llm_model: "deepseek-v4-flash".to_string(),
@@ -38,6 +39,8 @@ let config = GlossaryConfig {
 
 let output_path = generate_glossary(config, progress_callback).await?;
 ```
+
+EPUB 有 ruby 证据时会额外生成 `*.ruby-candidates.json`。候选按 `confirmed_existing`、`review_required`、`high_ambiguity_review`、`conflict` 等状态输出；未审核候选不会自动变成 `src -> dst` 强制术语。
 
 ## 模型文件要求
 

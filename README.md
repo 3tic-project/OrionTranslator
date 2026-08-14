@@ -80,6 +80,28 @@ novel_error_report.json           # 错误报告
 
 > **断点续翻**：中途中止后，下次翻译同一文件时若检测到 `*_translation_data.json`，已完成的段落会自动跳过。
 
+### 安全重导出与术语审核
+
+已有 `translation_data.json` 时可完全离线重导出；该命令默认不执行竖排/RTL/SVG 等有损格式修复，并拒绝输入输出同路径：
+
+```bash
+cargo run -p alnilam -- export novel.epub \
+  --translation-data novel_work/translation_data.json \
+  --output novel.reexport.epub \
+  --mode bilingual
+```
+
+检查现有术语表对 EPUB ruby 读音及后文平/片假名的覆盖情况（不调用模型）：
+
+```bash
+cargo run -p alnilam -- glossary-audit novel.epub \
+  --glossary-path novel_glossary.json
+```
+
+审核结果写入 `*.ruby-candidates.json`。`review_required`、`high_ambiguity_review` 和 `conflict` 必须审核；工具不会把语义 ruby 或短假名候选自动提升为强制术语。
+
+GUI 凭据文件在 Unix/macOS 上以 `0600` 原子保存。当前内容仍是本地 XOR 混淆而非系统密钥库加密，不应在共享账户或不可信备份中视为强加密。
+
 ### 关于本地模型
 
 本项目针对轻小说翻译场景开发了精简的专用模型格式，详见 https://huggingface.co/3tic ，现在已经发布了测试模型 https://huggingface.co/3tic/Orion-HYMT1.5-7B-SFT-v2601 和 https://huggingface.co/3tic/Orion-Qwen3-1.7B-SFT-v2601 ，目前是概念验证阶段，欢迎测试反馈，不建议直接使用，后续将训练更完善的版本。
@@ -107,7 +129,7 @@ novel_error_report.json           # 错误报告
 │  ┌──────────────────────┐         ┌────────────────────────────┐ │
 │  │  bellatrix           │         │  betelgeuse                │ │
 │  │  嵌入式 NER 推理       │         │  EPUB/TXT 文本提取          │ │
-│  │    术语表生成          │         │  (Spine 排序 / Ruby 去除)   │ │
+│  │    术语表生成/审核      │         │  (Spine 排序 / Ruby 双通道) │ │
 │  └──────────────────────┘         └────────────────────────────┘ │
 └───────────────────────────────────────────────────────────────────┘
 

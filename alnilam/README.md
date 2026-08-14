@@ -10,8 +10,10 @@ EPUB/TXT 日译中翻译管线核心，同时作为 CLI 工具和库使用。
 - **断点续翻**：自动保存工作区快照；恢复时**只重发未完成单元**，不整批覆盖已译内容
 - **上下文感知**：规则化场景检测（对话/叙述/标题/场景切换）+ 智能上下文选择
 - **质量保障**：假名残留、韩文残留、长度异常、相似度检测；通过项仅做安全引号/标点正规化，失败项才激进修复并复检
-- **术语表生成**：内嵌 NER（via bellatrix）；Orion 跳过 LLM 译名时以「人物候选」注入 prompt
-- **EPUB 保真**：未改章节保留 ZIP 原始 XHTML；Replace 模式尽量保留 ruby/链接等内联结构
+- **术语表生成/审核**：内嵌 NER（via bellatrix）；双通道抽取 ruby base/reading，并生成默认不自动提升的别名审核清单
+- **术语匹配**：带假名/ASCII 边界和 leftmost-longest 重叠解析，避免 `アイ` 命中 `アイテム`
+- **EPUB 保真**：未改章节保留 ZIP 原始 XHTML；目录跨节点时在原链接内追加中文节点，保留 ruby/fragment
+- **事务输出**：EPUB/TXT/快照原子写入，拒绝输入输出同路径；可从已有翻译数据无模型重导出
 - **格式修复**：纵书→横书、RTL→LTR、SVG 图片简化（可选，默认仍受 CLI `--no-fix` 控制）
 
 ## 结构
@@ -23,7 +25,7 @@ alnilam/
 ├── rules/
 │   └── ja2zh_context_rules.json  # 上下文检测规则（770 条）
 └── src/
-    ├── main.rs                 # CLI 入口（translate / glossary 子命令）
+    ├── main.rs                 # CLI 入口（translate / export / glossary / glossary-audit）
     ├── lib.rs                  # 库导出
     ├── config.rs               # PipelineConfig 配置 + 默认值
     ├── pipeline.rs             # EPUB/TXT 翻译编排（并发批处理 + 重试）
@@ -65,6 +67,15 @@ alnilam novel.txt -m replace -w 4
 
 # 术语表生成（内嵌 NER）
 alnilam glossary novel.epub --llm-key "sk-xxx"
+
+# 使用已有翻译数据离线重导出（默认不启用有损格式修复）
+alnilam export novel.epub \
+  --translation-data novel_work/translation_data.json \
+  --output novel.reexport.epub
+
+# 离线审查 ruby 读音、平片假名复现与术语冲突
+alnilam glossary-audit novel.epub \
+  --glossary-path novel_glossary.json
 ```
 
 ## 编译特性
