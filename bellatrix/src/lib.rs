@@ -813,23 +813,31 @@ fn suggest_ruby_classification(
             "短假名歧义过高，必须结合实体上下文人工分类".to_string(),
         );
     }
+    if !base_confirmed {
+        return (
+            RubyAliasClassification::Unclassified,
+            15,
+            "ruby base 尚未被术语生成确认为实体，不提出 alias 分类".to_string(),
+        );
+    }
+    if independent_mentions == 0 {
+        return (
+            RubyAliasClassification::Unclassified,
+            30,
+            "读音未在 rt 外独立复现，暂不提出 alias 分类".to_string(),
+        );
+    }
     if reading.chars().all(is_hiragana_char) {
-        let confidence = match (base_confirmed, independent_mentions > 0) {
-            (true, true) => 90,
-            (true, false) => 72,
-            (false, true) => 60,
-            (false, false) => 45,
-        };
         return (
             RubyAliasClassification::PhoneticReading,
-            confidence,
+            85,
             "汉字 base 配纯平假名，符合常见发音 ruby；仍需人工确认实体身份".to_string(),
         );
     }
     if reading.chars().all(is_katakana_char) {
         return (
             RubyAliasClassification::Unclassified,
-            if independent_mentions > 0 { 40 } else { 20 },
+            40,
             "片假名 ruby 可能是发音、昵称或语义标注，禁止仅凭字形自动分类".to_string(),
         );
     }
@@ -1087,7 +1095,43 @@ mod tests {
             review[0].suggested_classification,
             RubyAliasClassification::PhoneticReading
         );
-        assert_eq!(review[0].suggestion_confidence, 90);
+        assert_eq!(review[0].suggestion_confidence, 85);
+    }
+
+    #[test]
+    fn ruby_review_does_not_suggest_alias_for_unconfirmed_base() {
+        let review = build_ruby_alias_review(
+            &[ruby("白地野音", "しらじのおと")],
+            &["後でしらじのおとが笑った。".to_string()],
+            &[],
+        );
+
+        assert_eq!(review[0].status, "base_not_confirmed");
+        assert_eq!(
+            review[0].suggested_classification,
+            RubyAliasClassification::Unclassified
+        );
+        assert_eq!(review[0].suggestion_confidence, 15);
+        assert!(review[0]
+            .suggestion_reason
+            .contains("尚未被术语生成确认为实体"));
+    }
+
+    #[test]
+    fn ruby_review_does_not_suggest_alias_without_independent_recurrence() {
+        let review = build_ruby_alias_review(
+            &[ruby("白地野音", "しらじのおと")],
+            &["白地野音が笑った。".to_string()],
+            &[translation("白地野音", "白地野音")],
+        );
+
+        assert_eq!(review[0].status, "no_independent_mention");
+        assert_eq!(
+            review[0].suggested_classification,
+            RubyAliasClassification::Unclassified
+        );
+        assert_eq!(review[0].suggestion_confidence, 30);
+        assert!(review[0].suggestion_reason.contains("rt 外独立复现"));
     }
 
     #[test]
