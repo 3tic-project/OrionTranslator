@@ -226,6 +226,16 @@ fn re_json_escape() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"(\\?"\\?:\\?")|(":")|(":")"#).expect("json escape regex"))
 }
 
+fn re_orphan_json_mapping() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?:\{\s*[「『“\"]?\d+[」』”\"]?\s*:|[「『“\"]\{[」』”\"]\s*\d+\s*[「『“\"]:[」』”\"])"#,
+        )
+        .expect("orphan JSON mapping regex")
+    })
+}
+
 fn re_digits() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\d+").expect("digits regex"))
@@ -541,10 +551,15 @@ impl ResponseChecker {
 
         // JSON structure anomaly
         let json_matches: Vec<_> = re_json_escape().find_iter(dst).collect();
-        if json_matches.len() >= 3 {
+        let orphan_json_mapping = re_orphan_json_mapping().is_match(dst);
+        if json_matches.len() >= 3 || orphan_json_mapping {
             return CheckResult {
                 error: ErrorType::JsonStructureError,
-                details: format!("译文包含 JSON 结构片段 ({} 处)", json_matches.len()),
+                details: if orphan_json_mapping {
+                    "译文包含疑似跨行泄漏的 JSON key/value 片段".to_string()
+                } else {
+                    format!("译文包含 JSON 结构片段 ({} 处)", json_matches.len())
+                },
             };
         }
 
@@ -714,10 +729,15 @@ impl ResponseChecker {
         }
 
         let json_matches: Vec<_> = re_json_escape().find_iter(dst).collect();
-        if json_matches.len() >= 3 {
+        let orphan_json_mapping = re_orphan_json_mapping().is_match(dst);
+        if json_matches.len() >= 3 || orphan_json_mapping {
             findings.push(CheckResult {
                 error: ErrorType::JsonStructureError,
-                details: format!("译文包含 JSON 结构片段 ({} 处)", json_matches.len()),
+                details: if orphan_json_mapping {
+                    "译文包含疑似跨行泄漏的 JSON key/value 片段".to_string()
+                } else {
+                    format!("译文包含 JSON 结构片段 ({} 处)", json_matches.len())
+                },
             });
         }
 
@@ -1062,5 +1082,17 @@ mod tests {
         assert!(errors.contains(&ErrorType::NumberMismatch));
         assert!(errors.contains(&ErrorType::PlaceholderMismatch));
         assert!(!errors.contains(&ErrorType::KanaUntranslatedProse));
+    }
+
+    #[test]
+    fn detects_cjk_quote_normalized_json_mapping_leaks() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 2);
+        for dst in [
+            "圆这么一说，我们便开始动手做了。「{」10「:」老实说，我不擅长手工活。",
+            "把照片剪下来。{「12」:「「琉星，剪好的给我一下」",
+        ] {
+            let result = checker.check(&["普通の原文です。".to_string()], &[dst.to_string()], 0);
+            assert_eq!(result[0].error, ErrorType::JsonStructureError, "{dst}");
+        }
     }
 }
