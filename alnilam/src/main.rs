@@ -163,6 +163,10 @@ enum Commands {
         #[arg(long)]
         hard_only: bool,
 
+        /// 术语只检查人工确认 alias 或 info 中 enforcement=hard 的条目
+        #[arg(long)]
+        hard_terms_only: bool,
+
         /// 源语言
         #[arg(long, default_value = "ja")]
         source_language: String,
@@ -568,6 +572,7 @@ async fn run_subcommand(cmd: Commands) -> Result<()> {
             glossary_path,
             output,
             hard_only,
+            hard_terms_only,
             source_language,
             target_language,
         } => {
@@ -588,6 +593,7 @@ async fn run_subcommand(cmd: Commands) -> Result<()> {
                 &source_language,
                 &target_language,
                 !hard_only,
+                hard_terms_only,
             )?;
             checker::save_quality_audit_report(&output, &report)?;
 

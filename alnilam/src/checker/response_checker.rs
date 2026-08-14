@@ -538,7 +538,7 @@ impl ResponseChecker {
             if !missing.is_empty() {
                 return CheckResult {
                     error: ErrorType::TermMissing,
-                    details: format!("已确认术语未按约束呈现: {}", missing.join(", ")),
+                    details: format!("术语目标未按约束呈现: {}", missing.join(", ")),
                 };
             }
         }
@@ -721,7 +721,7 @@ impl ResponseChecker {
             if !missing.is_empty() {
                 findings.push(CheckResult {
                     error: ErrorType::TermMissing,
-                    details: format!("已确认术语未按约束呈现: {}", missing.join(", ")),
+                    details: format!("术语目标未按约束呈现: {}", missing.join(", ")),
                 });
             }
         }

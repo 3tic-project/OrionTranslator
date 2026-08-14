@@ -50,6 +50,7 @@ pub struct QualityAuditReport {
     pub source_language: String,
     pub target_language: String,
     pub include_soft_checks: bool,
+    pub term_check_mode: String,
     pub glossary_entry_count: usize,
     pub limitations: Vec<String>,
     pub summary: QualityAuditSummary,
@@ -79,11 +80,17 @@ pub fn audit_translation_data(
     source_language: &str,
     target_language: &str,
     include_soft_checks: bool,
+    hard_terms_only: bool,
 ) -> Result<QualityAuditReport> {
     let units = load_audit_units(translation_data)?;
-    let glossary_entries = match glossary_path {
+    let loaded_glossary_entries = match glossary_path {
         Some(path) => glossary::load_glossary_with_confirmed_aliases(path)?,
         None => Vec::new(),
+    };
+    let glossary_entries = if hard_terms_only {
+        glossary::hard_quality_constraints(&loaded_glossary_entries)
+    } else {
+        loaded_glossary_entries
     };
     let glossary_entry_count = glossary_entries.len();
     let checker = ResponseChecker::new(source_language, target_language, 0.80, usize::MAX)
@@ -95,6 +102,7 @@ pub fn audit_translation_data(
         source_language,
         target_language,
         include_soft_checks,
+        hard_terms_only,
         glossary_entry_count,
         units,
         &checker,
@@ -113,6 +121,7 @@ fn build_report(
     source_language: &str,
     target_language: &str,
     include_soft_checks: bool,
+    hard_terms_only: bool,
     glossary_entry_count: usize,
     units: Vec<AuditUnit>,
     checker: &ResponseChecker,
@@ -170,7 +179,7 @@ fn build_report(
         "离线规则只能发现结构化异常和可疑项，不能证明译文语义正确。".to_string(),
         "软质量项是启发式信号，需要抽样或人工复核。".to_string(),
     ];
-    if glossary_path.is_some() {
+    if glossary_path.is_some() && !hard_terms_only {
         limitations.push(
             "TERM_MISSING 对 v1 扁平术语表使用单一目标字符串；姓/名/昵称的允许译法需待 Entity render policy 完成后再作为发布 Gate。"
                 .to_string(),
@@ -184,6 +193,14 @@ fn build_report(
         source_language: source_language.to_string(),
         target_language: target_language.to_string(),
         include_soft_checks,
+        term_check_mode: if glossary_path.is_none() {
+            "disabled"
+        } else if hard_terms_only {
+            "explicit_hard_constraints"
+        } else {
+            "diagnostic_all_glossary_entries"
+        }
+        .to_string(),
         glossary_entry_count,
         limitations,
         summary,
@@ -267,6 +284,7 @@ mod tests {
             "ja",
             "zh",
             true,
+            false,
             0,
             units,
             &checker,
