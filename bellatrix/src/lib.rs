@@ -9,7 +9,11 @@ pub mod tokenizer;
 use anyhow::Result;
 use burn::tensor::backend::Backend;
 use log::info;
-use std::path::Path;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -133,6 +137,8 @@ pub fn load_ner_pipeline<B: Backend + 'static>(
 pub struct GlossaryConfig {
     /// Pre-extracted text lines from the input file
     pub lines: Vec<String>,
+    /// EPUB ruby 证据；TXT 或旧调用方可传空数组。
+    pub ruby_annotations: Vec<betelgeuse::RubyAnnotation>,
     /// NER model directory
     pub model_dir: String,
     /// NER batch size
@@ -151,6 +157,28 @@ pub struct GlossaryConfig {
     pub output_path: std::path::PathBuf,
     /// Skip LLM translation (for Orion models, only run NER)
     pub skip_llm_translation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RubySurfaceEvidence {
+    pub surface: String,
+    pub mention_count: usize,
+    pub exact_reading: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RubyAliasReviewEntry {
+    pub base: String,
+    pub reading: String,
+    pub reading_variants: Vec<String>,
+    pub surface_evidence: Vec<RubySurfaceEvidence>,
+    pub source_paths: Vec<String>,
+    pub contexts: Vec<String>,
+    pub independent_mentions: usize,
+    pub base_dst: Option<String>,
+    pub existing_reading_dst: Option<String>,
+    pub status: String,
+    pub reason: String,
 }
 
 impl GlossaryConfig {
@@ -261,14 +289,15 @@ pub async fn generate_glossary(
         emit(
             &progress,
             GlossaryProgressEvent::Log {
-                message: "Orion模型模式：跳过LLM译名，生成人物候选术语表（dst 为空，翻译时作实体提示）"
-                    .to_string(),
+                message:
+                    "Orion模型模式：跳过LLM译名，生成人物候选术语表（dst 为空，翻译时作实体提示）"
+                        .to_string(),
             },
         );
         // Create raw entries with empty dst/info for Orion models
         characters
-            .into_iter()
-            .map(|(name, _info)| llm::TranslationEntry {
+            .into_keys()
+            .map(|name| llm::TranslationEntry {
                 src: name,
                 dst: String::new(),
                 info: String::new(),
@@ -296,11 +325,36 @@ pub async fn generate_glossary(
         translations
     };
 
+    // Ruby 证据只生成审核清单，不在缺乏分类/确认时自动提升为强制术语。
+    // 这避免把 `桃谷<rt>ライバル</rt>` 一类语义 ruby 错绑成人名读音。
+    let ruby_review =
+        build_ruby_alias_review(&config.ruby_annotations, &config.lines, &translations);
+
     // Save glossary
     let output_path = &config.output_path;
 
     let json = serde_json::to_string_pretty(&translations)?;
-    std::fs::write(output_path, &json)?;
+    atomic_write(output_path, json.as_bytes())?;
+
+    if !ruby_review.is_empty() {
+        let review_path = ruby_review_path(output_path);
+        let review_json = serde_json::to_string_pretty(&ruby_review)?;
+        atomic_write(&review_path, review_json.as_bytes())?;
+        let actionable = ruby_review
+            .iter()
+            .filter(|entry| is_actionable_review_status(&entry.status))
+            .count();
+        emit(
+            &progress,
+            GlossaryProgressEvent::Log {
+                message: format!(
+                    "Ruby别名审核清单: {}（{} 条需审核；未自动提升为强制术语）",
+                    review_path.display(),
+                    actionable
+                ),
+            },
+        );
+    }
 
     emit(
         &progress,
@@ -311,6 +365,290 @@ pub async fn generate_glossary(
     );
 
     Ok(output_path.clone())
+}
+
+pub fn ruby_review_path(glossary_path: &Path) -> PathBuf {
+    let stem = glossary_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("glossary");
+    glossary_path.with_file_name(format!("{stem}.ruby-candidates.json"))
+}
+
+pub fn save_ruby_alias_review(path: &Path, review: &[RubyAliasReviewEntry]) -> Result<()> {
+    let json = serde_json::to_string_pretty(review)?;
+    atomic_write(path, json.as_bytes())
+}
+
+pub fn build_ruby_alias_review(
+    annotations: &[betelgeuse::RubyAnnotation],
+    lines: &[String],
+    translations: &[llm::TranslationEntry],
+) -> Vec<RubyAliasReviewEntry> {
+    let mut grouped: HashMap<(String, String), (HashSet<String>, HashSet<String>)> = HashMap::new();
+    for annotation in annotations {
+        let base = annotation.base.trim();
+        let reading = annotation.reading.trim();
+        if base.is_empty() || reading.is_empty() {
+            continue;
+        }
+        let (paths, contexts) = grouped
+            .entry((base.to_string(), reading.to_string()))
+            .or_default();
+        if !annotation.source_path.trim().is_empty() {
+            paths.insert(annotation.source_path.clone());
+        }
+        if !annotation.context.trim().is_empty() && contexts.len() < 5 {
+            contexts.insert(annotation.context.chars().take(240).collect());
+        }
+    }
+
+    let mut review = Vec::new();
+    for ((base, reading), (paths, contexts)) in grouped {
+        let variants = kana_variants(&reading);
+        let surface_evidence: Vec<RubySurfaceEvidence> = variants
+            .iter()
+            .map(|surface| RubySurfaceEvidence {
+                surface: surface.clone(),
+                mention_count: count_surface_mentions(lines, surface),
+                exact_reading: surface == &reading,
+            })
+            .collect();
+        let independent_mentions = surface_evidence
+            .iter()
+            .map(|evidence| evidence.mention_count)
+            .sum();
+        let base_entry = find_translation_entry(translations, std::slice::from_ref(&base));
+        let reading_entry = variants
+            .iter()
+            .find_map(|variant| {
+                translations
+                    .iter()
+                    .find(|entry| entry.src.trim() == variant)
+            })
+            .or_else(|| find_translation_entry(translations, &variants));
+        let base_dst = base_entry
+            .map(|entry| entry.dst.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let existing_reading_dst = reading_entry
+            .map(|entry| entry.dst.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let (status, reason) = if !is_kana_surface(&reading) || reading.chars().count() < 2 {
+            (
+                "invalid_or_high_ambiguity",
+                "读音不是至少两个字符的纯假名表面，禁止自动提升",
+            )
+        } else if base_entry.is_none() {
+            ("base_not_confirmed", "ruby base 未被 NER/LLM 确认为实体")
+        } else if base_dst.is_none() {
+            ("base_unresolved", "ruby base 尚无已确认中文译名")
+        } else if independent_mentions == 0 {
+            (
+                "no_independent_mention",
+                "读音及其平片假名变体未在 rt 外独立出现",
+            )
+        } else if let Some(reading_dst) = existing_reading_dst.as_deref() {
+            if base_dst.as_deref() == Some(reading_dst) {
+                ("confirmed_existing", "读音已有相同目标译名，无需新增")
+            } else {
+                ("conflict", "ruby base 与读音现有译名冲突，必须人工消歧")
+            }
+        } else if reading.chars().count() <= 2 {
+            (
+                "high_ambiguity_review",
+                "1–2 个假名可能是普通词或昵称；即使复现也必须结合实体上下文审核",
+            )
+        } else {
+            (
+                "review_required",
+                "具备实体 base 与 rt 外复现证据；需区分发音、昵称和语义 ruby",
+            )
+        };
+
+        let mut source_paths: Vec<String> = paths.into_iter().collect();
+        source_paths.sort();
+        let mut contexts: Vec<String> = contexts.into_iter().collect();
+        contexts.sort();
+        review.push(RubyAliasReviewEntry {
+            base,
+            reading,
+            reading_variants: variants,
+            surface_evidence,
+            source_paths,
+            contexts,
+            independent_mentions,
+            base_dst,
+            existing_reading_dst,
+            status: status.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+
+    review.sort_by(|left, right| {
+        review_status_rank(&left.status)
+            .cmp(&review_status_rank(&right.status))
+            .then(right.independent_mentions.cmp(&left.independent_mentions))
+            .then(left.base.cmp(&right.base))
+            .then(left.reading.cmp(&right.reading))
+    });
+    review
+}
+
+fn review_status_rank(status: &str) -> usize {
+    match status {
+        "conflict" => 0,
+        "review_required" => 1,
+        "high_ambiguity_review" => 2,
+        "confirmed_existing" => 3,
+        "base_unresolved" => 4,
+        "no_independent_mention" => 5,
+        "base_not_confirmed" => 6,
+        _ => 7,
+    }
+}
+
+pub fn is_actionable_review_status(status: &str) -> bool {
+    matches!(
+        status,
+        "conflict" | "review_required" | "high_ambiguity_review"
+    )
+}
+
+fn find_translation_entry<'a>(
+    translations: &'a [llm::TranslationEntry],
+    surfaces: &[String],
+) -> Option<&'a llm::TranslationEntry> {
+    translations
+        .iter()
+        .find(|entry| surfaces.iter().any(|surface| entry.src.trim() == surface))
+        .or_else(|| {
+            translations.iter().find(|entry| {
+                let canonical = llm::canonical_key(&entry.src);
+                surfaces.contains(&canonical)
+            })
+        })
+}
+
+fn kana_variants(reading: &str) -> Vec<String> {
+    let mut variants = vec![reading.to_string()];
+    let hiragana: String = reading
+        .chars()
+        .map(|character| {
+            let code = character as u32;
+            if (0x30a1..=0x30f6).contains(&code) {
+                char::from_u32(code - 0x60).unwrap_or(character)
+            } else {
+                character
+            }
+        })
+        .collect();
+    let katakana: String = reading
+        .chars()
+        .map(|character| {
+            let code = character as u32;
+            if (0x3041..=0x3096).contains(&code) {
+                char::from_u32(code + 0x60).unwrap_or(character)
+            } else {
+                character
+            }
+        })
+        .collect();
+    for variant in [hiragana, katakana] {
+        if !variants.contains(&variant) {
+            variants.push(variant);
+        }
+    }
+    variants
+}
+
+fn is_kana_surface(surface: &str) -> bool {
+    !surface.is_empty()
+        && surface.chars().all(|character| {
+            matches!(character as u32, 0x3040..=0x309f | 0x30a0..=0x30ff | 0xff66..=0xff9f)
+                || matches!(character, 'ー' | '・')
+        })
+}
+
+fn count_surface_mentions(lines: &[String], surface: &str) -> usize {
+    let katakana = surface.chars().all(is_katakana_char);
+    let hiragana = surface.chars().all(is_hiragana_char);
+    lines
+        .iter()
+        .map(|line| {
+            line.match_indices(surface)
+                .filter(|(start, _)| {
+                    let end = *start + surface.len();
+                    let previous = line[..*start].chars().next_back();
+                    let next = line[end..].chars().next();
+                    if katakana {
+                        !previous.is_some_and(is_katakana_char)
+                            && !next.is_some_and(is_katakana_char)
+                    } else if hiragana {
+                        !previous.is_some_and(is_hiragana_char)
+                            && !next.is_some_and(is_hiragana_char)
+                    } else {
+                        true
+                    }
+                })
+                .count()
+        })
+        .sum()
+}
+
+fn is_hiragana_char(character: char) -> bool {
+    matches!(character as u32, 0x3040..=0x309f) || character == 'ー'
+}
+
+fn is_katakana_char(character: char) -> bool {
+    matches!(character as u32, 0x30a0..=0x30ff | 0xff66..=0xff9f)
+        || matches!(character, 'ー' | '・')
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("glossary.json");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut last_error = None;
+    for sequence in 0..100u32 {
+        let temp_path = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(mut file) => {
+                let result = (|| -> Result<()> {
+                    file.write_all(contents)?;
+                    file.flush()?;
+                    file.sync_all()?;
+                    drop(file);
+                    fs::rename(&temp_path, path)?;
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_file(&temp_path);
+                }
+                return result;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error)
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("无法创建术语表临时文件")))
 }
 
 /// Check if a model name is a "generic" (non-Orion) model
@@ -326,6 +664,7 @@ mod tests {
     fn sample_config() -> GlossaryConfig {
         GlossaryConfig {
             lines: vec!["テスト".into()],
+            ruby_annotations: Vec::new(),
             model_dir: ".".into(),
             ner_batch_size: 8,
             min_count: 1,
@@ -361,5 +700,105 @@ mod tests {
     fn is_generic_model_detects_orion_substring() {
         assert!(!is_generic_model("Orion-Qwen3-1.7B-SFT"));
         assert!(is_generic_model("deepseek-v4-flash"));
+    }
+
+    fn ruby(base: &str, reading: &str) -> betelgeuse::RubyAnnotation {
+        betelgeuse::RubyAnnotation {
+            base: base.to_string(),
+            reading: reading.to_string(),
+            source_path: "Text/ch1.xhtml".to_string(),
+            context: format!("{base}が現れた"),
+            combined: false,
+        }
+    }
+
+    fn translation(src: &str, dst: &str) -> llm::TranslationEntry {
+        llm::TranslationEntry {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            info: String::new(),
+        }
+    }
+
+    #[test]
+    fn ruby_review_finds_hiragana_or_katakana_independent_mentions() {
+        let review = build_ruby_alias_review(
+            &[ruby("白地野音", "しらじのおと")],
+            &["後でシラジノオトが笑った。".to_string()],
+            &[translation("白地野音", "白地野音")],
+        );
+
+        assert_eq!(review.len(), 1);
+        assert_eq!(review[0].status, "review_required");
+        assert_eq!(review[0].independent_mentions, 1);
+        assert!(review[0]
+            .reading_variants
+            .contains(&"シラジノオト".to_string()));
+    }
+
+    #[test]
+    fn ruby_review_does_not_count_short_katakana_inside_longer_words() {
+        let review = build_ruby_alias_review(
+            &[ruby("愛", "アイ")],
+            &["アイテム、アイディア、アイツ。".to_string()],
+            &[translation("愛", "爱")],
+        );
+
+        assert_eq!(review[0].status, "no_independent_mention");
+        assert_eq!(review[0].independent_mentions, 0);
+    }
+
+    #[test]
+    fn semantic_ruby_remains_review_only_even_when_it_reappears() {
+        let review = build_ruby_alias_review(
+            &[ruby("桃谷", "ライバル")],
+            &["ライバルが立ちはだかった。".to_string()],
+            &[translation("桃谷", "桃谷")],
+        );
+
+        assert_eq!(review[0].status, "review_required");
+        assert!(review[0].reason.contains("语义 ruby"));
+    }
+
+    #[test]
+    fn ruby_review_exposes_existing_translation_conflict() {
+        let review = build_ruby_alias_review(
+            &[ruby("白地野音", "シラジノ")],
+            &["シラジノが来た。".to_string()],
+            &[
+                translation("白地野音", "白地野音"),
+                translation("シラジノ", "席拉吉诺"),
+            ],
+        );
+
+        assert_eq!(review[0].status, "conflict");
+        assert_eq!(review[0].base_dst.as_deref(), Some("白地野音"));
+        assert_eq!(review[0].existing_reading_dst.as_deref(), Some("席拉吉诺"));
+    }
+
+    #[test]
+    fn ruby_review_matches_kana_variant_with_honorific_suffix() {
+        let review = build_ruby_alias_review(
+            &[ruby("最乃", "もの")],
+            &["モノくんが来た。".to_string()],
+            &[
+                translation("最乃", "入座最乃"),
+                translation("モノくん", "物君"),
+            ],
+        );
+
+        assert_eq!(review[0].status, "conflict");
+        assert!(review[0]
+            .surface_evidence
+            .iter()
+            .any(|evidence| evidence.surface == "モノ" && evidence.mention_count == 1));
+    }
+
+    #[test]
+    fn ruby_review_sidecar_keeps_glossary_stem() {
+        assert_eq!(
+            ruby_review_path(Path::new("book_glossary.json")),
+            PathBuf::from("book_glossary.ruby-candidates.json")
+        );
     }
 }
