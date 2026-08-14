@@ -5,6 +5,8 @@ use regex::Regex;
 use super::types::{CheckResult, ErrorType};
 use crate::llm::glossary::{self, GlossaryEntry};
 
+const MIN_UNCHANGED_CJK_PROSE_CHARS: usize = 12;
+
 // ── Text helpers ─────────────────────────────────────────────────────────
 
 fn is_hiragana(c: char) -> bool {
@@ -636,7 +638,7 @@ impl ResponseChecker {
             };
         }
 
-        if src == dst && src.chars().count() >= 3 && has_cjk(src) {
+        if src == dst && src.chars().count() >= MIN_UNCHANGED_CJK_PROSE_CHARS && has_cjk(src) {
             return CheckResult {
                 error: ErrorType::HighSimilarity,
                 details: "译文与原文完全相同".to_string(),
@@ -805,7 +807,7 @@ impl ResponseChecker {
             return findings;
         }
 
-        if src == dst && src.chars().count() >= 3 && has_cjk(src) {
+        if src == dst && src.chars().count() >= MIN_UNCHANGED_CJK_PROSE_CHARS && has_cjk(src) {
             findings.push(CheckResult {
                 error: ErrorType::HighSimilarity,
                 details: "译文与原文完全相同".to_string(),
@@ -905,11 +907,17 @@ mod tests {
     }
 
     #[test]
-    fn flags_unchanged_cjk_text_before_retry_threshold() {
+    fn allows_short_shared_cjk_but_flags_long_unchanged_prose() {
         let checker = ResponseChecker::new("ja", "zh", 0.80, 2);
-        let srcs = vec!["第一章".to_string()];
-        let dsts = vec!["第一章".to_string()];
-        let results = checker.check(&srcs, &dsts, 0);
+        let shared_title = checker.check(&["第一章".to_string()], &["第一章".to_string()], 0);
+        assert_eq!(shared_title[0].error, ErrorType::None);
+
+        let unchanged_prose = "本日臨時休業次回営業日時未定".to_string();
+        let results = checker.check(
+            std::slice::from_ref(&unchanged_prose),
+            std::slice::from_ref(&unchanged_prose),
+            0,
+        );
         assert_eq!(results[0].error, ErrorType::HighSimilarity);
     }
 
