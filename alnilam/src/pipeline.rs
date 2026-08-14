@@ -20,6 +20,7 @@ use crate::context::{
     PrecomputedContext,
 };
 use crate::epub::{EpubHandler, TranslationBlock};
+use crate::io_utils::{atomic_write, ensure_distinct_paths};
 use crate::llm::{glossary, BatchTranslationResponse, LlmClient};
 use crate::txt;
 
@@ -82,6 +83,11 @@ pub type ProgressCallback = Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>;
 
 /// A cancellation flag shared between GUI and pipeline. true = cancel requested.
 pub type CancelFlag = Option<Arc<AtomicBool>>;
+
+/// Validate that a render/export target cannot overwrite its source document.
+pub fn validate_distinct_input_output(input: &Path, output: &Path) -> Result<()> {
+    ensure_distinct_paths(input, output)
+}
 
 /// Helper to send progress events
 #[allow(dead_code)]
@@ -384,7 +390,8 @@ fn load_resume_manifest(work_dir: &Path) -> Result<Option<ResumeManifest>> {
 
 fn save_resume_manifest(work_dir: &Path, manifest: &ResumeManifest) -> Result<()> {
     let path = work_dir.join("resume_manifest.json");
-    std::fs::write(path, serde_json::to_string_pretty(manifest)?)?;
+    let json = serde_json::to_string_pretty(manifest)?;
+    atomic_write(&path, json.as_bytes())?;
     Ok(())
 }
 
@@ -431,7 +438,8 @@ fn save_txt_translation_snapshot(
             snapshot[*idx].dst_text = Some(translated.clone());
         }
     }
-    std::fs::write(json_path, serde_json::to_string_pretty(&snapshot)?)?;
+    let json = serde_json::to_string_pretty(&snapshot)?;
+    atomic_write(Path::new(json_path), json.as_bytes())?;
     Ok(())
 }
 
@@ -519,7 +527,8 @@ fn save_epub_stage(
     });
 
     let path = work_dir.join(format!("{}.json", stage_name));
-    std::fs::write(&path, serde_json::to_string_pretty(&summary)?)?;
+    let json = serde_json::to_string_pretty(&summary)?;
+    atomic_write(&path, json.as_bytes())?;
     info!("阶段快照已保存: {}", path.display());
     Ok(())
 }
@@ -570,7 +579,8 @@ fn save_txt_stage(
     });
 
     let path = work_dir.join(format!("{}.json", stage_name));
-    std::fs::write(&path, serde_json::to_string_pretty(&summary)?)?;
+    let json = serde_json::to_string_pretty(&summary)?;
+    atomic_write(&path, json.as_bytes())?;
     info!("阶段快照已保存: {}", path.display());
     Ok(())
 }
@@ -764,7 +774,8 @@ fn generate_error_report(
         "failed": failed_list,
     });
 
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    let report_json = serde_json::to_string_pretty(&report)?;
+    atomic_write(&report_path, report_json.as_bytes())?;
 
     let result: HashMap<String, serde_json::Value> =
         serde_json::from_value(summary).unwrap_or_default();
@@ -807,7 +818,11 @@ fn check_and_fix_translations(
                 fixed_results.insert(orig_idx, fixed_dst);
             } else {
                 // 修复后强制复检，防止“修好了又坏了”
-                let recheck = checker.check(&[src.clone()], &[fixed_dst.clone()], retry_count);
+                let recheck = checker.check(
+                    std::slice::from_ref(src),
+                    std::slice::from_ref(&fixed_dst),
+                    retry_count,
+                );
                 if !recheck.is_empty() && recheck[0].error == ErrorType::None {
                     fixed_results.insert(orig_idx, fixed_dst.clone());
                     corrected_count += 1;
@@ -845,7 +860,11 @@ fn check_and_fix_translations(
         } else {
             // 质检失败：允许更积极的修复（含孤立假名删除），复检通过才接受
             let fixed_dst = fixer.fix(src, dst);
-            let recheck = checker.check(&[src.clone()], &[fixed_dst.clone()], retry_count);
+            let recheck = checker.check(
+                std::slice::from_ref(src),
+                std::slice::from_ref(&fixed_dst),
+                retry_count,
+            );
 
             if !recheck.is_empty() && recheck[0].error == ErrorType::None {
                 fixed_results.insert(orig_idx, fixed_dst.clone());
@@ -905,6 +924,32 @@ fn process_batch_response(
     fixer: &AutoFixer,
     error_records: &Arc<Mutex<Vec<ErrorRecord>>>,
 ) -> BatchOutcome {
+    if response.diagnostics.has_issues() {
+        let diagnostic_summary = parser_diagnostic_summary(&response);
+        let mut failure_causes = HashMap::new();
+        for &idx in unit_indices {
+            failure_causes.insert(
+                idx,
+                FailureCause::new(
+                    ErrorType::JsonStructureError.to_string(),
+                    format!("批次响应结构不完整，拒绝部分提交；{}", diagnostic_summary),
+                    "first_pass_parser",
+                    0,
+                ),
+            );
+        }
+        warn!(
+            "批次响应结构异常，拒绝提交全部 {} 个单元: {}",
+            unit_indices.len(),
+            diagnostic_summary
+        );
+        return BatchOutcome {
+            api_failed: unit_indices.to_vec(),
+            failure_causes,
+            ..BatchOutcome::default()
+        };
+    }
+
     let mut srcs = Vec::new();
     let mut dsts = Vec::new();
     let mut indices = Vec::new();
@@ -933,18 +978,6 @@ fn process_batch_response(
                 ),
             );
         }
-    }
-
-    if response.diagnostics.has_issues() {
-        let first = unit_indices.first().copied().unwrap_or(0);
-        let last = unit_indices.last().copied().unwrap_or(first);
-        warn!(
-            "批次 units={:?} ({}..{}) 响应结构异常: {}",
-            unit_indices.len(),
-            first,
-            last,
-            diagnostic_summary
-        );
     }
 
     if srcs.is_empty() {
@@ -1211,6 +1244,7 @@ fn record_skipped_retry_errors(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn retry_failed_with_context(
     llm: Arc<LlmClient>,
     checker: &ResponseChecker,
@@ -1432,7 +1466,7 @@ async fn retry_failed_with_context(
                     check_and_fix_translations(
                         checker,
                         fixer,
-                        &[src_text.clone()],
+                        std::slice::from_ref(&src_text),
                         &[translated],
                         &[idx],
                         error_records,
@@ -1573,6 +1607,7 @@ pub async fn translate_epub(
     cancel_flag: CancelFlag,
 ) -> Result<bool> {
     config.validate()?;
+    ensure_distinct_paths(input_epub, output_epub)?;
 
     // Early cancel check before any work
     if is_cancelled(&cancel_flag) {
@@ -1674,7 +1709,7 @@ pub async fn translate_epub(
         }
     }
 
-    EpubHandler::save_translation_data(&data, &json_path)?;
+    save_epub_translation_snapshot(&data, &translations, &json_path)?;
     save_resume_manifest(&work_dir, &resume_manifest)?;
 
     // ========================================================================
@@ -1705,7 +1740,7 @@ pub async fn translate_epub(
         config.api_key.clone(),
         glossary_entries.clone(),
     )?);
-    let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
+    let total_batches = data.len().div_ceil(config.batch_size);
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
 
     let pb = ProgressBar::new(total_batches as u64);
@@ -1901,8 +1936,10 @@ pub async fn translate_epub(
                 let result = async {
                     let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
-                    let texts: Vec<String> =
-                        pending.iter().map(|&i| data_c[i].src_text.clone()).collect();
+                    let texts: Vec<String> = pending
+                        .iter()
+                        .map(|&i| data_c[i].src_text.clone())
+                        .collect();
 
                     let context = build_context_for_batch_precomputed(
                         pc.as_ref().as_ref(),
@@ -2040,7 +2077,11 @@ pub async fn translate_epub(
                     emit_progress(
                         &progress_cb,
                         ProgressEvent::Log {
-                            message: format!("任务异常中断: {}（已登记 {} 个单元）", e, orphaned.len()),
+                            message: format!(
+                                "任务异常中断: {}（已登记 {} 个单元）",
+                                e,
+                                orphaned.len()
+                            ),
                         },
                     );
                     emit_progress(
@@ -2282,8 +2323,7 @@ pub async fn translate_epub(
         if !records.is_empty() {
             println!("\n生成错误报告...");
             let metadata = epub_report_metadata(&data);
-            let summary = generate_error_report(&records, &work_dir, Some(&metadata))?;
-            summary
+            generate_error_report(&records, &work_dir, Some(&metadata))?
         } else {
             HashMap::new()
         }
@@ -2420,6 +2460,7 @@ pub async fn translate_txt(
     cancel_flag: CancelFlag,
 ) -> Result<bool> {
     config.validate()?;
+    ensure_distinct_paths(input_txt, output_txt)?;
 
     // Early cancel check before any work
     if is_cancelled(&cancel_flag) {
@@ -2509,9 +2550,8 @@ pub async fn translate_txt(
         }
     }
 
-    // Save initial data to disk (crash recovery)
-    let json_str_init = serde_json::to_string_pretty(&data)?;
-    std::fs::write(&txt_json_path, &json_str_init)?;
+    // Save initial/resumed data to disk without overwriting recovered translations.
+    save_txt_translation_snapshot(&data, &translations, &txt_json_path)?;
     save_resume_manifest(&work_dir, &resume_manifest)?;
 
     // Step 2: Translate
@@ -2538,7 +2578,7 @@ pub async fn translate_txt(
         config.api_key.clone(),
         glossary_entries.clone(),
     )?);
-    let total_batches = (data.len() + config.batch_size - 1) / config.batch_size;
+    let total_batches = data.len().div_ceil(config.batch_size);
     let batch_indices: Vec<usize> = (0..data.len()).step_by(config.batch_size).collect();
 
     let pb = ProgressBar::new(total_batches as u64);
@@ -2740,8 +2780,10 @@ pub async fn translate_txt(
                 let result = async {
                     let _permit = sem.acquire().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
-                    let texts: Vec<String> =
-                        pending.iter().map(|&i| data_c[i].src_text.clone()).collect();
+                    let texts: Vec<String> = pending
+                        .iter()
+                        .map(|&i| data_c[i].src_text.clone())
+                        .collect();
 
                     let context = build_context_for_batch_precomputed(
                         pc.as_ref().as_ref(),
@@ -3071,7 +3113,7 @@ pub async fn translate_txt(
         }
     }
     let json_str = serde_json::to_string_pretty(&data)?;
-    std::fs::write(&txt_json_path, &json_str)?;
+    atomic_write(Path::new(&txt_json_path), json_str.as_bytes())?;
     println!("翻译数据已保存: {}", txt_json_path);
 
     // Step 4: Write output
@@ -3110,8 +3152,7 @@ pub async fn translate_txt(
         let records = error_records.lock().unwrap_or_else(|e| e.into_inner());
         if !records.is_empty() {
             let metadata = txt_report_metadata(&data);
-            let summary = generate_error_report(&records, &work_dir, Some(&metadata))?;
-            summary
+            generate_error_report(&records, &work_dir, Some(&metadata))?
         } else {
             HashMap::new()
         }
@@ -3176,6 +3217,18 @@ mod tests {
     use super::*;
     use crate::llm::ParseDiagnostics;
 
+    fn unique_json_path(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "orion_pipeline_{name}_{}_{}.json",
+            std::process::id(),
+            nonce
+        ))
+    }
+
     #[test]
     fn pending_indices_skips_already_translated() {
         let mut done = HashMap::new();
@@ -3225,7 +3278,10 @@ mod tests {
         translations.insert(1usize, "仅第一项".to_string());
         let response = BatchTranslationResponse {
             translations,
-            diagnostics: ParseDiagnostics::default(),
+            diagnostics: ParseDiagnostics {
+                missing_indices: vec![2],
+                ..ParseDiagnostics::default()
+            },
         };
 
         let outcome = process_batch_response(
@@ -3237,8 +3293,76 @@ mod tests {
             &error_records,
         );
 
-        assert!(outcome.fixed.contains_key(&10));
-        assert_eq!(outcome.api_failed, vec![11]);
+        assert!(outcome.fixed.is_empty());
+        assert_eq!(outcome.api_failed, vec![10, 11]);
+        assert!(outcome.failure_causes.contains_key(&10));
         assert!(outcome.failure_causes.contains_key(&11));
+    }
+
+    #[test]
+    fn process_batch_response_rejects_duplicate_ids_atomically() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 3);
+        let fixer = AutoFixer::new("ja", "zh");
+        let error_records = Arc::new(Mutex::new(Vec::new()));
+        let response = BatchTranslationResponse {
+            translations: HashMap::from([
+                (1usize, "第一项".to_string()),
+                (2usize, "第二项".to_string()),
+            ]),
+            diagnostics: ParseDiagnostics {
+                duplicate_indices: vec![1],
+                ..ParseDiagnostics::default()
+            },
+        };
+
+        let outcome = process_batch_response(
+            response,
+            &[20, 21],
+            |idx| format!("src{idx}"),
+            &checker,
+            &fixer,
+            &error_records,
+        );
+
+        assert!(outcome.fixed.is_empty());
+        assert_eq!(outcome.api_failed, vec![20, 21]);
+    }
+
+    #[test]
+    fn initial_epub_snapshot_keeps_resumed_translations() {
+        let path = unique_json_path("epub_resume");
+        let data = vec![TranslationBlock {
+            file_id: "chapter".to_string(),
+            file_name: "chapter.xhtml".to_string(),
+            title: "Chapter".to_string(),
+            index: 0,
+            src_text: "原文".to_string(),
+            dst_text: None,
+            page_type: "content".to_string(),
+        }];
+        let translations = HashMap::from([(0usize, "恢复译文".to_string())]);
+
+        save_epub_translation_snapshot(&data, &translations, &path.to_string_lossy()).unwrap();
+
+        let saved = EpubHandler::load_translation_data(&path.to_string_lossy()).unwrap();
+        assert_eq!(saved[0].dst_text.as_deref(), Some("恢复译文"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn initial_txt_snapshot_keeps_resumed_translations() {
+        let path = unique_json_path("txt_resume");
+        let data = vec![txt::TxtBlock {
+            index: 0,
+            src_text: "原文".to_string(),
+            dst_text: None,
+        }];
+        let translations = HashMap::from([(0usize, "恢复译文".to_string())]);
+
+        save_txt_translation_snapshot(&data, &translations, &path.to_string_lossy()).unwrap();
+
+        let saved = load_txt_translation_data(&path.to_string_lossy()).unwrap();
+        assert_eq!(saved[0].dst_text.as_deref(), Some("恢复译文"));
+        let _ = std::fs::remove_file(path);
     }
 }

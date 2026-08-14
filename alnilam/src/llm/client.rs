@@ -109,6 +109,7 @@ impl LlmClient {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_params(
         llm_url: &str,
         model: &str,
@@ -134,6 +135,7 @@ impl LlmClient {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_params_and_glossary_entries(
         llm_url: &str,
         model: &str,
@@ -314,7 +316,9 @@ impl LlmClient {
             payload.thinking.as_ref().map(|t| t.thinking_type)
         );
 
-        for attempt in 0..self.max_retries {
+        let mut last_error = None;
+        let total_attempts = network_attempts(self.max_retries);
+        for attempt in 0..total_attempts {
             match self.send_request(&endpoint, &payload).await {
                 Ok(response_text) => {
                     debug!("RESPONSE [Batch {}]: len={}", batch_id, response_text.len());
@@ -322,6 +326,10 @@ impl LlmClient {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
+                    if is_permanent_request_error(&err_str) {
+                        warn!("[永久请求错误] 不再重试 [Batch {}]: {}", batch_id, err_str);
+                        return Err(e);
+                    }
                     let is_rate_limit = err_str.contains("429") || err_str.contains("rate");
                     let is_timeout = err_str.contains("timed out") || err_str.contains("timeout");
                     let label = if is_rate_limit {
@@ -335,14 +343,17 @@ impl LlmClient {
                         "[{}] Attempt {}/{} [Batch {}]: {}",
                         label,
                         attempt + 1,
-                        self.max_retries,
+                        total_attempts,
                         batch_id,
                         e
                     );
-                    if attempt + 1 < self.max_retries {
+                    if attempt + 1 < total_attempts {
                         // 限流时使用更长的退避时间
-                        let base_ms = if is_rate_limit { 3000 } else { 1000 };
-                        let delay = Duration::from_millis(base_ms * 2u64.pow(attempt as u32));
+                        let base_ms: u64 = if is_rate_limit { 3000 } else { 1000 };
+                        let exponent = (attempt as u32).min(5);
+                        let delay = Duration::from_millis(
+                            base_ms.saturating_mul(2u64.pow(exponent)).min(30_000),
+                        );
                         warn!(
                             "[Batch {}] 等待 {:.1}s 后重试...",
                             batch_id,
@@ -350,11 +361,12 @@ impl LlmClient {
                         );
                         tokio::time::sleep(delay).await;
                     }
+                    last_error = Some(e);
                 }
             }
         }
 
-        Ok(None)
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("LLM 请求未执行")))
     }
 
     async fn send_request(&self, endpoint: &str, payload: &ChatRequest) -> Result<String> {
@@ -532,6 +544,32 @@ impl LlmClient {
     }
 }
 
+fn is_permanent_request_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "http error 400",
+        "http error 401",
+        "http error 403",
+        "http error 404",
+        "http error 405",
+        "http error 409",
+        "http error 410",
+        "http error 413",
+        "http error 415",
+        "http error 422",
+        "invalid api key",
+        "incorrect api key",
+        "authentication",
+        "permission denied",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn network_attempts(max_retries: usize) -> usize {
+    max_retries.saturating_add(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,6 +580,29 @@ mod tests {
             dst: dst.to_string(),
             info: String::new(),
         }
+    }
+
+    #[test]
+    fn classifies_permanent_http_errors_without_retry() {
+        for message in [
+            "HTTP error 400 Bad Request: invalid parameter",
+            "HTTP error 401 Unauthorized: invalid API key",
+            "HTTP error 403 Forbidden",
+            "HTTP error 422 Unprocessable Entity",
+        ] {
+            assert!(is_permanent_request_error(message), "{message}");
+        }
+        assert!(!is_permanent_request_error("API 限流 (429)"));
+        assert!(!is_permanent_request_error(
+            "HTTP error 500 Internal Server Error"
+        ));
+        assert!(!is_permanent_request_error("request timed out"));
+    }
+
+    #[test]
+    fn zero_retry_budget_still_allows_the_initial_request() {
+        assert_eq!(network_attempts(0), 1);
+        assert_eq!(network_attempts(3), 4);
     }
 
     #[test]
@@ -608,8 +669,7 @@ mod tests {
 
     #[test]
     fn orion_request_omits_thinking_field() {
-        let llm =
-            LlmClient::new("http://127.0.0.1:9633/v1", "Orion-Qwen3-1.7B-SFT", 1).unwrap();
+        let llm = LlmClient::new("http://127.0.0.1:9633/v1", "Orion-Qwen3-1.7B-SFT", 1).unwrap();
         assert_eq!(llm.thinking_for_request(), None);
 
         let payload = ChatRequest {

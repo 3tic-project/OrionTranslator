@@ -50,16 +50,17 @@ pub fn parse_jsonl_response_detailed(response: &str, expected_count: usize) -> P
                 for (key, value) in map {
                     if let Ok(idx) = key.parse::<usize>() {
                         parsed_any = true;
-                        insert_translation(
-                            &mut results,
-                            &mut diagnostics,
-                            expected_count,
-                            idx,
-                            match value {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            },
-                        );
+                        if let serde_json::Value::String(value) = value {
+                            insert_translation(
+                                &mut results,
+                                &mut diagnostics,
+                                expected_count,
+                                idx,
+                                value.clone(),
+                            );
+                        } else {
+                            diagnostics.malformed_lines.push(line.to_string());
+                        }
                     }
                 }
             }
@@ -74,7 +75,6 @@ pub fn parse_jsonl_response_detailed(response: &str, expected_count: usize) -> P
         for caps in re.captures_iter(line) {
             if let (Some(idx_match), Some(val_match)) = (caps.get(1), caps.get(2)) {
                 if let Ok(idx) = idx_match.as_str().parse::<usize>() {
-                    parsed_any = true;
                     let mut value = val_match.as_str().to_string();
                     value = value.replace("\\n", "\n");
                     value = value.replace("\\r", "\r");
@@ -85,9 +85,9 @@ pub fn parse_jsonl_response_detailed(response: &str, expected_count: usize) -> P
                 }
             }
         }
-        if !parsed_any {
-            diagnostics.malformed_lines.push(line.to_string());
-        }
+        // The fallback is retained for diagnostics/legacy callers, but detailed
+        // pipeline validation treats every non-JSON line as malformed.
+        diagnostics.malformed_lines.push(line.to_string());
     }
 
     for idx in 1..=expected_count {
@@ -196,5 +196,14 @@ not json"#;
         assert_eq!(parsed.diagnostics.duplicate_indices, vec![1]);
         assert_eq!(parsed.diagnostics.out_of_range_indices, vec![3]);
         assert_eq!(parsed.diagnostics.malformed_lines, vec!["not json"]);
+    }
+
+    #[test]
+    fn reports_non_string_values_as_malformed() {
+        let parsed = parse_jsonl_response_detailed(r#"{"1":123}"#, 1);
+
+        assert!(parsed.translations.is_empty());
+        assert_eq!(parsed.diagnostics.missing_indices, vec![1]);
+        assert_eq!(parsed.diagnostics.malformed_lines, vec![r#"{"1":123}"#]);
     }
 }

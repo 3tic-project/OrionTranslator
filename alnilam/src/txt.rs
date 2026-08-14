@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::TranslationMode;
+use crate::io_utils::atomic_write_with;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxtBlock {
@@ -39,22 +40,20 @@ pub fn write_txt_output(
     output_path: &Path,
     mode: TranslationMode,
 ) -> Result<()> {
-    let mut file = std::fs::File::create(output_path)
-        .with_context(|| format!("Failed to create: {}", output_path.display()))?;
-
-    for item in data {
-        let dst = item.dst_text.as_deref().unwrap_or(&item.src_text);
-        match mode {
-            TranslationMode::Bilingual => {
-                writeln!(file, "{}", item.src_text)?;
-                writeln!(file, "{}", dst)?;
-                writeln!(file)?;
-            }
-            TranslationMode::Replace => {
-                writeln!(file, "{}", dst)?;
+    atomic_write_with(output_path, |file| {
+        for item in data {
+            let dst = item.dst_text.as_deref().unwrap_or(&item.src_text);
+            match mode {
+                TranslationMode::Bilingual => {
+                    writeln!(file, "{}", item.src_text)?;
+                    writeln!(file, "{}", dst)?;
+                    writeln!(file)?;
+                }
+                TranslationMode::Replace => {
+                    writeln!(file, "{}", dst)?;
+                }
             }
         }
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
