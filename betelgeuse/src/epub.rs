@@ -40,12 +40,35 @@ pub struct EpubLeafBlock {
     pub raw_text: String,
 }
 
+/// EPUB 中保留的 ruby 表记与读音证据。
+///
+/// 该类型只表达原书中实际存在的标注，不代表读音已经被确认为术语别名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RubyAnnotation {
+    pub base: String,
+    pub reading: String,
+    pub source_path: String,
+    pub context: String,
+    pub combined: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EpubTextExtraction {
+    pub lines: Vec<String>,
+    pub ruby_annotations: Vec<RubyAnnotation>,
+}
+
 /// Extract text lines from an EPUB file.
 ///
 /// Each line corresponds to a block-level element (p, h1-h6, li, div, etc.)
 /// from the EPUB content files, processed in spine order.
 /// Ruby annotations (<rt> tags) are stripped.
 pub fn extract_epub_lines(epub_path: &Path) -> Result<Vec<String>> {
+    Ok(extract_epub_text(epub_path)?.lines)
+}
+
+/// 同时抽取可翻译正文与 ruby 证据。`rt` 不会混入正文。
+pub fn extract_epub_text(epub_path: &Path) -> Result<EpubTextExtraction> {
     let file = std::fs::File::open(epub_path)
         .with_context(|| format!("EPUB文件不存在: {}", epub_path.display()))?;
     let mut archive = zip::ZipArchive::new(file).with_context(|| "Failed to read EPUB as ZIP")?;
@@ -93,7 +116,7 @@ pub fn extract_epub_lines(epub_path: &Path) -> Result<Vec<String>> {
 
     log::debug!("EPUB spine has {} content files", ordered_files.len());
 
-    let mut all_lines: Vec<String> = Vec::new();
+    let mut extraction = EpubTextExtraction::default();
 
     for (_, file_path) in &ordered_files {
         let content_bytes = match find_item_content(&raw_items, file_path) {
@@ -104,18 +127,28 @@ pub fn extract_epub_lines(epub_path: &Path) -> Result<Vec<String>> {
             }
         };
 
-        let content_str = String::from_utf8_lossy(&content_bytes).to_string();
+        let content_str = String::from_utf8_lossy(content_bytes).to_string();
 
         // Preprocess XHTML for html5ever compatibility
         let content_str = fix_xhtml_for_html5(&content_str);
         let content_str = normalize_void_elements(&content_str);
 
         // Extract text lines from this document
-        let lines = extract_lines_from_html(&content_str);
-        all_lines.extend(lines);
+        let blocks = extract_leaf_blocks_from_html(&content_str);
+        extraction
+            .lines
+            .extend(blocks.iter().map(|block| block.text.clone()));
+        extraction.ruby_annotations.extend(
+            extract_ruby_annotations_from_html(&content_str)
+                .into_iter()
+                .map(|mut annotation| {
+                    annotation.source_path = file_path.clone();
+                    annotation
+                }),
+        );
     }
 
-    Ok(all_lines)
+    Ok(extraction)
 }
 
 // ── OPF Parsing ──────────────────────────────────────────────────────────
@@ -395,7 +428,7 @@ pub fn extract_leaf_blocks_from_html(html: &str) -> Vec<EpubLeafBlock> {
         let has_nested_block = element.descendants().skip(1).any(|node| {
             node.value()
                 .as_element()
-                .map_or(false, |e| EPUB_BLOCK_TAGS.iter().any(|bt| *bt == e.name()))
+                .is_some_and(|e| EPUB_BLOCK_TAGS.iter().any(|bt| *bt == e.name()))
         });
 
         if has_nested_block {
@@ -418,6 +451,163 @@ pub fn extract_leaf_blocks_from_html(html: &str) -> Vec<EpubLeafBlock> {
     }
 
     blocks
+}
+
+/// 从 HTML/XHTML 中抽取 ruby 证据，同时为逐字相邻的 ruby 生成组合候选。
+pub fn extract_ruby_annotations_from_html(html: &str) -> Vec<RubyAnnotation> {
+    let fragment = Html::parse_document(html);
+    let block_selector = match Selector::parse(&EPUB_BLOCK_TAGS.join(", ")) {
+        Ok(selector) => selector,
+        Err(_) => return Vec::new(),
+    };
+    let ruby_selector = match Selector::parse("ruby") {
+        Ok(selector) => selector,
+        Err(_) => return Vec::new(),
+    };
+    let rt_selector = match Selector::parse("rt") {
+        Ok(selector) => selector,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut annotations = Vec::new();
+    for block in fragment.select(&block_selector) {
+        if has_orion_translation_class(&block) {
+            continue;
+        }
+        let has_nested_block = block.descendants().skip(1).any(|node| {
+            node.value()
+                .as_element()
+                .is_some_and(|element| EPUB_BLOCK_TAGS.contains(&element.name()))
+        });
+        if has_nested_block {
+            continue;
+        }
+
+        let context = get_clean_text(&block).trim().to_string();
+        let block_html = block.html();
+        let mut cursor = 0usize;
+        let mut positioned = Vec::new();
+
+        for ruby in block.select(&ruby_selector) {
+            let base = compact_text(&get_ruby_base_text(&ruby));
+            let reading = compact_text(
+                &ruby
+                    .select(&rt_selector)
+                    .flat_map(|rt| rt.text())
+                    .collect::<String>(),
+            );
+            if base.is_empty() || reading.is_empty() || base == reading {
+                continue;
+            }
+
+            let ruby_html = ruby.html();
+            let (start, end) = match block_html[cursor..].find(&ruby_html) {
+                Some(relative) => {
+                    let start = cursor + relative;
+                    let end = start + ruby_html.len();
+                    cursor = end;
+                    (start, end)
+                }
+                None => (cursor, cursor),
+            };
+            positioned.push((
+                RubyAnnotation {
+                    base,
+                    reading,
+                    source_path: String::new(),
+                    context: context.clone(),
+                    combined: false,
+                },
+                start,
+                end,
+            ));
+        }
+
+        annotations.extend(
+            positioned
+                .iter()
+                .map(|(annotation, _, _)| annotation.clone()),
+        );
+
+        let mut group_start = 0usize;
+        while group_start < positioned.len() {
+            let mut group_end = group_start + 1;
+            while group_end < positioned.len()
+                && ruby_nodes_are_adjacent(
+                    &block_html,
+                    positioned[group_end - 1].2,
+                    positioned[group_end].1,
+                )
+            {
+                group_end += 1;
+            }
+
+            if group_end - group_start >= 2 {
+                annotations.push(RubyAnnotation {
+                    base: positioned[group_start..group_end]
+                        .iter()
+                        .map(|(annotation, _, _)| annotation.base.as_str())
+                        .collect(),
+                    reading: positioned[group_start..group_end]
+                        .iter()
+                        .map(|(annotation, _, _)| annotation.reading.as_str())
+                        .collect(),
+                    source_path: String::new(),
+                    context: context.clone(),
+                    combined: true,
+                });
+            }
+            group_start = group_end;
+        }
+    }
+
+    annotations
+}
+
+fn compact_text(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
+fn ruby_nodes_are_adjacent(html: &str, previous_end: usize, next_start: usize) -> bool {
+    if previous_end > next_start || next_start > html.len() {
+        return false;
+    }
+    let separator = &html[previous_end..next_start];
+    if separator.to_ascii_lowercase().contains("<br") {
+        return false;
+    }
+    let fragment = Html::parse_fragment(separator);
+    fragment
+        .root_element()
+        .text()
+        .all(|text| text.trim().is_empty())
+}
+
+fn get_ruby_base_text(element: &scraper::ElementRef) -> String {
+    use ego_tree::iter::Edge;
+    use scraper::Node;
+
+    let mut text = String::new();
+    let mut ignored_depth = 0u32;
+    for edge in element.traverse() {
+        match edge {
+            Edge::Open(node) => match node.value() {
+                Node::Element(element) if matches!(element.name(), "rt" | "rp") => {
+                    ignored_depth += 1;
+                }
+                Node::Text(value) if ignored_depth == 0 => text.push_str(value),
+                _ => {}
+            },
+            Edge::Close(node) => {
+                if let Node::Element(element) = node.value() {
+                    if matches!(element.name(), "rt" | "rp") && ignored_depth > 0 {
+                        ignored_depth -= 1;
+                    }
+                }
+            }
+        }
+    }
+    text
 }
 
 pub fn extract_attr(attrs: &str, name: &str) -> Option<String> {
@@ -472,6 +662,48 @@ fn has_orion_translation_class(element: &scraper::ElementRef) -> bool {
     })
 }
 
+/// Extract text from an element, ignoring ruby fallback/readout nodes (`rt`/`rp`)
+/// and translator-generated descendants.
+pub fn get_clean_text(element: &scraper::ElementRef) -> String {
+    use ego_tree::iter::Edge;
+    use scraper::Node;
+
+    let mut text = String::new();
+    let mut ignored_depth = 0u32;
+
+    for edge in element.traverse() {
+        match edge {
+            Edge::Open(node) => match node.value() {
+                Node::Element(elem) if is_ignored_generated_or_ruby_element(elem) => {
+                    ignored_depth += 1;
+                }
+                Node::Text(t) if ignored_depth == 0 => {
+                    text.push_str(t);
+                }
+                _ => {}
+            },
+            Edge::Close(node) => {
+                if let Node::Element(elem) = node.value() {
+                    if is_ignored_generated_or_ruby_element(elem) && ignored_depth > 0 {
+                        ignored_depth -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    text
+}
+
+fn is_ignored_generated_or_ruby_element(element: &scraper::node::Element) -> bool {
+    matches!(element.name(), "rt" | "rp")
+        || element.attr("class").is_some_and(|classes| {
+            classes.split_whitespace().any(|class_name| {
+                matches!(class_name, "orion-translation" | "orion-toc-translation")
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +712,42 @@ mod tests {
     fn extraction_skips_injected_translation_blocks() {
         let html = r#"<html><body><p>原文一</p><p class="orion-translation">译文一</p><p>原文二</p></body></html>"#;
         assert_eq!(extract_lines_from_html(html), vec!["原文一", "原文二"]);
+    }
+
+    #[test]
+    fn extraction_skips_generated_toc_translation_descendant() {
+        let html = r#"<html><body><p><a href="ch.xhtml"><ruby>第一章<rt>だいいっしょう</rt></ruby><span class="orion-toc-translation"> / 第一章</span></a></p></body></html>"#;
+        assert_eq!(extract_lines_from_html(html), vec!["第一章"]);
+    }
+
+    #[test]
+    fn ruby_extraction_keeps_base_and_reading_out_of_visible_text() {
+        let html = r#"<html><body><p>彼女は<ruby>白地野音<rp>（</rp><rt>シラジノオト</rt><rp>）</rp></ruby>だ。</p></body></html>"#;
+        assert_eq!(extract_lines_from_html(html), vec!["彼女は白地野音だ。"]);
+
+        let annotations = extract_ruby_annotations_from_html(html);
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].base, "白地野音");
+        assert_eq!(annotations[0].reading, "シラジノオト");
+        assert!(!annotations[0].combined);
+    }
+
+    #[test]
+    fn adjacent_per_character_ruby_produces_combined_candidate() {
+        let html = r#"<html><body><p><ruby>白<rt>しら</rt></ruby><ruby>地<rt>じ</rt></ruby><ruby>野<rt>の</rt></ruby>さん</p></body></html>"#;
+        let annotations = extract_ruby_annotations_from_html(html);
+
+        assert!(annotations
+            .iter()
+            .any(|item| item.base == "白地野" && item.reading == "しらじの" && item.combined));
+        assert_eq!(annotations.iter().filter(|item| !item.combined).count(), 3);
+    }
+
+    #[test]
+    fn separated_ruby_does_not_create_combined_candidate() {
+        let html = r#"<html><body><p><ruby>白<rt>しら</rt></ruby>と<ruby>野<rt>の</rt></ruby></p></body></html>"#;
+        let annotations = extract_ruby_annotations_from_html(html);
+        assert!(!annotations.iter().any(|item| item.combined));
     }
 
     #[test]
@@ -513,37 +781,4 @@ mod tests {
         assert!(!fixed.contains("<img src=\"a.jpg\" alt=\"illustration\">"));
         assert_eq!(restore_xhtml_void_elements("<br></br>"), "<br />");
     }
-}
-
-/// Extract text from an element, ignoring <rt> (ruby annotation text).
-/// Uses edge traversal to properly handle nested <rt> elements.
-pub fn get_clean_text(element: &scraper::ElementRef) -> String {
-    use ego_tree::iter::Edge;
-    use scraper::Node;
-
-    let mut text = String::new();
-    let mut rt_depth = 0u32;
-
-    for edge in element.traverse() {
-        match edge {
-            Edge::Open(node) => match node.value() {
-                Node::Element(elem) if elem.name() == "rt" => {
-                    rt_depth += 1;
-                }
-                Node::Text(t) if rt_depth == 0 => {
-                    text.push_str(t);
-                }
-                _ => {}
-            },
-            Edge::Close(node) => {
-                if let Node::Element(elem) = node.value() {
-                    if elem.name() == "rt" && rt_depth > 0 {
-                        rt_depth -= 1;
-                    }
-                }
-            }
-        }
-    }
-
-    text
 }
