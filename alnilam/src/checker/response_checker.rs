@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use regex::Regex;
 
@@ -29,9 +29,10 @@ fn is_kana(c: char) -> bool {
     is_hiragana(c) || is_katakana(c)
 }
 
-fn has_problematic_kana_residue(text: &str) -> bool {
+fn problematic_kana_runs<'a>(src: &str, text: &'a str) -> Vec<&'a str> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut i = 0usize;
+    let mut problematic = Vec::new();
 
     while i < chars.len() {
         if !is_kana(chars[i].1) {
@@ -52,13 +53,64 @@ fn has_problematic_kana_residue(text: &str) -> bool {
         let prev = if i == 0 { None } else { Some(chars[i - 1].1) };
         let next = chars.get(end).map(|(_, c)| *c);
 
-        if !is_allowed_shape_kana(run, prev, next) {
-            return true;
+        if !is_allowed_shape_kana(run, prev, next) && !is_protected_japanese_token(src, run) {
+            problematic.push(run);
         }
         i = end;
     }
 
-    false
+    problematic
+}
+
+fn has_problematic_kana_residue(src: &str, text: &str) -> bool {
+    !problematic_kana_runs(src, text).is_empty()
+}
+
+fn is_protected_japanese_token(src: &str, run: &str) -> bool {
+    if run.is_empty() || !src.contains(run) {
+        return false;
+    }
+    is_inside_source_quotes(src, run) || is_credit_line(src)
+}
+
+fn is_inside_source_quotes(src: &str, token: &str) -> bool {
+    const OPEN: &[char] = &[
+        '「', '『', '〝', '“', '‘', '（', '(', '【', '[', '《', '〈', '"',
+    ];
+    const CLOSE: &[char] = &[
+        '」', '』', '〟', '”', '’', '）', ')', '】', ']', '》', '〉', '"',
+    ];
+
+    src.match_indices(token).any(|(start, matched)| {
+        let prefix = &src[..start];
+        let suffix = &src[start + matched.len()..];
+        let last_open = prefix
+            .char_indices()
+            .filter(|(_, character)| OPEN.contains(character))
+            .map(|(index, _)| index)
+            .next_back();
+        let last_close = prefix
+            .char_indices()
+            .filter(|(_, character)| CLOSE.contains(character))
+            .map(|(index, _)| index)
+            .next_back();
+        last_open.is_some_and(|open| last_close.is_none_or(|close| open >= close))
+            && suffix.chars().any(|character| CLOSE.contains(&character))
+    })
+}
+
+fn is_credit_line(src: &str) -> bool {
+    [
+        "イラスト",
+        "口絵",
+        "挿絵",
+        "装画",
+        "原作",
+        "著者",
+        "印刷・製本",
+    ]
+    .iter()
+    .any(|marker| src.contains(marker))
 }
 
 fn is_allowed_shape_kana(run: &str, prev: Option<char>, next: Option<char>) -> bool {
@@ -174,14 +226,27 @@ fn re_json_escape() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"(\\?"\\?:\\?")|(":")|(":")"#).expect("json escape regex"))
 }
 
-fn re_chapter_number() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"第\d+[話话章節节回]").expect("chapter number regex"))
-}
-
 fn re_digits() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\d+").expect("digits regex"))
+}
+
+fn re_placeholder() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"\{\{[^{}\r\n]+\}\}|\{[A-Za-z_][A-Za-z0-9_.-]*\}|%(?:\d+\$)?[sdif]|__[A-Z][A-Z0-9_]*__",
+        )
+        .expect("placeholder regex")
+    })
+}
+
+fn token_multiset(regex: &Regex, text: &str) -> BTreeMap<String, usize> {
+    let mut tokens = BTreeMap::new();
+    for matched in regex.find_iter(text) {
+        *tokens.entry(matched.as_str().to_string()).or_default() += 1;
+    }
+    tokens
 }
 
 // ── ResponseChecker ──────────────────────────────────────────────────────
@@ -317,12 +382,41 @@ impl ResponseChecker {
             };
         }
 
-        // Kana residue (ja -> other), with small shape-marker tolerance.
-        if self.source_lang == "ja" && self.target_lang != "ja" && has_problematic_kana_residue(dst)
-        {
+        // Arabic numbers are hard QA. Width differences are normalized, counts are preserved.
+        let src_normalized = fullwidth_to_halfwidth(src);
+        let dst_normalized = fullwidth_to_halfwidth(dst);
+        let src_numbers = token_multiset(re_digits(), &src_normalized);
+        let dst_numbers = token_multiset(re_digits(), &dst_normalized);
+        if src_numbers != dst_numbers {
             return CheckResult {
-                error: ErrorType::KanaResidue,
-                details: "译文中残留假名".to_string(),
+                error: ErrorType::NumberMismatch,
+                details: format!("数字不一致: src={:?}, dst={:?}", src_numbers, dst_numbers),
+            };
+        }
+
+        // Template/control placeholders are hard QA and must survive verbatim.
+        let src_placeholders = token_multiset(re_placeholder(), src);
+        let dst_placeholders = token_multiset(re_placeholder(), dst);
+        if src_placeholders != dst_placeholders {
+            return CheckResult {
+                error: ErrorType::PlaceholderMismatch,
+                details: format!(
+                    "占位符不一致: src={:?}, dst={:?}",
+                    src_placeholders, dst_placeholders
+                ),
+            };
+        }
+
+        // Kana residue (ja -> other). Quoted puzzle/name tokens copied from the
+        // source and credit-line names are protected; other runs are prose.
+        if self.source_lang == "ja"
+            && self.target_lang != "ja"
+            && has_problematic_kana_residue(src, dst)
+        {
+            let runs = problematic_kana_runs(src, dst);
+            return CheckResult {
+                error: ErrorType::KanaUntranslatedProse,
+                details: format!("译文中残留未保护的假名正文: {}", runs.join(" / ")),
             };
         }
 
@@ -365,36 +459,10 @@ impl ResponseChecker {
             }
         }
 
-        // Number consistency check
-        let src_normalized = fullwidth_to_halfwidth(src);
-        let dst_normalized = fullwidth_to_halfwidth(dst);
-        let src_numbers: HashSet<String> = re_digits()
-            .find_iter(&src_normalized)
-            .map(|m| m.as_str().to_string())
-            .collect();
-        let dst_numbers: HashSet<String> = re_digits()
-            .find_iter(&dst_normalized)
-            .map(|m| m.as_str().to_string())
-            .collect();
-
-        if !src_numbers.is_empty()
-            && src_numbers.len() <= 3
-            && src_numbers.intersection(&dst_numbers).count() == 0
-            && re_chapter_number().is_match(&src_normalized)
-        {
-            return CheckResult {
-                error: ErrorType::LengthMismatch,
-                details: format!(
-                    "章节号不匹配: src含{:?}, dst含{:?}",
-                    src_numbers, dst_numbers
-                ),
-            };
-        }
-
         // Similarity check
         if self.check_similarity(src, dst) {
             let should_flag = if self.source_lang == "ja" && self.target_lang == "zh" {
-                has_problematic_kana_residue(dst)
+                has_problematic_kana_residue(src, dst)
             } else if self.source_lang == "ko" && self.target_lang == "zh" {
                 any_hangeul(dst)
             } else {
@@ -467,7 +535,7 @@ mod tests {
         let srcs = vec!["今日はいい天気ですね".to_string()];
         let dsts = vec!["今天はいい天気ですね".to_string()];
         let results = checker.check(&srcs, &dsts, 1);
-        assert_eq!(results[0].error, ErrorType::KanaResidue);
+        assert_eq!(results[0].error, ErrorType::KanaUntranslatedProse);
     }
 
     #[test]
@@ -529,5 +597,67 @@ mod tests {
             0,
         );
         assert_eq!(full_name[0].error, ErrorType::None);
+    }
+
+    #[test]
+    fn quoted_puzzle_tokens_are_protected_but_prose_is_not() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 2);
+        let puzzle = checker.check(
+            &["３─２　十二支の３番目「とら」の２文字目＝「ら」".to_string()],
+            &["3-2，取十二生肖第3位「とら」的第2个字符，即「ら」。".to_string()],
+            0,
+        );
+        assert_eq!(puzzle[0].error, ErrorType::None);
+
+        let prose = checker.check(
+            &["今日はいい天気ですね".to_string()],
+            &["今天はいい天気ですね".to_string()],
+            0,
+        );
+        assert_eq!(prose[0].error, ErrorType::KanaUntranslatedProse);
+        assert!(prose[0].details.contains("はいい"));
+    }
+
+    #[test]
+    fn credit_name_kana_is_protected_when_copied_from_source() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 2);
+        let result = checker.check(
+            &["口絵・本文イラスト●チェリ子".to_string()],
+            &["彩页、正文插图：チェリ子".to_string()],
+            0,
+        );
+        assert_eq!(result[0].error, ErrorType::None);
+    }
+
+    #[test]
+    fn numbers_and_placeholders_are_hard_checks() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 0);
+        let missing_number = checker.check(
+            &["第12章、3人、3人".to_string()],
+            &["第十二章，共三人。".to_string()],
+            5,
+        );
+        assert_eq!(missing_number[0].error, ErrorType::NumberMismatch);
+
+        let width_only = checker.check(
+            &["第１２章、３人".to_string()],
+            &["第12章，共3人。".to_string()],
+            5,
+        );
+        assert_eq!(width_only[0].error, ErrorType::None);
+
+        let missing_placeholder = checker.check(
+            &["{player}のHPは%dです".to_string()],
+            &["玩家的生命值是%d。".to_string()],
+            5,
+        );
+        assert_eq!(missing_placeholder[0].error, ErrorType::PlaceholderMismatch);
+
+        let placeholders_kept = checker.check(
+            &["{player}のHPは%dです".to_string()],
+            &["{player}的生命值是%d。".to_string()],
+            5,
+        );
+        assert_eq!(placeholders_kept[0].error, ErrorType::None);
     }
 }

@@ -277,12 +277,12 @@ pub fn filter_glossary_for_texts(
 
 pub fn format_matched_glossary(entries: &[GlossaryEntry], texts: &[String]) -> String {
     let matched = filter_glossary_for_texts(entries, texts);
-    format_grouped_constraints(&matched, false)
+    format_grouped_constraints(&matched)
         .map(|constraints| constraints.trim_end().to_string())
         .unwrap_or_default()
 }
 
-fn format_grouped_constraints(entries: &[GlossaryEntry], orion: bool) -> Option<String> {
+fn format_grouped_constraints(entries: &[GlossaryEntry]) -> Option<String> {
     let mut by_target: BTreeMap<&str, (Vec<&str>, Vec<&str>)> = BTreeMap::new();
     let mut entities = Vec::new();
     for entry in entries {
@@ -306,39 +306,25 @@ fn format_grouped_constraints(entries: &[GlossaryEntry], orion: bool) -> Option<
         return None;
     }
 
-    let mut result = if orion {
-        String::from("术语表：\n")
-    } else {
-        String::new()
-    };
+    let mut result = String::new();
     for (target, (mut surfaces, mut notes)) in by_target {
         surfaces.sort_unstable();
         surfaces.dedup();
         notes.sort_unstable();
         notes.dedup();
-        if orion {
-            result.push_str(&surfaces.join(" / "));
-            result.push('→');
-            result.push_str(target);
-        } else {
-            result.push_str(&surfaces.join(" / "));
-            result.push_str(" -> ");
-            result.push_str(target);
-            if !notes.is_empty() {
-                result.push_str("   #");
-                result.push_str(&notes.join("; "));
-            }
+        result.push_str(&surfaces.join(" / "));
+        result.push_str(" -> ");
+        result.push_str(target);
+        if !notes.is_empty() {
+            result.push_str("   #");
+            result.push_str(&notes.join("; "));
         }
         result.push('\n');
     }
     if !entities.is_empty() {
         entities.sort_unstable();
         entities.dedup();
-        result.push_str(if orion {
-            "人物候选：\n"
-        } else {
-            "Entity candidates:\n"
-        });
+        result.push_str("Entity candidates:\n");
         for entity in entities {
             result.push_str(entity);
             result.push('\n');
@@ -360,7 +346,45 @@ fn format_grouped_constraints(entries: &[GlossaryEntry], orion: bool) -> Option<
 ///
 /// 返回 None 表示没有任何可注入信息。
 pub fn format_glossary_for_orion(entries: &[GlossaryEntry]) -> Option<String> {
-    format_grouped_constraints(entries, true)
+    let mut pairs = Vec::new();
+    let mut entities = Vec::new();
+    for entry in entries {
+        let src = entry.src.trim();
+        let dst = entry.dst.trim();
+        if src.is_empty() {
+            continue;
+        }
+        if dst.is_empty() {
+            entities.push(src);
+        } else {
+            pairs.push((src, dst));
+        }
+    }
+    if pairs.is_empty() && entities.is_empty() {
+        return None;
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    entities.sort_unstable();
+    entities.dedup();
+
+    // Preserve Orion SFT's one-surface-per-line shape. Confirmed aliases share
+    // a target but remain separate mappings rather than introducing new syntax.
+    let mut result = String::from("术语表：\n");
+    for (src, dst) in pairs {
+        result.push_str(src);
+        result.push('→');
+        result.push_str(dst);
+        result.push('\n');
+    }
+    if !entities.is_empty() {
+        result.push_str("人物候选：\n");
+        for entity in entities {
+            result.push_str(entity);
+            result.push('\n');
+        }
+    }
+    Some(result)
 }
 
 pub fn format_matched_glossary_for_orion(

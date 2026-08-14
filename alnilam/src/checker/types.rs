@@ -9,12 +9,15 @@ pub enum ErrorType {
     EmptyTranslation,
     Degradation,
     KanaResidue,
+    KanaUntranslatedProse,
     HangeulResidue,
     HighSimilarity,
     CodeMismatch,
     JsonStructureError,
     LengthMismatch,
     TermMissing,
+    NumberMismatch,
+    PlaceholderMismatch,
 }
 
 impl std::fmt::Display for ErrorType {
@@ -26,12 +29,15 @@ impl std::fmt::Display for ErrorType {
             ErrorType::EmptyTranslation => write!(f, "EMPTY_TRANSLATION"),
             ErrorType::Degradation => write!(f, "DEGRADATION"),
             ErrorType::KanaResidue => write!(f, "KANA_RESIDUE"),
+            ErrorType::KanaUntranslatedProse => write!(f, "KANA_UNTRANSLATED_PROSE"),
             ErrorType::HangeulResidue => write!(f, "HANGEUL_RESIDUE"),
             ErrorType::HighSimilarity => write!(f, "HIGH_SIMILARITY"),
             ErrorType::CodeMismatch => write!(f, "CODE_MISMATCH"),
             ErrorType::JsonStructureError => write!(f, "JSON_STRUCTURE_ERROR"),
             ErrorType::LengthMismatch => write!(f, "LENGTH_MISMATCH"),
             ErrorType::TermMissing => write!(f, "TERM_MISSING"),
+            ErrorType::NumberMismatch => write!(f, "NUMBER_MISMATCH"),
+            ErrorType::PlaceholderMismatch => write!(f, "PLACEHOLDER_MISMATCH"),
         }
     }
 }
