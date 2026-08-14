@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use reqwest::header::RETRY_AFTER;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -69,6 +71,53 @@ struct ChatChoiceMessage {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum RequestError {
+    #[error("HTTP error {status}: {body}")]
+    Http {
+        status: StatusCode,
+        body: String,
+        retry_after: Option<Duration>,
+    },
+    #[error("LLM transport error: {0}")]
+    Transport(#[source] reqwest::Error),
+    #[error("LLM response protocol error: {0}")]
+    Protocol(String),
+}
+
+impl RequestError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Http { status, .. } => {
+                *status == StatusCode::REQUEST_TIMEOUT
+                    || *status == StatusCode::TOO_EARLY
+                    || *status == StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+            }
+            Self::Transport(error) => {
+                error.is_timeout() || error.is_connect() || error.is_request()
+            }
+            Self::Protocol(_) => true,
+        }
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Http { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS => "API 限流",
+            Self::Transport(error) if error.is_timeout() => "请求超时",
+            Self::Protocol(_) => "响应协议错误",
+            _ => "请求失败",
+        }
+    }
 }
 
 // ── LLM Client ───────────────────────────────────────────────────────────
@@ -324,36 +373,21 @@ impl LlmClient {
                     debug!("RESPONSE [Batch {}]: len={}", batch_id, response_text.len());
                     return Ok(Some(response_text));
                 }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if is_permanent_request_error(&err_str) {
-                        warn!("[永久请求错误] 不再重试 [Batch {}]: {}", batch_id, err_str);
-                        return Err(e);
+                Err(error) => {
+                    if !error.is_retryable() {
+                        warn!("[永久请求错误] 不再重试 [Batch {}]: {}", batch_id, error);
+                        return Err(error.into());
                     }
-                    let is_rate_limit = err_str.contains("429") || err_str.contains("rate");
-                    let is_timeout = err_str.contains("timed out") || err_str.contains("timeout");
-                    let label = if is_rate_limit {
-                        "API 限流"
-                    } else if is_timeout {
-                        "请求超时"
-                    } else {
-                        "请求失败"
-                    };
                     warn!(
                         "[{}] Attempt {}/{} [Batch {}]: {}",
-                        label,
+                        error.label(),
                         attempt + 1,
                         total_attempts,
                         batch_id,
-                        e
+                        error
                     );
                     if attempt + 1 < total_attempts {
-                        // 限流时使用更长的退避时间
-                        let base_ms: u64 = if is_rate_limit { 3000 } else { 1000 };
-                        let exponent = (attempt as u32).min(5);
-                        let delay = Duration::from_millis(
-                            base_ms.saturating_mul(2u64.pow(exponent)).min(30_000),
-                        );
+                        let delay = retry_delay(&error, attempt);
                         warn!(
                             "[Batch {}] 等待 {:.1}s 后重试...",
                             batch_id,
@@ -361,51 +395,60 @@ impl LlmClient {
                         );
                         tokio::time::sleep(delay).await;
                     }
-                    last_error = Some(e);
+                    last_error = Some(error);
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("LLM 请求未执行")))
+        match last_error {
+            Some(error) => Err(error.into()),
+            None => anyhow::bail!("LLM 请求未执行"),
+        }
     }
 
-    async fn send_request(&self, endpoint: &str, payload: &ChatRequest) -> Result<String> {
+    async fn send_request(
+        &self,
+        endpoint: &str,
+        payload: &ChatRequest,
+    ) -> std::result::Result<String, RequestError> {
         let mut req = self.client.post(endpoint).json(payload);
         if let Some(key) = &self.api_key {
             if !key.is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", key));
             }
         }
-        let response = req.send().await.context("Failed to send request to LLM")?;
+        let response = req.send().await.map_err(RequestError::Transport)?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read body>".to_string());
-            let body = self.redact_secrets(body);
-            anyhow::bail!("API 限流 (429): {}", body);
-        }
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
             let body = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
             let body = self.redact_secrets(body);
-            anyhow::bail!("HTTP error {}: {}", status, body);
+            return Err(RequestError::Http {
+                status,
+                body,
+                retry_after,
+            });
         }
 
         let data: ChatResponse = response
             .json()
             .await
-            .context("Failed to parse LLM response")?;
+            .map_err(|error| RequestError::Protocol(format!("JSON 解析失败: {error}")))?;
 
         data.choices
             .first()
             .and_then(|c| c.message.content.as_ref())
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("No content in LLM response"))
+            .ok_or_else(|| RequestError::Protocol("choices 为空或缺少 message.content".to_string()))
     }
 
     /// 测试模型：发送一条真实翻译格式的 prompt，验证返回是否可正常解析
@@ -544,26 +587,16 @@ impl LlmClient {
     }
 }
 
-fn is_permanent_request_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    [
-        "http error 400",
-        "http error 401",
-        "http error 403",
-        "http error 404",
-        "http error 405",
-        "http error 409",
-        "http error 410",
-        "http error 413",
-        "http error 415",
-        "http error 422",
-        "invalid api key",
-        "incorrect api key",
-        "authentication",
-        "permission denied",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+fn retry_delay(error: &RequestError, attempt: usize) -> Duration {
+    if let Some(delay) = error.retry_after() {
+        return delay.min(Duration::from_secs(30));
+    }
+    let base_ms: u64 = match error {
+        RequestError::Http { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS => 3000,
+        _ => 1000,
+    };
+    let exponent = (attempt as u32).min(5);
+    Duration::from_millis(base_ms.saturating_mul(2u64.pow(exponent)).min(30_000))
 }
 
 fn network_attempts(max_retries: usize) -> usize {
@@ -573,6 +606,89 @@ fn network_attempts(max_retries: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_mock_server(
+        responses: Vec<String>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let task = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(header_start) =
+                        request.windows(4).position(|part| part == b"\r\n\r\n")
+                    {
+                        let body_start = header_start + 4;
+                        let headers = String::from_utf8_lossy(&request[..header_start]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= body_start + content_length {
+                            break;
+                        }
+                    }
+                }
+                request_count.fetch_add(1, Ordering::SeqCst);
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        (
+            format!("http://{address}/v1/chat/completions"),
+            requests,
+            task,
+        )
+    }
+
+    fn mock_http_response(status: &str, extra_headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn successful_chat_response(content: &str) -> String {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": content}}]
+        })
+        .to_string();
+        mock_http_response("200 OK", "", &body)
+    }
+
+    fn mock_client(url: &str, max_retries: usize, api_key: Option<String>) -> LlmClient {
+        LlmClient::with_params(
+            url,
+            "mock-model",
+            max_retries,
+            0.0,
+            None,
+            None,
+            String::new(),
+            None,
+            api_key,
+        )
+        .unwrap()
+    }
 
     fn glossary_entry(src: &str, dst: &str) -> GlossaryEntry {
         GlossaryEntry {
@@ -583,26 +699,98 @@ mod tests {
     }
 
     #[test]
-    fn classifies_permanent_http_errors_without_retry() {
-        for message in [
-            "HTTP error 400 Bad Request: invalid parameter",
-            "HTTP error 401 Unauthorized: invalid API key",
-            "HTTP error 403 Forbidden",
-            "HTTP error 422 Unprocessable Entity",
+    fn classifies_http_status_without_parsing_error_strings() {
+        let error = |status| RequestError::Http {
+            status,
+            body: String::new(),
+            retry_after: None,
+        };
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::UNPROCESSABLE_ENTITY,
         ] {
-            assert!(is_permanent_request_error(message), "{message}");
+            assert!(!error(status).is_retryable(), "{status}");
         }
-        assert!(!is_permanent_request_error("API 限流 (429)"));
-        assert!(!is_permanent_request_error(
-            "HTTP error 500 Internal Server Error"
-        ));
-        assert!(!is_permanent_request_error("request timed out"));
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_EARLY,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(error(status).is_retryable(), "{status}");
+        }
+    }
+
+    #[test]
+    fn retry_after_seconds_is_capped() {
+        let error = RequestError::Http {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: String::new(),
+            retry_after: Some(Duration::from_secs(300)),
+        };
+        assert_eq!(retry_delay(&error, 0), Duration::from_secs(30));
     }
 
     #[test]
     fn zero_retry_budget_still_allows_the_initial_request() {
         assert_eq!(network_attempts(0), 1);
         assert_eq!(network_attempts(3), 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_unauthorized_is_not_retried_and_redacts_key() {
+        let secret = "mock-secret-key";
+        let body = format!(r#"{{"error":"invalid {secret}"}}"#);
+        let (url, requests, server) =
+            spawn_mock_server(vec![mock_http_response("401 Unauthorized", "", &body)]).await;
+        let client = mock_client(&url, 3, Some(secret.to_string()));
+
+        let error = client.call("test", "unauthorized").await.unwrap_err();
+
+        server.await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let message = error.to_string();
+        assert!(message.contains("401"));
+        assert!(message.contains("[REDACTED_API_KEY]"));
+        assert!(!message.contains(secret));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_server_error_retries_once_then_succeeds() {
+        let (url, requests, server) = spawn_mock_server(vec![
+            mock_http_response("500 Internal Server Error", "", r#"{"error":"temporary"}"#),
+            successful_chat_response(r#"{"1":"你好"}"#),
+        ])
+        .await;
+        let client = mock_client(&url, 1, None);
+
+        let response = client.call("test", "server-error").await.unwrap();
+
+        server.await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(response.as_deref(), Some(r#"{"1":"你好"}"#));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_rate_limit_honors_zero_retry_after_then_succeeds() {
+        let (url, requests, server) = spawn_mock_server(vec![
+            mock_http_response(
+                "429 Too Many Requests",
+                "Retry-After: 0\r\n",
+                r#"{"error":"slow down"}"#,
+            ),
+            successful_chat_response(r#"{"1":"你好"}"#),
+        ])
+        .await;
+        let client = mock_client(&url, 1, None);
+
+        let response = client.call("test", "rate-limit").await.unwrap();
+
+        server.await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(response.as_deref(), Some(r#"{"1":"你好"}"#));
     }
 
     #[test]
