@@ -120,6 +120,32 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// 更新 ruby 候选的分类和确认/拒绝决定
+    GlossaryReview {
+        /// glossary-audit 生成的 *.ruby-candidates.json
+        review_file: PathBuf,
+
+        /// 候选的稳定 candidate_id
+        #[arg(long)]
+        candidate_id: String,
+
+        /// unclassified|phonetic_reading|orthographic_alias|nickname_cue|semantic_ruby|ordinary_reading|wordplay_token
+        #[arg(long)]
+        classification: String,
+
+        /// pending|confirmed|rejected
+        #[arg(long)]
+        decision: String,
+
+        /// confirmed 时使用的中文译名；省略则使用候选 base_dst
+        #[arg(long)]
+        target: Option<String>,
+
+        /// 人工审核备注
+        #[arg(long)]
+        note: Option<String>,
+    },
+
     /// 自动生成术语表（NER实体识别 + LLM翻译）
     Glossary {
         /// 输入 EPUB/TXT 文件路径
@@ -460,21 +486,55 @@ async fn run_subcommand(cmd: Commands) -> Result<()> {
                     info: entry.info,
                 })
                 .collect();
-            let review =
-                bellatrix::build_ruby_alias_review(&ruby_annotations, &lines, &translations);
             let output = output.unwrap_or_else(|| bellatrix::ruby_review_path(&glossary_path));
             pipeline::validate_distinct_input_output(&glossary_path, &output)?;
-            bellatrix::save_ruby_alias_review(&output, &review)?;
+            let review = bellatrix::refresh_ruby_alias_review(
+                &output,
+                &ruby_annotations,
+                &lines,
+                &translations,
+            )?;
 
             let actionable = review
+                .candidates
                 .iter()
                 .filter(|entry| bellatrix::is_actionable_review_status(&entry.status))
                 .count();
             println!(
                 "Ruby审核完成: {}（共 {} 条，{} 条需审核）",
                 output.display(),
-                review.len(),
+                review.candidates.len(),
                 actionable
+            );
+        }
+        Commands::GlossaryReview {
+            review_file,
+            candidate_id,
+            classification,
+            decision,
+            target,
+            note,
+        } => {
+            if !review_file.exists() {
+                anyhow::bail!("Ruby审核文件不存在: {}", review_file.display());
+            }
+            let classification = bellatrix::RubyAliasClassification::parse(&classification)?;
+            let decision = bellatrix::CandidateDecision::parse(&decision)?;
+            let updated = bellatrix::update_ruby_alias_decision(
+                &review_file,
+                &candidate_id,
+                classification,
+                decision,
+                target,
+                note,
+            )?;
+            println!(
+                "Ruby候选已更新: {} / {} -> {:?} {:?}（revision {}）",
+                updated.base,
+                updated.reading,
+                updated.classification,
+                updated.decision,
+                updated.revision
             );
         }
     }

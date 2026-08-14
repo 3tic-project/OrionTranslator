@@ -9,7 +9,8 @@ pub mod tokenizer;
 use anyhow::Result;
 use burn::tensor::backend::Backend;
 use log::info;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -159,15 +160,75 @@ pub struct GlossaryConfig {
     pub skip_llm_translation: bool,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub const RUBY_REVIEW_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RubyAliasClassification {
+    #[default]
+    Unclassified,
+    PhoneticReading,
+    OrthographicAlias,
+    NicknameCue,
+    SemanticRuby,
+    OrdinaryReading,
+    WordplayToken,
+}
+
+impl RubyAliasClassification {
+    pub fn can_be_translation_alias(self) -> bool {
+        matches!(
+            self,
+            Self::PhoneticReading | Self::OrthographicAlias | Self::NicknameCue
+        )
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "unclassified" => Ok(Self::Unclassified),
+            "phonetic_reading" => Ok(Self::PhoneticReading),
+            "orthographic_alias" => Ok(Self::OrthographicAlias),
+            "nickname_cue" => Ok(Self::NicknameCue),
+            "semantic_ruby" => Ok(Self::SemanticRuby),
+            "ordinary_reading" => Ok(Self::OrdinaryReading),
+            "wordplay_token" => Ok(Self::WordplayToken),
+            other => anyhow::bail!("未知 ruby 分类: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateDecision {
+    #[default]
+    Pending,
+    Confirmed,
+    Rejected,
+}
+
+impl CandidateDecision {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "confirmed" => Ok(Self::Confirmed),
+            "rejected" => Ok(Self::Rejected),
+            other => anyhow::bail!("未知审核决定: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RubySurfaceEvidence {
     pub surface: String,
     pub mention_count: usize,
     pub exact_reading: bool,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RubyAliasReviewEntry {
+    /// Stable across re-scans of the same base/reading pair.
+    #[serde(default)]
+    pub candidate_id: String,
     pub base: String,
     pub reading: String,
     pub reading_variants: Vec<String>,
@@ -177,8 +238,36 @@ pub struct RubyAliasReviewEntry {
     pub independent_mentions: usize,
     pub base_dst: Option<String>,
     pub existing_reading_dst: Option<String>,
+    /// Machine/user classification. Unclassified candidates never become constraints.
+    #[serde(default)]
+    pub classification: RubyAliasClassification,
+    /// Explicit review decision, preserved when this sidecar is regenerated.
+    #[serde(default)]
+    pub decision: CandidateDecision,
+    /// Target used by confirmed aliases. Falls back to base_dst only after validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_note: Option<String>,
+    #[serde(default)]
+    pub revision: u64,
     pub status: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RubyAliasReviewDocument {
+    pub schema_version: u32,
+    pub candidates: Vec<RubyAliasReviewEntry>,
+}
+
+impl RubyAliasReviewDocument {
+    pub fn new(candidates: Vec<RubyAliasReviewEntry>) -> Self {
+        Self {
+            schema_version: RUBY_REVIEW_SCHEMA_VERSION,
+            candidates,
+        }
+    }
 }
 
 impl GlossaryConfig {
@@ -327,20 +416,22 @@ pub async fn generate_glossary(
 
     // Ruby 证据只生成审核清单，不在缺乏分类/确认时自动提升为强制术语。
     // 这避免把 `桃谷<rt>ライバル</rt>` 一类语义 ruby 错绑成人名读音。
-    let ruby_review =
-        build_ruby_alias_review(&config.ruby_annotations, &config.lines, &translations);
-
     // Save glossary
     let output_path = &config.output_path;
 
     let json = serde_json::to_string_pretty(&translations)?;
     atomic_write(output_path, json.as_bytes())?;
 
-    if !ruby_review.is_empty() {
+    if !config.ruby_annotations.is_empty() {
         let review_path = ruby_review_path(output_path);
-        let review_json = serde_json::to_string_pretty(&ruby_review)?;
-        atomic_write(&review_path, review_json.as_bytes())?;
+        let ruby_review = refresh_ruby_alias_review(
+            &review_path,
+            &config.ruby_annotations,
+            &config.lines,
+            &translations,
+        )?;
         let actionable = ruby_review
+            .candidates
             .iter()
             .filter(|entry| is_actionable_review_status(&entry.status))
             .count();
@@ -376,8 +467,146 @@ pub fn ruby_review_path(glossary_path: &Path) -> PathBuf {
 }
 
 pub fn save_ruby_alias_review(path: &Path, review: &[RubyAliasReviewEntry]) -> Result<()> {
+    save_ruby_alias_review_document(path, &RubyAliasReviewDocument::new(review.to_vec()))
+}
+
+pub fn save_ruby_alias_review_document(
+    path: &Path,
+    review: &RubyAliasReviewDocument,
+) -> Result<()> {
+    if review.schema_version != RUBY_REVIEW_SCHEMA_VERSION {
+        anyhow::bail!(
+            "不支持的 ruby 审核 schema_version: {}（当前支持 {}）",
+            review.schema_version,
+            RUBY_REVIEW_SCHEMA_VERSION
+        );
+    }
     let json = serde_json::to_string_pretty(review)?;
     atomic_write(path, json.as_bytes())
+}
+
+pub fn load_ruby_alias_review(path: &Path) -> Result<RubyAliasReviewDocument> {
+    let json = fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let mut document = if value.is_array() {
+        RubyAliasReviewDocument::new(serde_json::from_value(value)?)
+    } else {
+        serde_json::from_value(value)?
+    };
+    if document.schema_version != RUBY_REVIEW_SCHEMA_VERSION {
+        anyhow::bail!(
+            "不支持的 ruby 审核 schema_version: {}（当前支持 {}）",
+            document.schema_version,
+            RUBY_REVIEW_SCHEMA_VERSION
+        );
+    }
+    normalize_candidate_ids(&mut document.candidates);
+    Ok(document)
+}
+
+pub fn refresh_ruby_alias_review(
+    path: &Path,
+    annotations: &[betelgeuse::RubyAnnotation],
+    lines: &[String],
+    translations: &[llm::TranslationEntry],
+) -> Result<RubyAliasReviewDocument> {
+    let previous = if path.exists() {
+        Some(load_ruby_alias_review(path)?)
+    } else {
+        None
+    };
+    let mut candidates = build_ruby_alias_review(annotations, lines, translations);
+    if let Some(previous) = previous.as_ref() {
+        preserve_review_decisions(&mut candidates, &previous.candidates);
+    }
+    let document = RubyAliasReviewDocument::new(candidates);
+    save_ruby_alias_review_document(path, &document)?;
+    Ok(document)
+}
+
+pub fn update_ruby_alias_decision(
+    path: &Path,
+    candidate_id: &str,
+    classification: RubyAliasClassification,
+    decision: CandidateDecision,
+    target: Option<String>,
+    note: Option<String>,
+) -> Result<RubyAliasReviewEntry> {
+    let mut document = load_ruby_alias_review(path)?;
+    let candidate = document
+        .candidates
+        .iter_mut()
+        .find(|candidate| candidate.candidate_id == candidate_id)
+        .ok_or_else(|| anyhow::anyhow!("找不到 ruby 候选: {candidate_id}"))?;
+
+    let target = target
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| candidate.base_dst.clone());
+    if decision == CandidateDecision::Confirmed {
+        if !classification.can_be_translation_alias() {
+            anyhow::bail!(
+                "分类 {:?} 不能确认为翻译 alias；只允许 phonetic_reading、orthographic_alias、nickname_cue",
+                classification
+            );
+        }
+        if target.as_deref().is_none_or(str::is_empty) {
+            anyhow::bail!("确认 ruby alias 必须提供非空 target，且候选没有可回退的 base_dst");
+        }
+    }
+
+    candidate.classification = classification;
+    candidate.decision = decision;
+    candidate.target = if decision == CandidateDecision::Confirmed {
+        target
+    } else {
+        None
+    };
+    candidate.decision_note = note
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    candidate.revision = candidate.revision.saturating_add(1);
+    let updated = candidate.clone();
+    save_ruby_alias_review_document(path, &document)?;
+    Ok(updated)
+}
+
+fn preserve_review_decisions(
+    current: &mut [RubyAliasReviewEntry],
+    previous: &[RubyAliasReviewEntry],
+) {
+    let decisions: HashMap<&str, &RubyAliasReviewEntry> = previous
+        .iter()
+        .filter(|entry| !entry.candidate_id.is_empty())
+        .map(|entry| (entry.candidate_id.as_str(), entry))
+        .collect();
+    for candidate in current {
+        let Some(previous) = decisions.get(candidate.candidate_id.as_str()) else {
+            continue;
+        };
+        candidate.classification = previous.classification;
+        candidate.decision = previous.decision;
+        candidate.target = previous.target.clone();
+        candidate.decision_note = previous.decision_note.clone();
+        candidate.revision = previous.revision;
+    }
+}
+
+fn normalize_candidate_ids(candidates: &mut [RubyAliasReviewEntry]) {
+    for candidate in candidates {
+        if candidate.candidate_id.is_empty() {
+            candidate.candidate_id = ruby_candidate_id(&candidate.base, &candidate.reading);
+        }
+    }
+}
+
+pub fn ruby_candidate_id(base: &str, reading: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"orion-ruby-candidate-v2\0");
+    hasher.update(base.trim().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(reading.trim().as_bytes());
+    format!("ruby-v2:{:x}", hasher.finalize())
 }
 
 pub fn build_ruby_alias_review(
@@ -471,6 +700,7 @@ pub fn build_ruby_alias_review(
         let mut contexts: Vec<String> = contexts.into_iter().collect();
         contexts.sort();
         review.push(RubyAliasReviewEntry {
+            candidate_id: ruby_candidate_id(&base, &reading),
             base,
             reading,
             reading_variants: variants,
@@ -480,6 +710,11 @@ pub fn build_ruby_alias_review(
             independent_mentions,
             base_dst,
             existing_reading_dst,
+            classification: RubyAliasClassification::Unclassified,
+            decision: CandidateDecision::Pending,
+            target: None,
+            decision_note: None,
+            revision: 0,
             status: status.to_string(),
             reason: reason.to_string(),
         });
@@ -800,5 +1035,98 @@ mod tests {
             ruby_review_path(Path::new("book_glossary.json")),
             PathBuf::from("book_glossary.ruby-candidates.json")
         );
+    }
+
+    fn temp_review_path(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bellatrix-ruby-review-{label}-{}-{nonce}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn ruby_review_v2_roundtrip_and_refresh_preserve_decision() {
+        let path = temp_review_path("preserve");
+        let annotations = [ruby("白地野音", "しらじのおと")];
+        let lines = ["シラジノオトが来た。".to_string()];
+        let translations = [translation("白地野音", "白地野音")];
+
+        let first = refresh_ruby_alias_review(&path, &annotations, &lines, &translations).unwrap();
+        assert_eq!(first.schema_version, RUBY_REVIEW_SCHEMA_VERSION);
+        let id = first.candidates[0].candidate_id.clone();
+        update_ruby_alias_decision(
+            &path,
+            &id,
+            RubyAliasClassification::PhoneticReading,
+            CandidateDecision::Confirmed,
+            Some("白地野音".to_string()),
+            Some("正文复现已核对".to_string()),
+        )
+        .unwrap();
+
+        let refreshed =
+            refresh_ruby_alias_review(&path, &annotations, &lines, &translations).unwrap();
+        let candidate = &refreshed.candidates[0];
+        assert_eq!(candidate.candidate_id, id);
+        assert_eq!(candidate.decision, CandidateDecision::Confirmed);
+        assert_eq!(
+            candidate.classification,
+            RubyAliasClassification::PhoneticReading
+        );
+        assert_eq!(candidate.target.as_deref(), Some("白地野音"));
+        assert_eq!(candidate.revision, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn semantic_ruby_cannot_be_confirmed_as_translation_alias() {
+        let path = temp_review_path("semantic");
+        let review = build_ruby_alias_review(
+            &[ruby("桃谷", "ライバル")],
+            &["ライバルが来た。".to_string()],
+            &[translation("桃谷", "桃谷")],
+        );
+        save_ruby_alias_review(&path, &review).unwrap();
+        let id = review[0].candidate_id.clone();
+
+        let error = update_ruby_alias_decision(
+            &path,
+            &id,
+            RubyAliasClassification::SemanticRuby,
+            CandidateDecision::Confirmed,
+            Some("桃谷".to_string()),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("不能确认为翻译 alias"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_array_sidecar_is_loaded_as_v2() {
+        let path = temp_review_path("legacy");
+        let review = build_ruby_alias_review(
+            &[ruby("奈子", "なこ")],
+            &["ナコちゃん".to_string()],
+            &[translation("奈子", "奈子")],
+        );
+        atomic_write(
+            &path,
+            serde_json::to_string_pretty(&review).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let loaded = load_ruby_alias_review(&path).unwrap();
+        assert_eq!(loaded.schema_version, RUBY_REVIEW_SCHEMA_VERSION);
+        assert_eq!(loaded.candidates.len(), 1);
+        assert!(!loaded.candidates[0].candidate_id.is_empty());
+
+        let _ = fs::remove_file(path);
     }
 }
