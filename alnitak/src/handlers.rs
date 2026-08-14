@@ -19,6 +19,8 @@ use alnilam::{
 use crate::app::OrionApp;
 use crate::types::{GlossaryGenStatus, ModelPreset, TranslationStatus};
 
+const MODEL_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 // ============================================================================
 // Event Handlers
 // ============================================================================
@@ -794,7 +796,7 @@ impl OrionApp {
                     let llm = LlmClient::with_params(
                         &url,
                         &mdl,
-                        1,
+                        0,
                         0.8,
                         None,
                         None,
@@ -804,7 +806,7 @@ impl OrionApp {
                     )?;
 
                     let result = if llm.is_orion_model() {
-                        tokio::time::timeout(Duration::from_secs(30), async {
+                        tokio::time::timeout(MODEL_TEST_TIMEOUT, async {
                             match llm
                                 .translate_single("今日はいい天気ですね。", &[], "model-test")
                                 .await?
@@ -817,12 +819,15 @@ impl OrionApp {
                         })
                         .await
                     } else {
-                        tokio::time::timeout(Duration::from_secs(30), llm.test_translation()).await
+                        tokio::time::timeout(MODEL_TEST_TIMEOUT, llm.test_translation()).await
                     };
 
                     match result {
                         Ok(v) => v,
-                        Err(_) => Err(anyhow::anyhow!("模型测试超时（30s）")),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "模型服务在 {} 秒内未返回；这不代表基础网络不可达，请稍后重试",
+                            MODEL_TEST_TIMEOUT.as_secs()
+                        )),
                     }
                 })
             })
@@ -1031,7 +1036,9 @@ impl OrionApp {
         self.add_log(&format!("LLM模型: {} @ {}", model_name, llm_url));
         cx.notify();
 
-        // 4. Test connectivity first, then run glossary generation
+        // 4. Run glossary generation. Do not issue a duplicate blocking translation probe here:
+        // the actual LLM stage already records HTTP/timeout/protocol failures in its report, while
+        // a fixed preflight deadline can reject a healthy but temporarily slow provider.
         let entity = cx.entity();
 
         // Create a channel for progress events
@@ -1125,19 +1132,11 @@ impl OrionApp {
             skip_llm_translation: is_orion,
         };
 
-        // Test connectivity + run generation in background
-        let test_url = llm_url.clone();
-        let test_model = model_name.clone();
-        let test_api_key_for_test = glossary_config.llm_api_key.clone();
-        let skip_llm = is_orion;
-
+        // Extract input and run generation in the background.
         let glossary_task = cx.spawn(async move |_, cx| {
             let result = smol::unblock({
                 let mut config = glossary_config;
                 let cb = progress_cb;
-                let test_url = test_url;
-                let test_model = test_model;
-                let test_key = test_api_key_for_test;
                 let file_path = input_path.clone();
                 move || {
                     // Extract text lines from the input file (blocking I/O)
@@ -1161,35 +1160,6 @@ impl OrionApp {
                     let rt =
                         tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
                     rt.block_on(async {
-                        // Test LLM connectivity (only for generic models)
-                        if !skip_llm {
-                            let llm = alnilam::llm::LlmClient::with_params(
-                                &test_url,
-                                &test_model,
-                                1,
-                                0.8,
-                                None,
-                                None,
-                                String::new(),
-                                None,
-                                Some(test_key),
-                            )?;
-                            let test_result = tokio::time::timeout(
-                                Duration::from_secs(30),
-                                llm.test_translation(),
-                            )
-                            .await;
-                            match test_result {
-                                Ok(Ok(_)) => {} // connectivity OK
-                                Ok(Err(e)) => {
-                                    anyhow::bail!("LLM连通性测试失败: {}", e);
-                                }
-                                Err(_) => {
-                                    anyhow::bail!("LLM连通性测试超时 (30s)");
-                                }
-                            }
-                        }
-
                         // Run the glossary generation pipeline
                         let output_path = bellatrix::generate_glossary(config, cb).await?;
                         Ok::<std::path::PathBuf, anyhow::Error>(output_path)
