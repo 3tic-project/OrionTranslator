@@ -13,7 +13,7 @@ EPUB/TXT 日译中翻译管线核心，同时作为 CLI 工具和库使用。
 - **术语表生成/审核**：内嵌 NER（via bellatrix）；双通道抽取 ruby base/reading，并生成默认不自动提升的别名审核清单
 - **术语匹配**：带假名/ASCII 边界和 leftmost-longest 重叠解析，避免 `アイ` 命中 `アイテム`
 - **EPUB 保真**：未改章节保留 ZIP 原始 XHTML；目录跨节点时在原链接内追加中文节点；Replace 遇到复杂内联树时隐藏并保留源节点、另显示中文节点，避免清空 ruby/链接内容
-- **事务输出**：EPUB/TXT/快照原子写入，拒绝输入输出同路径；可从已有翻译数据无模型重导出
+- **事务输出**：EPUB/TXT/快照原子写入，拒绝输入输出同路径；EPUB 重导出对 file/block/source/UnitId 身份做全量硬校验，拒绝静默缺段
 - **格式修复**：纵书→横书、RTL→LTR、SVG 图片简化（可选，默认仍受 CLI `--no-fix` 控制）
 
 ## 结构

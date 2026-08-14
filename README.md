@@ -84,7 +84,7 @@ novel_error_report.json           # 错误报告
 
 ### 安全重导出与术语审核
 
-已有 `translation_data.json` 时可完全离线重导出；该命令默认不执行竖排/RTL/SVG 等有损格式修复，并拒绝输入输出同路径：
+已有 `translation_data.json` 时可完全离线重导出；该命令默认不执行竖排/RTL/SVG 等有损格式修复，并拒绝输入输出同路径。EPUB 回填还会校验 file/block/source 身份；未知文件、重复 block、源文或新格式 UnitId/hash 不一致时整次导出失败，不生成缺段成品：
 
 ```bash
 cargo run -p alnilam -- export novel.epub \
