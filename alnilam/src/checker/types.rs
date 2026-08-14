@@ -14,6 +14,7 @@ pub enum ErrorType {
     CodeMismatch,
     JsonStructureError,
     LengthMismatch,
+    TermMissing,
 }
 
 impl std::fmt::Display for ErrorType {
@@ -30,6 +31,7 @@ impl std::fmt::Display for ErrorType {
             ErrorType::CodeMismatch => write!(f, "CODE_MISMATCH"),
             ErrorType::JsonStructureError => write!(f, "JSON_STRUCTURE_ERROR"),
             ErrorType::LengthMismatch => write!(f, "LENGTH_MISMATCH"),
+            ErrorType::TermMissing => write!(f, "TERM_MISSING"),
         }
     }
 }

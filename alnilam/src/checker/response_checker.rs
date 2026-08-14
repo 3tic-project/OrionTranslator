@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use regex::Regex;
 
 use super::types::{CheckResult, ErrorType};
+use crate::llm::glossary::{self, GlossaryEntry};
 
 // ── Text helpers ─────────────────────────────────────────────────────────
 
@@ -190,6 +191,7 @@ pub struct ResponseChecker {
     target_lang: String,
     similarity_threshold: f64,
     retry_threshold: usize,
+    glossary_entries: Vec<GlossaryEntry>,
 }
 
 impl ResponseChecker {
@@ -204,7 +206,13 @@ impl ResponseChecker {
             target_lang: target_lang.to_lowercase(),
             similarity_threshold,
             retry_threshold,
+            glossary_entries: Vec::new(),
         }
+    }
+
+    pub fn with_glossary_entries(mut self, entries: Vec<GlossaryEntry>) -> Self {
+        self.glossary_entries = entries;
+        self
     }
 
     pub fn check(&self, srcs: &[String], dsts: &[String], retry_count: usize) -> Vec<CheckResult> {
@@ -249,6 +257,27 @@ impl ResponseChecker {
                 error: ErrorType::EmptyTranslation,
                 details: "原文非空但译文为空".to_string(),
             };
+        }
+
+        // Confirmed glossary constraints are hard QA: retries must not disable them.
+        if !self.glossary_entries.is_empty() {
+            let matched =
+                glossary::filter_glossary_for_texts(&self.glossary_entries, &[src.to_string()]);
+            let mut missing = Vec::new();
+            for entry in matched {
+                let target = entry.dst.trim();
+                if !target.is_empty() && !dst.contains(target) {
+                    missing.push(format!("{}→{}", entry.src.trim(), target));
+                }
+            }
+            missing.sort();
+            missing.dedup();
+            if !missing.is_empty() {
+                return CheckResult {
+                    error: ErrorType::TermMissing,
+                    details: format!("已确认术语未按约束呈现: {}", missing.join(", ")),
+                };
+            }
         }
 
         // Skip pure punctuation/numbers
@@ -448,5 +477,57 @@ mod tests {
         let dsts = vec!["第一章".to_string()];
         let results = checker.check(&srcs, &dsts, 0);
         assert_eq!(results[0].error, ErrorType::HighSimilarity);
+    }
+
+    #[test]
+    fn confirmed_term_is_a_hard_check_even_after_retry_threshold() {
+        let checker =
+            ResponseChecker::new("ja", "zh", 0.80, 0).with_glossary_entries(vec![GlossaryEntry {
+                src: "シラジノオト".to_string(),
+                dst: "白地野音".to_string(),
+                info: "confirmed ruby alias".to_string(),
+            }]);
+        let srcs = vec!["シラジノオトが笑った。".to_string()];
+        let wrong = checker.check(&srcs, &["席拉吉诺笑了。".to_string()], 3);
+        assert_eq!(wrong[0].error, ErrorType::TermMissing);
+        assert!(wrong[0].details.contains("シラジノオト→白地野音"));
+
+        let correct = checker.check(&srcs, &["白地野音笑了。".to_string()], 3);
+        assert_eq!(correct[0].error, ErrorType::None);
+    }
+
+    #[test]
+    fn term_check_uses_boundaries_and_longest_match() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 2).with_glossary_entries(vec![
+            GlossaryEntry {
+                src: "アイ".to_string(),
+                dst: "爱".to_string(),
+                info: String::new(),
+            },
+            GlossaryEntry {
+                src: "星園".to_string(),
+                dst: "星园".to_string(),
+                info: String::new(),
+            },
+            GlossaryEntry {
+                src: "星園まなか".to_string(),
+                dst: "星园真中".to_string(),
+                info: String::new(),
+            },
+        ]);
+
+        let item = checker.check(
+            &["アイテムを取った。".to_string()],
+            &["拿到了道具。".to_string()],
+            0,
+        );
+        assert_ne!(item[0].error, ErrorType::TermMissing);
+
+        let full_name = checker.check(
+            &["星園まなかが来た。".to_string()],
+            &["星园真中来了。".to_string()],
+            0,
+        );
+        assert_eq!(full_name[0].error, ErrorType::None);
     }
 }

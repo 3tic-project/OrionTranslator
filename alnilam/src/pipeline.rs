@@ -330,6 +330,8 @@ struct ResumeManifest {
     top_p: String,
     top_k: u32,
     glossary_sha256: Option<String>,
+    #[serde(default)]
+    ruby_review_sha256: Option<String>,
     rules_sha256: Option<String>,
     extractor_version: String,
 }
@@ -365,6 +367,13 @@ fn build_resume_manifest(
 ) -> Result<ResumeManifest> {
     let input_sha256 = sha256_file(input_path)?;
     let glossary_sha256 = optional_file_hash(config.glossary_path.as_ref())?;
+    let ruby_review_sha256 = config
+        .glossary_path
+        .as_deref()
+        .map(bellatrix::ruby_review_path)
+        .filter(|path| path.exists())
+        .map(|path| sha256_file(&path))
+        .transpose()?;
     let rules_sha256 = rules_hash(config)?;
     let config_value = serde_json::json!({
         "source_kind": source_kind,
@@ -380,13 +389,14 @@ fn build_resume_manifest(
         "top_p": config.top_p,
         "top_k": config.top_k,
         "glossary_sha256": &glossary_sha256,
+        "ruby_review_sha256": &ruby_review_sha256,
         "rules_sha256": &rules_sha256,
         "extractor_version": "2026-08-14-stable-unit-v1",
     });
     let config_sha256 = sha256_bytes(serde_json::to_string(&config_value)?.as_bytes());
 
     Ok(ResumeManifest {
-        version: 2,
+        version: 3,
         source_kind: source_kind.to_string(),
         input_path: input_path.display().to_string(),
         input_sha256,
@@ -400,6 +410,7 @@ fn build_resume_manifest(
         top_p: config.top_p.to_string(),
         top_k: config.top_k,
         glossary_sha256,
+        ruby_review_sha256,
         rules_sha256,
         extractor_version: "2026-08-14-stable-unit-v1".to_string(),
     })
@@ -775,19 +786,15 @@ fn load_context_detector(config: &PipelineConfig) -> Option<ContextDetector> {
 // Glossary Loading
 // ============================================================================
 
-fn load_glossary_entries(config: &PipelineConfig) -> Vec<glossary::GlossaryEntry> {
+fn load_glossary_entries(config: &PipelineConfig) -> Result<Vec<glossary::GlossaryEntry>> {
     match &config.glossary_path {
-        Some(path) if path.exists() => match glossary::load_glossary(path) {
-            Ok(entries) => {
-                info!("已加载术语表: {} 条", entries.len());
-                entries
-            }
-            Err(e) => {
-                warn!("加载术语表失败: {}", e);
-                Vec::new()
-            }
-        },
-        _ => Vec::new(),
+        Some(path) if path.exists() => {
+            let entries = glossary::load_glossary_with_confirmed_aliases(path)?;
+            info!("已加载术语表及确认 alias: {} 条", entries.len());
+            Ok(entries)
+        }
+        Some(path) => anyhow::bail!("显式配置的术语表不存在: {}", path.display()),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -1775,7 +1782,9 @@ pub async fn translate_epub(
         return Ok(false);
     }
 
-    let checker = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
+    let glossary_entries = load_glossary_entries(config)?;
+    let checker = ResponseChecker::new("ja", "zh", 0.80, config.max_retry)
+        .with_glossary_entries(glossary_entries.clone());
     let fixer = AutoFixer::new("ja", "zh");
     let error_records: Arc<Mutex<Vec<ErrorRecord>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -1891,7 +1900,6 @@ pub async fn translate_epub(
         },
     );
 
-    let glossary_entries = load_glossary_entries(config);
     let glossary_text = glossary::format_glossary(&glossary_entries);
     let orion_glossary_text = glossary::format_glossary_for_orion(&glossary_entries);
     // 全程共享同一 LlmClient（含连接池），首轮与重试不再重复建连
@@ -2367,7 +2375,8 @@ pub async fn translate_epub(
             );
         }
 
-        let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
+        let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry)
+            .with_glossary_entries(glossary_entries.clone());
         let fixer_retry = AutoFixer::new("ja", "zh");
         let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
 
@@ -2648,7 +2657,9 @@ pub async fn translate_txt(
         return Ok(false);
     }
 
-    let checker = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
+    let glossary_entries = load_glossary_entries(config)?;
+    let checker = ResponseChecker::new("ja", "zh", 0.80, config.max_retry)
+        .with_glossary_entries(glossary_entries.clone());
     let fixer = AutoFixer::new("ja", "zh");
     let error_records: Arc<Mutex<Vec<ErrorRecord>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -2753,7 +2764,6 @@ pub async fn translate_txt(
             detail: "调用 LLM 进行翻译...".into(),
         },
     );
-    let glossary_entries = load_glossary_entries(config);
     let glossary_text = glossary::format_glossary(&glossary_entries);
     let orion_glossary_text = glossary::format_glossary_for_orion(&glossary_entries);
     let llm = Arc::new(LlmClient::with_params_and_glossary_entries(
@@ -3229,7 +3239,8 @@ pub async fn translate_txt(
             );
         }
 
-        let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry);
+        let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry)
+            .with_glossary_entries(glossary_entries.clone());
         let fixer_retry = AutoFixer::new("ja", "zh");
         let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
 

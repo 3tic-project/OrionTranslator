@@ -1,7 +1,9 @@
-use anyhow::Result;
-use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[derive(Debug, Clone, Deserialize)]
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlossaryEntry {
     pub src: String,
     pub dst: String,
@@ -12,6 +14,89 @@ pub struct GlossaryEntry {
 pub fn load_glossary(path: &std::path::Path) -> Result<Vec<GlossaryEntry>> {
     let content = std::fs::read_to_string(path)?;
     let entries: Vec<GlossaryEntry> = serde_json::from_str(&content)?;
+    Ok(entries)
+}
+
+/// Load the v1 glossary plus explicitly confirmed ruby aliases from its sibling
+/// `*.ruby-candidates.json` sidecar. Pending/rejected/semantic candidates never
+/// become prompt constraints.
+pub fn load_glossary_with_confirmed_aliases(path: &std::path::Path) -> Result<Vec<GlossaryEntry>> {
+    let mut entries =
+        load_glossary(path).with_context(|| format!("加载术语表失败: {}", path.display()))?;
+    let review_path = bellatrix::ruby_review_path(path);
+    if !review_path.exists() {
+        return Ok(entries);
+    }
+
+    let review = bellatrix::load_ruby_alias_review(&review_path)
+        .with_context(|| format!("加载 Ruby 审核状态失败: {}", review_path.display()))?;
+    let mut targets_by_surface: HashMap<String, HashSet<String>> = HashMap::new();
+    for entry in &entries {
+        let src = entry.src.trim();
+        let dst = entry.dst.trim();
+        if !src.is_empty() && !dst.is_empty() {
+            targets_by_surface
+                .entry(src.to_string())
+                .or_default()
+                .insert(dst.to_string());
+        }
+    }
+    if let Some((surface, targets)) = targets_by_surface
+        .iter()
+        .find(|(_, targets)| targets.len() > 1)
+    {
+        anyhow::bail!("术语表存在同源多译冲突: {} -> {:?}", surface, targets);
+    }
+
+    for candidate in review
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.decision == bellatrix::CandidateDecision::Confirmed)
+    {
+        if !candidate.classification.can_be_translation_alias() {
+            anyhow::bail!(
+                "已确认 Ruby 候选 {} 的分类 {:?} 不能作为翻译 alias",
+                candidate.candidate_id,
+                candidate.classification
+            );
+        }
+        let target = candidate
+            .target
+            .as_deref()
+            .or(candidate.base_dst.as_deref())
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("已确认 Ruby 候选 {} 缺少目标译名", candidate.candidate_id)
+            })?;
+
+        for surface in &candidate.reading_variants {
+            let surface = surface.trim();
+            if surface.is_empty() {
+                continue;
+            }
+            let known_targets = targets_by_surface.entry(surface.to_string()).or_default();
+            if !known_targets.is_empty() && !known_targets.contains(target) {
+                anyhow::bail!(
+                    "Ruby alias 译名冲突: {} 已映射到 {:?}，候选 {} 要求 {}",
+                    surface,
+                    known_targets,
+                    candidate.candidate_id,
+                    target
+                );
+            }
+            if known_targets.insert(target.to_string()) {
+                entries.push(GlossaryEntry {
+                    src: surface.to_string(),
+                    dst: target.to_string(),
+                    info: format!(
+                        "ruby_alias:{}; classification={:?}; revision={}",
+                        candidate.base, candidate.classification, candidate.revision
+                    ),
+                });
+            }
+        }
+    }
     Ok(entries)
 }
 
@@ -191,7 +276,75 @@ pub fn filter_glossary_for_texts(
 }
 
 pub fn format_matched_glossary(entries: &[GlossaryEntry], texts: &[String]) -> String {
-    format_glossary(&filter_glossary_for_texts(entries, texts))
+    let matched = filter_glossary_for_texts(entries, texts);
+    format_grouped_constraints(&matched, false)
+        .map(|constraints| constraints.trim_end().to_string())
+        .unwrap_or_default()
+}
+
+fn format_grouped_constraints(entries: &[GlossaryEntry], orion: bool) -> Option<String> {
+    let mut by_target: BTreeMap<&str, (Vec<&str>, Vec<&str>)> = BTreeMap::new();
+    let mut entities = Vec::new();
+    for entry in entries {
+        let src = entry.src.trim();
+        let dst = entry.dst.trim();
+        if src.is_empty() {
+            continue;
+        }
+        if dst.is_empty() {
+            entities.push(src);
+        } else {
+            let (surfaces, notes) = by_target.entry(dst).or_default();
+            surfaces.push(src);
+            let note = entry.info.trim();
+            if !note.is_empty() {
+                notes.push(note);
+            }
+        }
+    }
+    if by_target.is_empty() && entities.is_empty() {
+        return None;
+    }
+
+    let mut result = if orion {
+        String::from("术语表：\n")
+    } else {
+        String::new()
+    };
+    for (target, (mut surfaces, mut notes)) in by_target {
+        surfaces.sort_unstable();
+        surfaces.dedup();
+        notes.sort_unstable();
+        notes.dedup();
+        if orion {
+            result.push_str(&surfaces.join(" / "));
+            result.push('→');
+            result.push_str(target);
+        } else {
+            result.push_str(&surfaces.join(" / "));
+            result.push_str(" -> ");
+            result.push_str(target);
+            if !notes.is_empty() {
+                result.push_str("   #");
+                result.push_str(&notes.join("; "));
+            }
+        }
+        result.push('\n');
+    }
+    if !entities.is_empty() {
+        entities.sort_unstable();
+        entities.dedup();
+        result.push_str(if orion {
+            "人物候选：\n"
+        } else {
+            "Entity candidates:\n"
+        });
+        for entity in entities {
+            result.push_str(entity);
+            result.push('\n');
+        }
+    }
+    Some(result)
 }
 
 /// 将术语表格式化为 Orion 模型 prompt。
@@ -207,45 +360,7 @@ pub fn format_matched_glossary(entries: &[GlossaryEntry], texts: &[String]) -> S
 ///
 /// 返回 None 表示没有任何可注入信息。
 pub fn format_glossary_for_orion(entries: &[GlossaryEntry]) -> Option<String> {
-    let mut pairs: Vec<(&str, &str)> = Vec::new();
-    let mut entities: Vec<&str> = Vec::new();
-
-    for e in entries {
-        let src = e.src.trim();
-        let dst = e.dst.trim();
-        if src.is_empty() {
-            continue;
-        }
-        if dst.is_empty() {
-            entities.push(src);
-        } else {
-            pairs.push((src, dst));
-        }
-    }
-
-    if pairs.is_empty() && entities.is_empty() {
-        return None;
-    }
-
-    pairs.sort();
-    entities.sort();
-    entities.dedup();
-
-    let mut result = String::from("术语表：\n");
-    for (src, dst) in &pairs {
-        result.push_str(src);
-        result.push('→');
-        result.push_str(dst);
-        result.push('\n');
-    }
-    if !entities.is_empty() {
-        result.push_str("人物候选：\n");
-        for src in &entities {
-            result.push_str(src);
-            result.push('\n');
-        }
-    }
-    Some(result)
+    format_grouped_constraints(entries, true)
 }
 
 pub fn format_matched_glossary_for_orion(
@@ -404,7 +519,7 @@ mod tests {
 
         let text = format_matched_glossary(&entries, &texts);
 
-        assert_eq!(text, "saber -> Saber   #");
+        assert_eq!(text, "saber -> Saber");
     }
 
     #[test]
@@ -527,5 +642,112 @@ mod tests {
 
         assert!(result.contains("ネギ→涅吉\n"));
         assert!(!result.contains("なのは"));
+    }
+
+    fn temp_glossary_path(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "alnilam-glossary-{label}-{}-{nonce}.json",
+            std::process::id()
+        ))
+    }
+
+    fn ruby(base: &str, reading: &str) -> betelgeuse::RubyAnnotation {
+        betelgeuse::RubyAnnotation {
+            base: base.to_string(),
+            reading: reading.to_string(),
+            source_path: "Text/ch1.xhtml".to_string(),
+            context: format!("{base}が来た"),
+            combined: false,
+        }
+    }
+
+    #[test]
+    fn confirmed_ruby_aliases_join_translation_constraints() {
+        let glossary_path = temp_glossary_path("confirmed-alias");
+        let review_path = bellatrix::ruby_review_path(&glossary_path);
+        let base_entries = vec![GlossaryEntry {
+            src: "白地野音".to_string(),
+            dst: "白地野音".to_string(),
+            info: "人物".to_string(),
+        }];
+        std::fs::write(
+            &glossary_path,
+            serde_json::to_string_pretty(&base_entries).unwrap(),
+        )
+        .unwrap();
+        let translations = [bellatrix::llm::TranslationEntry {
+            src: "白地野音".to_string(),
+            dst: "白地野音".to_string(),
+            info: "人物".to_string(),
+        }];
+        let document = bellatrix::refresh_ruby_alias_review(
+            &review_path,
+            &[ruby("白地野音", "しらじのおと")],
+            &["シラジノオトが来た。".to_string()],
+            &translations,
+        )
+        .unwrap();
+        bellatrix::update_ruby_alias_decision(
+            &review_path,
+            &document.candidates[0].candidate_id,
+            bellatrix::RubyAliasClassification::PhoneticReading,
+            bellatrix::CandidateDecision::Confirmed,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let loaded = load_glossary_with_confirmed_aliases(&glossary_path).unwrap();
+        assert!(loaded
+            .iter()
+            .any(|entry| entry.src == "しらじのおと" && entry.dst == "白地野音"));
+        assert!(loaded
+            .iter()
+            .any(|entry| entry.src == "シラジノオト" && entry.dst == "白地野音"));
+        let prompt =
+            format_matched_glossary_for_orion(&loaded, &["シラジノオトが来た。".to_string()])
+                .unwrap();
+        assert!(prompt.contains("シラジノオト→白地野音"));
+
+        let _ = std::fs::remove_file(glossary_path);
+        let _ = std::fs::remove_file(review_path);
+    }
+
+    #[test]
+    fn pending_ruby_candidate_does_not_join_glossary() {
+        let glossary_path = temp_glossary_path("pending-alias");
+        let review_path = bellatrix::ruby_review_path(&glossary_path);
+        let base_entries = vec![GlossaryEntry {
+            src: "桃谷".to_string(),
+            dst: "桃谷".to_string(),
+            info: String::new(),
+        }];
+        std::fs::write(
+            &glossary_path,
+            serde_json::to_string_pretty(&base_entries).unwrap(),
+        )
+        .unwrap();
+        let translations = [bellatrix::llm::TranslationEntry {
+            src: "桃谷".to_string(),
+            dst: "桃谷".to_string(),
+            info: String::new(),
+        }];
+        bellatrix::refresh_ruby_alias_review(
+            &review_path,
+            &[ruby("桃谷", "ライバル")],
+            &["ライバルが来た。".to_string()],
+            &translations,
+        )
+        .unwrap();
+
+        let loaded = load_glossary_with_confirmed_aliases(&glossary_path).unwrap();
+        assert_eq!(loaded, base_entries);
+
+        let _ = std::fs::remove_file(glossary_path);
+        let _ = std::fs::remove_file(review_path);
     }
 }
