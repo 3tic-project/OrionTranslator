@@ -23,6 +23,12 @@ use super::format_fixer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationBlock {
+    /// Stable identity for recovery/protocol mapping. Empty only in legacy JSON.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unit_id: String,
+    /// Versioned hash of the exact extracted source text. Empty only in legacy JSON.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_sha256: String,
     pub file_id: String,
     pub file_name: String,
     pub title: String,
@@ -379,8 +385,18 @@ impl EpubHandler {
                 };
 
             let leaf_blocks = extract_leaf_blocks_from_html(&doc.content);
+            let mut source_occurrences: HashMap<String, usize> = HashMap::new();
             for leaf in &leaf_blocks {
+                let occurrence = source_occurrences.entry(leaf.text.clone()).or_default();
+                let source_sha256 = crate::unit_identity::source_sha256(&leaf.text);
                 data.push(TranslationBlock {
+                    unit_id: crate::unit_identity::unit_id(
+                        "epub",
+                        &doc.name,
+                        &leaf.text,
+                        *occurrence,
+                    ),
+                    source_sha256,
                     file_id: doc.id.clone(),
                     file_name: doc.name.clone(),
                     title: title.clone(),
@@ -389,6 +405,7 @@ impl EpubHandler {
                     dst_text: None,
                     page_type: page_type.clone(),
                 });
+                *occurrence += 1;
             }
             if !leaf_blocks.is_empty() {
                 tracing::debug!(
@@ -527,19 +544,17 @@ impl EpubHandler {
                                 })?
                         } else {
                             match mode {
-                                crate::config::TranslationMode::Replace => {
-                                    replace_tag_content(
-                                        &matched.html,
-                                        translated,
-                                        &matched.raw_text,
+                                crate::config::TranslationMode::Replace => replace_tag_content(
+                                    &matched.html,
+                                    translated,
+                                    &matched.raw_text,
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "Replace 回填失败：文档 '{}' 的 block {}",
+                                        doc.name, block.index
                                     )
-                                    .with_context(|| {
-                                        format!(
-                                            "Replace 回填失败：文档 '{}' 的 block {}",
-                                            doc.name, block.index
-                                        )
-                                    })?
-                                }
+                                })?,
                                 crate::config::TranslationMode::Bilingual => {
                                     let new_tag = create_translation_tag(
                                         &matched.html,
@@ -1200,6 +1215,8 @@ mod tests {
 
     fn block(index: usize, src_text: &str, dst_text: &str) -> TranslationBlock {
         TranslationBlock {
+            unit_id: crate::unit_identity::unit_id("epub", "Text/chapter.xhtml", src_text, 0),
+            source_sha256: crate::unit_identity::source_sha256(src_text),
             file_id: "chapter".to_string(),
             file_name: "Text/chapter.xhtml".to_string(),
             title: "Chapter".to_string(),
@@ -1419,6 +1436,35 @@ mod tests {
         assert_eq!(texts, vec!["原文一", "原文二"]);
         assert_eq!(data[0].index, 0);
         assert_eq!(data[1].index, 1);
+        assert!(data.iter().all(|block| !block.unit_id.is_empty()));
+        assert!(data
+            .iter()
+            .all(|block| crate::unit_identity::source_hash_matches(
+                &block.src_text,
+                &block.source_sha256
+            )));
+    }
+
+    #[test]
+    fn epub_unit_ids_do_not_depend_on_unrelated_block_positions() {
+        let original =
+            test_handler("<html><body><p>A</p><p>B</p></body></html>").extract_translation_data();
+        let inserted = test_handler("<html><body><p>X</p><p>A</p><p>B</p></body></html>")
+            .extract_translation_data();
+
+        assert_eq!(original[0].unit_id, inserted[1].unit_id);
+        assert_eq!(original[1].unit_id, inserted[2].unit_id);
+    }
+
+    #[test]
+    fn legacy_translation_json_remains_export_compatible() {
+        let legacy = r#"{"file_id":"chapter","file_name":"Text/chapter.xhtml","title":"Chapter","index":0,"src_text":"原文","dst_text":"译文","page_type":"content"}"#;
+
+        let block: TranslationBlock = serde_json::from_str(legacy).unwrap();
+
+        assert!(block.unit_id.is_empty());
+        assert!(block.source_sha256.is_empty());
+        assert_eq!(block.dst_text.as_deref(), Some("译文"));
     }
 
     #[test]

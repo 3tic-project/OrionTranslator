@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -355,12 +355,12 @@ fn build_resume_manifest(
         "top_k": config.top_k,
         "glossary_sha256": &glossary_sha256,
         "rules_sha256": &rules_sha256,
-        "extractor_version": "2026-04-25-positioned-epub-v2",
+        "extractor_version": "2026-08-14-stable-unit-v1",
     });
     let config_sha256 = sha256_bytes(serde_json::to_string(&config_value)?.as_bytes());
 
     Ok(ResumeManifest {
-        version: 1,
+        version: 2,
         source_kind: source_kind.to_string(),
         input_path: input_path.display().to_string(),
         input_sha256,
@@ -375,7 +375,7 @@ fn build_resume_manifest(
         top_k: config.top_k,
         glossary_sha256,
         rules_sha256,
-        extractor_version: "2026-04-25-positioned-epub-v2".to_string(),
+        extractor_version: "2026-08-14-stable-unit-v1".to_string(),
     })
 }
 
@@ -410,6 +410,112 @@ fn can_resume_from_manifest(work_dir: &Path, current: &ResumeManifest) -> Result
             Ok(false)
         }
     }
+}
+
+fn restore_epub_translations(
+    current: &[TranslationBlock],
+    existing: &[TranslationBlock],
+) -> Result<HashMap<usize, String>> {
+    if current.len() != existing.len() {
+        anyhow::bail!(
+            "EPUB 恢复快照单元数不匹配: current={}, existing={}",
+            current.len(),
+            existing.len()
+        );
+    }
+
+    let mut current_by_id = HashMap::with_capacity(current.len());
+    for (index, block) in current.iter().enumerate() {
+        validate_unit_fields(&block.unit_id, &block.source_sha256, &block.src_text)?;
+        if current_by_id
+            .insert(block.unit_id.as_str(), index)
+            .is_some()
+        {
+            anyhow::bail!("当前 EPUB 提取结果含重复 unit_id: {}", block.unit_id);
+        }
+    }
+
+    let mut seen = HashSet::with_capacity(existing.len());
+    let mut translations = HashMap::new();
+    for block in existing {
+        validate_unit_fields(&block.unit_id, &block.source_sha256, &block.src_text)?;
+        if !seen.insert(block.unit_id.as_str()) {
+            anyhow::bail!("EPUB 恢复快照含重复 unit_id: {}", block.unit_id);
+        }
+        let index = current_by_id
+            .get(block.unit_id.as_str())
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("EPUB 恢复快照含未知 unit_id: {}", block.unit_id))?;
+        let target = &current[index];
+        if target.source_sha256 != block.source_sha256 || target.src_text != block.src_text {
+            anyhow::bail!(
+                "EPUB 恢复快照 source hash/text 与当前单元不匹配: {}",
+                block.unit_id
+            );
+        }
+        if let Some(dst) = block.dst_text.as_ref().filter(|dst| !dst.trim().is_empty()) {
+            translations.insert(index, dst.clone());
+        }
+    }
+    Ok(translations)
+}
+
+fn restore_txt_translations(
+    current: &[txt::TxtBlock],
+    existing: &[txt::TxtBlock],
+) -> Result<HashMap<usize, String>> {
+    if current.len() != existing.len() {
+        anyhow::bail!(
+            "TXT 恢复快照单元数不匹配: current={}, existing={}",
+            current.len(),
+            existing.len()
+        );
+    }
+
+    let mut current_by_id = HashMap::with_capacity(current.len());
+    for (index, block) in current.iter().enumerate() {
+        validate_unit_fields(&block.unit_id, &block.source_sha256, &block.src_text)?;
+        if current_by_id
+            .insert(block.unit_id.as_str(), index)
+            .is_some()
+        {
+            anyhow::bail!("当前 TXT 提取结果含重复 unit_id: {}", block.unit_id);
+        }
+    }
+
+    let mut seen = HashSet::with_capacity(existing.len());
+    let mut translations = HashMap::new();
+    for block in existing {
+        validate_unit_fields(&block.unit_id, &block.source_sha256, &block.src_text)?;
+        if !seen.insert(block.unit_id.as_str()) {
+            anyhow::bail!("TXT 恢复快照含重复 unit_id: {}", block.unit_id);
+        }
+        let index = current_by_id
+            .get(block.unit_id.as_str())
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("TXT 恢复快照含未知 unit_id: {}", block.unit_id))?;
+        let target = &current[index];
+        if target.source_sha256 != block.source_sha256 || target.src_text != block.src_text {
+            anyhow::bail!(
+                "TXT 恢复快照 source hash/text 与当前单元不匹配: {}",
+                block.unit_id
+            );
+        }
+        if let Some(dst) = block.dst_text.as_ref().filter(|dst| !dst.trim().is_empty()) {
+            translations.insert(index, dst.clone());
+        }
+    }
+    Ok(translations)
+}
+
+fn validate_unit_fields(unit_id: &str, source_hash: &str, source: &str) -> Result<()> {
+    if unit_id.is_empty() {
+        anyhow::bail!("恢复快照缺少 unit_id（旧格式快照不可直接复用）");
+    }
+    if !crate::unit_identity::source_hash_matches(source, source_hash) {
+        anyhow::bail!("恢复快照 source_sha256 无效: {}", unit_id);
+    }
+    Ok(())
 }
 
 fn save_epub_translation_snapshot(
@@ -1693,18 +1799,24 @@ pub async fn translate_epub(
     // Check for existing translation data (resume support)
     let mut translations: HashMap<usize, String> = HashMap::new();
     if resume_allowed && std::path::Path::new(&json_path).exists() {
-        if let Ok(existing_data) = EpubHandler::load_translation_data(&json_path) {
-            let mut resumed = 0usize;
-            for (i, block) in existing_data.iter().enumerate() {
-                if let Some(ref dst) = block.dst_text {
-                    if !dst.is_empty() && i < data.len() && block.src_text == data[i].src_text {
-                        translations.insert(i, dst.clone());
-                        resumed += 1;
-                    }
+        match EpubHandler::load_translation_data(&json_path)
+            .and_then(|existing| restore_epub_translations(&data, &existing))
+        {
+            Ok(restored) => {
+                let resumed = restored.len();
+                translations = restored;
+                if resumed > 0 {
+                    println!("按稳定 UnitId 从已有翻译数据恢复了 {} 个译文", resumed);
                 }
             }
-            if resumed > 0 {
-                println!("从已有翻译数据恢复了 {} 个译文", resumed);
+            Err(error) => {
+                warn!("EPUB 恢复快照身份校验失败，整份拒绝复用: {}", error);
+                emit_progress(
+                    &progress_cb,
+                    ProgressEvent::Log {
+                        message: format!("恢复快照身份校验失败，已整份跳过: {}", error),
+                    },
+                );
             }
         }
     }
@@ -2528,22 +2640,31 @@ pub async fn translate_txt(
     // Check for existing translation data (resume support, same as EPUB)
     let mut translations: HashMap<usize, String> = HashMap::new();
     if resume_allowed && std::path::Path::new(&txt_json_path).exists() {
-        if let Ok(existing_data) = load_txt_translation_data(&txt_json_path) {
-            let mut resumed = 0usize;
-            for (i, block) in existing_data.iter().enumerate() {
-                if let Some(ref dst) = block.dst_text {
-                    if !dst.is_empty() && i < data.len() && block.src_text == data[i].src_text {
-                        translations.insert(i, dst.clone());
-                        resumed += 1;
-                    }
+        match load_txt_translation_data(&txt_json_path)
+            .and_then(|existing| restore_txt_translations(&data, &existing))
+        {
+            Ok(restored) => {
+                let resumed = restored.len();
+                translations = restored;
+                if resumed > 0 {
+                    println!("按稳定 UnitId 从已有翻译数据恢复了 {} 个译文", resumed);
+                    emit_progress(
+                        &progress_cb,
+                        ProgressEvent::Log {
+                            message: format!(
+                                "按稳定 UnitId 从已有翻译数据恢复了 {} 个译文",
+                                resumed
+                            ),
+                        },
+                    );
                 }
             }
-            if resumed > 0 {
-                println!("从已有翻译数据恢复了 {} 个译文", resumed);
+            Err(error) => {
+                warn!("TXT 恢复快照身份校验失败，整份拒绝复用: {}", error);
                 emit_progress(
                     &progress_cb,
                     ProgressEvent::Log {
-                        message: format!("从已有翻译数据恢复了 {} 个译文", resumed),
+                        message: format!("恢复快照身份校验失败，已整份跳过: {}", error),
                     },
                 );
             }
@@ -3229,6 +3350,30 @@ mod tests {
         ))
     }
 
+    fn epub_identity_block(index: usize, source: &str) -> TranslationBlock {
+        TranslationBlock {
+            unit_id: crate::unit_identity::unit_id("epub", "Text/chapter.xhtml", source, 0),
+            source_sha256: crate::unit_identity::source_sha256(source),
+            file_id: "chapter".to_string(),
+            file_name: "Text/chapter.xhtml".to_string(),
+            title: "Chapter".to_string(),
+            index,
+            src_text: source.to_string(),
+            dst_text: None,
+            page_type: "content".to_string(),
+        }
+    }
+
+    fn txt_identity_block(index: usize, source: &str) -> txt::TxtBlock {
+        txt::TxtBlock {
+            unit_id: crate::unit_identity::unit_id("txt", "document", source, 0),
+            source_sha256: crate::unit_identity::source_sha256(source),
+            index,
+            src_text: source.to_string(),
+            dst_text: None,
+        }
+    }
+
     #[test]
     fn pending_indices_skips_already_translated() {
         let mut done = HashMap::new();
@@ -3331,15 +3476,7 @@ mod tests {
     #[test]
     fn initial_epub_snapshot_keeps_resumed_translations() {
         let path = unique_json_path("epub_resume");
-        let data = vec![TranslationBlock {
-            file_id: "chapter".to_string(),
-            file_name: "chapter.xhtml".to_string(),
-            title: "Chapter".to_string(),
-            index: 0,
-            src_text: "原文".to_string(),
-            dst_text: None,
-            page_type: "content".to_string(),
-        }];
+        let data = vec![epub_identity_block(0, "原文")];
         let translations = HashMap::from([(0usize, "恢复译文".to_string())]);
 
         save_epub_translation_snapshot(&data, &translations, &path.to_string_lossy()).unwrap();
@@ -3352,11 +3489,7 @@ mod tests {
     #[test]
     fn initial_txt_snapshot_keeps_resumed_translations() {
         let path = unique_json_path("txt_resume");
-        let data = vec![txt::TxtBlock {
-            index: 0,
-            src_text: "原文".to_string(),
-            dst_text: None,
-        }];
+        let data = vec![txt_identity_block(0, "原文")];
         let translations = HashMap::from([(0usize, "恢复译文".to_string())]);
 
         save_txt_translation_snapshot(&data, &translations, &path.to_string_lossy()).unwrap();
@@ -3364,5 +3497,52 @@ mod tests {
         let saved = load_txt_translation_data(&path.to_string_lossy()).unwrap();
         assert_eq!(saved[0].dst_text.as_deref(), Some("恢复译文"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn epub_resume_maps_reordered_snapshot_by_unit_id() {
+        let current = vec![
+            epub_identity_block(0, "第一段"),
+            epub_identity_block(1, "第二段"),
+        ];
+        let mut first = current[0].clone();
+        first.dst_text = Some("第一节".to_string());
+        let mut second = current[1].clone();
+        second.dst_text = Some("第二节".to_string());
+
+        let restored = restore_epub_translations(&current, &[second, first]).unwrap();
+
+        assert_eq!(restored.get(&0).map(String::as_str), Some("第一节"));
+        assert_eq!(restored.get(&1).map(String::as_str), Some("第二节"));
+    }
+
+    #[test]
+    fn txt_resume_rejects_tampered_source_hash_atomically() {
+        let current = vec![
+            txt_identity_block(0, "第一行"),
+            txt_identity_block(1, "第二行"),
+        ];
+        let mut existing = current.clone();
+        existing[0].dst_text = Some("第一行译文".to_string());
+        existing[1].dst_text = Some("第二行译文".to_string());
+        existing[1].source_sha256 = "source-v1:tampered".to_string();
+
+        let error = restore_txt_translations(&current, &existing).unwrap_err();
+
+        assert!(error.to_string().contains("source_sha256 无效"));
+    }
+
+    #[test]
+    fn epub_resume_rejects_duplicate_unit_ids_atomically() {
+        let current = vec![
+            epub_identity_block(0, "第一段"),
+            epub_identity_block(1, "第二段"),
+        ];
+        let mut existing = current.clone();
+        existing[1].unit_id = existing[0].unit_id.clone();
+
+        let error = restore_epub_translations(&current, &existing).unwrap_err();
+
+        assert!(error.to_string().contains("重复 unit_id"));
     }
 }
