@@ -154,10 +154,10 @@ impl<B: Backend> NerPipeline<B> {
             let pad_len = max_len - seq_len;
 
             batch_input_ids.extend(encoded.input_ids.iter().map(|&x| x as i64));
-            batch_input_ids.extend(std::iter::repeat(self.pad_token_id as i64).take(pad_len));
+            batch_input_ids.extend(std::iter::repeat_n(self.pad_token_id as i64, pad_len));
 
-            batch_mask.extend(std::iter::repeat(false).take(seq_len));
-            batch_mask.extend(std::iter::repeat(true).take(pad_len));
+            batch_mask.extend(std::iter::repeat_n(false, seq_len));
+            batch_mask.extend(std::iter::repeat_n(true, pad_len));
         }
 
         let input_ids = Tensor::<B, 2, Int>::from_ints(
@@ -248,7 +248,7 @@ impl<B: Backend> NerPipeline<B> {
             let score = max_probs.get(i).copied().unwrap_or(0.0);
 
             if let Some((ch, orig_pos)) = char_opt {
-                if label.starts_with("B-") {
+                if let Some(entity_type) = label.strip_prefix("B-") {
                     if let Some((text, entity_label, start, end, score_sum, count)) =
                         current_entity.take()
                     {
@@ -260,16 +260,15 @@ impl<B: Backend> NerPipeline<B> {
                             score: score_sum / count as f32,
                         });
                     }
-                    let entity_type = label[2..].to_string();
                     current_entity = Some((
                         ch.to_string(),
-                        entity_type,
+                        entity_type.to_string(),
                         *orig_pos,
                         *orig_pos + 1,
                         score,
                         1,
                     ));
-                } else if label.starts_with("I-") {
+                } else if let Some(expected_type) = label.strip_prefix("I-") {
                     if let Some((
                         ref mut text,
                         ref entity_label,
@@ -279,7 +278,6 @@ impl<B: Backend> NerPipeline<B> {
                         ref mut count,
                     )) = current_entity
                     {
-                        let expected_type = &label[2..];
                         if entity_label == expected_type {
                             text.push(*ch);
                             *end = *orig_pos + 1;
@@ -297,18 +295,16 @@ impl<B: Backend> NerPipeline<B> {
                             });
                         }
                     }
-                } else {
-                    if let Some((text, entity_label, start, end, score_sum, count)) =
-                        current_entity.take()
-                    {
-                        entities.push(NerEntity {
-                            text,
-                            label: entity_label,
-                            start,
-                            end,
-                            score: score_sum / count as f32,
-                        });
-                    }
+                } else if let Some((text, entity_label, start, end, score_sum, count)) =
+                    current_entity.take()
+                {
+                    entities.push(NerEntity {
+                        text,
+                        label: entity_label,
+                        start,
+                        end,
+                        score: score_sum / count as f32,
+                    });
                 }
             }
         }

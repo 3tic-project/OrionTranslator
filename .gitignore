@@ -2,6 +2,7 @@
 target/
 
 *.lock
+!/Cargo.lock
 
 # macOS metadata
 .DS_Store

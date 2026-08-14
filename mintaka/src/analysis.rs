@@ -296,7 +296,7 @@ fn analyze_characters(
         for (k, n) in multi_alias.iter().take(12) {
             println!("  {}: {}个别名", k, n);
             if let Some(names) = clusters.get(*k) {
-                let mut uniq: Vec<&str> = names.iter().copied().collect();
+                let mut uniq: Vec<&str> = names.to_vec();
                 uniq.sort();
                 uniq.dedup();
                 let preview = uniq.into_iter().take(8).collect::<Vec<_>>().join(" / ");

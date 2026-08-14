@@ -348,18 +348,18 @@ impl ResponseChecker {
             .map(|m| m.as_str().to_string())
             .collect();
 
-        if !src_numbers.is_empty() && src_numbers.len() <= 3 {
-            if src_numbers.intersection(&dst_numbers).count() == 0 {
-                if re_chapter_number().is_match(&src_normalized) {
-                    return CheckResult {
-                        error: ErrorType::LengthMismatch,
-                        details: format!(
-                            "章节号不匹配: src含{:?}, dst含{:?}",
-                            src_numbers, dst_numbers
-                        ),
-                    };
-                }
-            }
+        if !src_numbers.is_empty()
+            && src_numbers.len() <= 3
+            && src_numbers.intersection(&dst_numbers).count() == 0
+            && re_chapter_number().is_match(&src_normalized)
+        {
+            return CheckResult {
+                error: ErrorType::LengthMismatch,
+                details: format!(
+                    "章节号不匹配: src含{:?}, dst含{:?}",
+                    src_numbers, dst_numbers
+                ),
+            };
         }
 
         // Similarity check

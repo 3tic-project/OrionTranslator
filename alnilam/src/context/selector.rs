@@ -67,7 +67,7 @@ impl PrecomputedContext {
     pub fn is_reset_at(&self, idx: usize) -> bool {
         self.detection_results
             .get(idx)
-            .map_or(false, |r| r.reset_context())
+            .is_some_and(|r| r.reset_context())
     }
 }
 
@@ -447,7 +447,7 @@ fn score_candidates(
     }
 
     // Previous line bonus
-    if target_start > 0 && target_start - 1 >= allowed_start {
+    if target_start > allowed_start {
         add_score(target_start - 1, 2.0, "prev_line");
     }
 

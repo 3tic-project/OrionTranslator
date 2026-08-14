@@ -29,11 +29,7 @@ pub struct CharacterInfo {
 
 /// Check if a line should be skipped for NER processing
 fn should_skip_line(line: &str) -> bool {
-    let cleaned: String = line
-        .replace('\u{3000}', "")
-        .replace('\n', "")
-        .trim()
-        .to_string();
+    let cleaned: String = line.replace(['\u{3000}', '\n'], "").trim().to_string();
 
     if cleaned.chars().count() < 2 {
         return true;

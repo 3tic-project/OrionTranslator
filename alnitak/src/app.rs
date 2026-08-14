@@ -93,37 +93,37 @@ impl OrionApp {
         let batch_size_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("批次大小")
-                .default_value(&default_preset.batch_size().to_string())
+                .default_value(default_preset.batch_size().to_string())
         });
         let workers_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("并行数")
-                .default_value(&default_preset.workers().to_string())
+                .default_value(default_preset.workers().to_string())
         });
         let context_lines_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("上下文行数")
-                .default_value(&default_preset.context_lines().to_string())
+                .default_value(default_preset.context_lines().to_string())
         });
         let max_retry_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("最大重试")
-                .default_value(&DEFAULT_MAX_RETRY.to_string())
+                .default_value(DEFAULT_MAX_RETRY.to_string())
         });
         let temperature_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("温度")
-                .default_value(&default_preset.temperature().to_string())
+                .default_value(default_preset.temperature().to_string())
         });
         let top_p_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Top-P")
-                .default_value(&DEFAULT_TOP_P.to_string())
+                .default_value(DEFAULT_TOP_P.to_string())
         });
         let top_k_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Top-K")
-                .default_value(&DEFAULT_TOP_K.to_string())
+                .default_value(DEFAULT_TOP_K.to_string())
         });
         let api_key_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -223,14 +223,11 @@ impl OrionApp {
             .clone()
             .filled_with_defaults(preset);
 
-        self.llm_url_input.update(cx, |state, cx| {
-            state.set_value(&creds.llm_url, window, cx)
-        });
-        self.model_input.update(cx, |state, cx| {
-            state.set_value(&creds.model, window, cx)
-        });
-        self.api_key_input.update(cx, |state, cx| {
-            state.set_value(&creds.api_key, window, cx)
-        });
+        self.llm_url_input
+            .update(cx, |state, cx| state.set_value(&creds.llm_url, window, cx));
+        self.model_input
+            .update(cx, |state, cx| state.set_value(&creds.model, window, cx));
+        self.api_key_input
+            .update(cx, |state, cx| state.set_value(&creds.api_key, window, cx));
     }
 }

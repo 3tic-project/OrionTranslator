@@ -355,7 +355,7 @@ fn pick_primary_alias(key: &str, aliases: &[AliasInfo]) -> String {
         })
         .collect();
     if !hinted.is_empty() {
-        hinted.sort_by(|a, b| hinted_primary_score(b).cmp(&hinted_primary_score(a)));
+        hinted.sort_by_key(|alias| std::cmp::Reverse(hinted_primary_score(alias)));
         return hinted[0].name.clone();
     }
 
@@ -374,12 +374,7 @@ fn pick_primary_alias(key: &str, aliases: &[AliasInfo]) -> String {
 fn hinted_primary_score(a: &AliasInfo) -> i32 {
     let (m_hint, f_hint) = gender_hint_from_alias_name(&a.name);
     let hint = m_hint.max(f_hint);
-    let max_mention = a
-        .mentions
-        .iter()
-        .map(|m| mention_score(m))
-        .max()
-        .unwrap_or(0);
+    let max_mention = a.mentions.iter().map(mention_score).max().unwrap_or(0);
     hint * 100 + max_mention + (a.count.min(999) as i32)
 }
 
@@ -390,12 +385,7 @@ fn alias_primary_score(a: &AliasInfo) -> i32 {
     let (m_hint, f_hint) = gender_hint_from_alias_name(&a.name);
     score += (m_hint + f_hint) * 4;
 
-    let max_mention = a
-        .mentions
-        .iter()
-        .map(|m| mention_score(m))
-        .max()
-        .unwrap_or(0);
+    let max_mention = a.mentions.iter().map(mention_score).max().unwrap_or(0);
     score += max_mention;
 
     let mut m = 0i32;
@@ -722,10 +712,8 @@ async fn infer_base_name(
             return Ok(None);
         }
 
-        if contains_traditional_hint(&translated) {
-            if attempt < 3 {
-                continue;
-            }
+        if contains_traditional_hint(&translated) && attempt < 3 {
+            continue;
         }
 
         return Ok(Some(InferredBase {
@@ -981,10 +969,8 @@ fn propagate_gender_within_canonical(entries: &mut [TranslationEntry]) {
         if key.trim().is_empty() {
             continue;
         }
-        if let Some((_full, gender)) = parse_info(&e.info) {
-            if let Some(g) = gender {
-                genders_by_key.entry(key).or_insert(g);
-            }
+        if let Some((_full, Some(g))) = parse_info(&e.info) {
+            genders_by_key.entry(key).or_insert(g);
         }
     }
 

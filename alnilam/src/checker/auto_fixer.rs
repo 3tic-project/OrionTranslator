@@ -203,8 +203,10 @@ mod tests {
     #[test]
     fn test_fix_nested_quotes_mid_sentence() {
         let fixer = AutoFixer::new("ja", "zh");
-        let src = "「謎が解けたらトイレに入れるよ、おにーちゃん！『お漏らしの危機からの脱出』だね！」";
-        let dst = "\u{201C}哥哥！谜题解开了就能进厕所哦！——\u{2018}从漏尿危机中逃脱\u{2019}！\u{201D}";
+        let src =
+            "「謎が解けたらトイレに入れるよ、おにーちゃん！『お漏らしの危機からの脱出』だね！」";
+        let dst =
+            "\u{201C}哥哥！谜题解开了就能进厕所哦！——\u{2018}从漏尿危机中逃脱\u{2019}！\u{201D}";
         let fixed = fixer.fix(src, dst);
         assert_eq!(
             fixed,

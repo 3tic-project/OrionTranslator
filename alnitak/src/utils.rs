@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::*;
@@ -41,7 +41,7 @@ impl OrionApp {
             .join("\n")
     }
 
-    pub fn compute_output_paths(input: &PathBuf) -> (PathBuf, PathBuf) {
+    pub fn compute_output_paths(input: &Path) -> (PathBuf, PathBuf) {
         let ext = input
             .extension()
             .and_then(|e| e.to_str())

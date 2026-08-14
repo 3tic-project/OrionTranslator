@@ -153,7 +153,7 @@ pub fn validate_css_length(value: &str) -> Result<()> {
     let parsed: f64 = number
         .parse()
         .map_err(|_| anyhow::anyhow!("译文间距数值无效: {}", value))?;
-    if !parsed.is_finite() || parsed < 0.0 || parsed > 20.0 {
+    if !parsed.is_finite() || !(0.0..=20.0).contains(&parsed) {
         bail!("译文间距数值必须在 0..=20 之间，当前为 {}", value);
     }
     Ok(())
@@ -212,9 +212,7 @@ pub fn should_disable_thinking(llm_url: &str, model: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        resolve_chat_completions_endpoint, should_disable_thinking, validate_css_length,
-    };
+    use super::{resolve_chat_completions_endpoint, should_disable_thinking, validate_css_length};
 
     #[test]
     fn resolves_base_url_to_chat_endpoint() {
