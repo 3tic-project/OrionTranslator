@@ -1,4 +1,4 @@
-use alnilam::{config, pipeline};
+use alnilam::{checker, config, pipeline};
 
 use std::path::PathBuf;
 
@@ -144,6 +144,32 @@ enum Commands {
         /// 人工审核备注
         #[arg(long)]
         note: Option<String>,
+    },
+
+    /// 离线审查 translation_data.json 的术语与翻译质量，不调用模型
+    QualityAudit {
+        /// EPUB/TXT 翻译工作区中的 translation_data.json
+        translation_data: PathBuf,
+
+        /// 可选术语表；同时加载同名 ruby 审核 sidecar 中已确认的 alias
+        #[arg(long)]
+        glossary_path: Option<PathBuf>,
+
+        /// 质量报告输出路径（默认: translation_data.quality-report.json）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// 只执行空译、术语、数字、占位符、未译正文等硬检查
+        #[arg(long)]
+        hard_only: bool,
+
+        /// 源语言
+        #[arg(long, default_value = "ja")]
+        source_language: String,
+
+        /// 目标语言
+        #[arg(long, default_value = "zh")]
+        target_language: String,
     },
 
     /// 自动生成术语表（NER实体识别 + LLM翻译）
@@ -536,6 +562,45 @@ async fn run_subcommand(cmd: Commands) -> Result<()> {
                 updated.decision,
                 updated.revision
             );
+        }
+        Commands::QualityAudit {
+            translation_data,
+            glossary_path,
+            output,
+            hard_only,
+            source_language,
+            target_language,
+        } => {
+            if !translation_data.exists() {
+                anyhow::bail!("翻译数据不存在: {}", translation_data.display());
+            }
+            if let Some(path) = glossary_path.as_deref() {
+                if !path.exists() {
+                    anyhow::bail!("术语表不存在: {}", path.display());
+                }
+            }
+            let output =
+                output.unwrap_or_else(|| checker::default_quality_audit_path(&translation_data));
+            pipeline::validate_distinct_input_output(&translation_data, &output)?;
+            let report = checker::audit_translation_data(
+                &translation_data,
+                glossary_path.as_deref(),
+                &source_language,
+                &target_language,
+                !hard_only,
+            )?;
+            checker::save_quality_audit_report(&output, &report)?;
+
+            println!(
+                "翻译质量审核完成: {}（{} 单元，{} 个问题单元，{} 个发现）",
+                output.display(),
+                report.summary.total_units,
+                report.summary.issue_units,
+                report.summary.total_findings
+            );
+            for (error_type, count) in &report.summary.findings_by_type {
+                println!("  {}: {}", error_type, count);
+            }
         }
     }
 

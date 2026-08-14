@@ -483,6 +483,166 @@ impl ResponseChecker {
         }
     }
 
+    /// Audit a single translation without short-circuiting after the first finding.
+    ///
+    /// The online pipeline continues to use [`Self::check`], whose first-error
+    /// priority and retry behavior remain unchanged. Offline quality baselines use
+    /// this method so a terminology miss cannot hide a number or placeholder loss
+    /// on the same unit.
+    pub fn audit_line(&self, src: &str, dst: &str, include_soft_checks: bool) -> Vec<CheckResult> {
+        let src = src.trim();
+        let dst = dst.trim();
+        let mut findings = Vec::new();
+
+        if !src.is_empty() && dst.is_empty() {
+            findings.push(CheckResult {
+                error: ErrorType::EmptyTranslation,
+                details: "原文非空但译文为空".to_string(),
+            });
+            return findings;
+        }
+
+        if !self.glossary_entries.is_empty() {
+            let matched =
+                glossary::filter_glossary_for_texts(&self.glossary_entries, &[src.to_string()]);
+            let mut missing = matched
+                .into_iter()
+                .filter_map(|entry| {
+                    let target = entry.dst.trim();
+                    (!target.is_empty() && !dst.contains(target))
+                        .then(|| format!("{}→{}", entry.src.trim(), target))
+                })
+                .collect::<Vec<_>>();
+            missing.sort();
+            missing.dedup();
+            if !missing.is_empty() {
+                findings.push(CheckResult {
+                    error: ErrorType::TermMissing,
+                    details: format!("已确认术语未按约束呈现: {}", missing.join(", ")),
+                });
+            }
+        }
+
+        if is_only_punctuation_and_space(src) {
+            return findings;
+        }
+
+        let json_matches: Vec<_> = re_json_escape().find_iter(dst).collect();
+        if json_matches.len() >= 3 {
+            findings.push(CheckResult {
+                error: ErrorType::JsonStructureError,
+                details: format!("译文包含 JSON 结构片段 ({} 处)", json_matches.len()),
+            });
+        }
+
+        let src_has_repeat = has_repeated_substring(src, 1, 3, 16);
+        let dst_has_repeat = has_repeated_substring(dst, 1, 3, 16);
+        let src_ext = has_repeated_substring(src, 4, 10, 4);
+        let dst_ext = has_repeated_substring(dst, 4, 10, 4);
+        if !src_has_repeat && dst_has_repeat {
+            findings.push(CheckResult {
+                error: ErrorType::Degradation,
+                details: "检测到退化（重复文本）".to_string(),
+            });
+        }
+        if !src_ext && dst_ext {
+            findings.push(CheckResult {
+                error: ErrorType::Degradation,
+                details: "检测到退化（片段重复）".to_string(),
+            });
+        }
+
+        let src_normalized = fullwidth_to_halfwidth(src);
+        let dst_normalized = fullwidth_to_halfwidth(dst);
+        let src_numbers = token_multiset(re_digits(), &src_normalized);
+        let dst_numbers = token_multiset(re_digits(), &dst_normalized);
+        if src_numbers != dst_numbers {
+            findings.push(CheckResult {
+                error: ErrorType::NumberMismatch,
+                details: format!("数字不一致: src={:?}, dst={:?}", src_numbers, dst_numbers),
+            });
+        }
+
+        let src_placeholders = token_multiset(re_placeholder(), src);
+        let dst_placeholders = token_multiset(re_placeholder(), dst);
+        if src_placeholders != dst_placeholders {
+            findings.push(CheckResult {
+                error: ErrorType::PlaceholderMismatch,
+                details: format!(
+                    "占位符不一致: src={:?}, dst={:?}",
+                    src_placeholders, dst_placeholders
+                ),
+            });
+        }
+
+        if self.source_lang == "ja"
+            && self.target_lang != "ja"
+            && has_problematic_kana_residue(src, dst)
+        {
+            findings.push(CheckResult {
+                error: ErrorType::KanaUntranslatedProse,
+                details: format!(
+                    "译文中残留未保护的假名正文: {}",
+                    problematic_kana_runs(src, dst).join(" / ")
+                ),
+            });
+        }
+
+        if self.source_lang == "ko" && self.target_lang != "ko" && any_hangeul(dst) {
+            findings.push(CheckResult {
+                error: ErrorType::HangeulResidue,
+                details: "译文中残留谚文".to_string(),
+            });
+        }
+
+        if !include_soft_checks {
+            return findings;
+        }
+
+        if src == dst && src.chars().count() >= 3 && has_cjk(src) {
+            findings.push(CheckResult {
+                error: ErrorType::HighSimilarity,
+                details: "译文与原文完全相同".to_string(),
+            });
+        }
+
+        if src.chars().count() >= 10 && dst.chars().count() >= 5 {
+            let ratio = dst.chars().count() as f64 / src.chars().count() as f64;
+            if ratio < 0.3 {
+                findings.push(CheckResult {
+                    error: ErrorType::LengthMismatch,
+                    details: format!("译文过短 (ratio={:.2})", ratio),
+                });
+            } else if ratio > 3.0 {
+                findings.push(CheckResult {
+                    error: ErrorType::LengthMismatch,
+                    details: format!("译文过长 (ratio={:.2})", ratio),
+                });
+            }
+        }
+
+        let similarity_should_flag = if self.source_lang == "ja" && self.target_lang == "zh" {
+            has_problematic_kana_residue(src, dst)
+        } else if self.source_lang == "ko" && self.target_lang == "zh" {
+            any_hangeul(dst)
+        } else {
+            true
+        };
+        if self.check_similarity(src, dst)
+            && similarity_should_flag
+            && !findings
+                .iter()
+                .any(|finding| finding.error == ErrorType::HighSimilarity)
+        {
+            findings.push(CheckResult {
+                error: ErrorType::HighSimilarity,
+                details: "原译文高度相似（疑似未翻译）".to_string(),
+            });
+        }
+
+        findings
+    }
+
     fn check_similarity(&self, src: &str, dst: &str) -> bool {
         if src.contains(dst) || dst.contains(src) {
             return true;
@@ -659,5 +819,29 @@ mod tests {
             5,
         );
         assert_eq!(placeholders_kept[0].error, ErrorType::None);
+    }
+
+    #[test]
+    fn offline_audit_reports_multiple_findings_for_one_unit() {
+        let checker =
+            ResponseChecker::new("ja", "zh", 0.80, 2).with_glossary_entries(vec![GlossaryEntry {
+                src: "シラジノオト".to_string(),
+                dst: "白地野音".to_string(),
+                info: String::new(),
+            }]);
+        let findings = checker.audit_line(
+            "シラジノオトのHPは{player}に12ある。",
+            "席拉吉诺的HP是10。",
+            true,
+        );
+        let errors = findings
+            .iter()
+            .map(|finding| finding.error)
+            .collect::<HashSet<_>>();
+
+        assert!(errors.contains(&ErrorType::TermMissing));
+        assert!(errors.contains(&ErrorType::NumberMismatch));
+        assert!(errors.contains(&ErrorType::PlaceholderMismatch));
+        assert!(!errors.contains(&ErrorType::KanaUntranslatedProse));
     }
 }
