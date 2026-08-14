@@ -116,7 +116,21 @@ cargo run -p alnilam -- glossary-review novel_glossary.ruby-candidates.json \
   --target 白地野音
 ```
 
-只有人工确认为 `phonetic_reading`、`orthographic_alias` 或 `nickname_cue` 且具有目标译名的候选，才会把平/片假名变体加入翻译 prompt，并在译后执行不可被重试阈值关闭的 `TERM_MISSING` 检查。语义 ruby、普通注音、双关、待审核和已拒绝候选不会成为强制术语；同一 surface 多译会在翻译前硬失败。审核 revision 也计入恢复 manifest，改变决定后不会复用旧译文。
+只有人工确认为 `phonetic_reading`、`orthographic_alias` 或 `nickname_cue` 且具有目标译名的候选，才会把平/片假名变体加入翻译 prompt，并在译后执行不可被重试阈值关闭的 `TERM_MISSING` 检查。语义 ruby、普通注音、双关、待审核和已拒绝候选不会成为强制术语；同一 surface 多译会在翻译前硬失败。审核 revision 也计入恢复 manifest，改变决定后不会复用旧译文。旧 v1 扁平术语仍用于 prompt，但在缺少姓/名/昵称 render policy 时不默认进入硬 QA；需要强制的手工条目可在 `info` 中加入 `enforcement=hard`。
+
+离线检查已有翻译数据：
+
+```bash
+cargo run -p alnilam -- quality-audit novel_work/translation_data.json \
+  --glossary-path novel_glossary.json
+
+# 只复现在线硬门
+cargo run -p alnilam -- quality-audit novel_work/translation_data.json \
+  --glossary-path novel_glossary.json \
+  --hard-only --hard-terms-only
+```
+
+报告区分完整 v1 术语诊断和显式硬约束，能同时记录同一单元的空译、术语、数值、占位符、未译正文与 JSON 映射泄漏。数值比较接受全/半角、阿拉伯数字与中日汉字数字、常见范围和 24/12 小时制的等值本地化。
 
 生成术语表时还会写出 `*_glossary.generation-report.json`，区分 `resolved`、`unresolved` 和 `rejected` cluster，避免空响应或单个实体失败被静默省略。
 
@@ -350,6 +364,7 @@ DeepSeek / 火山引擎默认关闭思考模式（`thinking.type=disabled`），
 | `*_glossary.json` | 术语表 |
 | `*_glossary.generation-report.json` | 术语生成 resolved/unresolved/rejected 报告 |
 | `*_glossary.ruby-candidates.json` | Ruby alias 证据、分类和确认/拒绝状态 |
+| `*.quality-report.json` | 离线翻译质量与术语诊断报告 |
 | `*_characters.json` | NER 人物候选列表 |
 | `*_output.json` | NER + LLM 术语条目 |
 
