@@ -60,6 +60,8 @@ struct MatchedElement {
     index: usize,
     html: String,
     raw_text: String,
+    unit_id: String,
+    source_sha256: String,
     start: usize,
     end: usize,
 }
@@ -450,11 +452,35 @@ impl EpubHandler {
 
         let mut count = 0;
         let mut staged_documents = Vec::new();
+        let mut processed_file_ids = HashSet::new();
 
         for doc_index in 0..self.documents.len() {
             let doc = &self.documents[doc_index];
             let blocks = match by_file.get(&doc.id) {
-                Some(b) => b,
+                Some(blocks) => {
+                    if !processed_file_ids.insert(doc.id.as_str()) {
+                        anyhow::bail!("EPUB 文档 ID 重复，无法唯一回填: {}", doc.id);
+                    }
+                    let mut seen_indices = HashSet::new();
+                    for block in blocks {
+                        if !seen_indices.insert(block.index) {
+                            anyhow::bail!(
+                                "翻译数据在文档 '{}' 中含重复 block index: {}",
+                                doc.name,
+                                block.index
+                            );
+                        }
+                        if block.file_name != doc.name {
+                            anyhow::bail!(
+                                "翻译数据文件身份不匹配: file_id='{}' 指向 '{}'，数据记录为 '{}'",
+                                doc.id,
+                                doc.name,
+                                block.file_name
+                            );
+                        }
+                    }
+                    blocks
+                }
                 None => continue,
             };
 
@@ -470,10 +496,16 @@ impl EpubHandler {
             let mut matched_elements = Vec::with_capacity(elements_info.len());
             let mut search_from = 0usize;
             let mut position_failures = 0usize;
+            let mut source_occurrences: HashMap<String, usize> = HashMap::new();
             for leaf in elements_info {
                 let index = leaf.index;
                 let html = leaf.html;
                 let raw_text = leaf.raw_text;
+                let occurrence = source_occurrences.entry(leaf.text.clone()).or_default();
+                let unit_id =
+                    crate::unit_identity::unit_id("epub", &doc.name, &leaf.text, *occurrence);
+                let source_sha256 = crate::unit_identity::source_sha256(&leaf.text);
+                *occurrence += 1;
                 if let Some(relative_start) = new_content[search_from..].find(&html) {
                     let start = search_from + relative_start;
                     let end = start + html.len();
@@ -481,6 +513,8 @@ impl EpubHandler {
                         index,
                         html,
                         raw_text,
+                        unit_id,
+                        source_sha256,
                         start,
                         end,
                     });
@@ -495,6 +529,8 @@ impl EpubHandler {
                         index,
                         html: source_html,
                         raw_text,
+                        unit_id,
+                        source_sha256,
                         start,
                         end,
                     });
@@ -532,6 +568,12 @@ impl EpubHandler {
                         .iter()
                         .find(|element| element.index == block.index)
                     {
+                        validate_translation_block_identity(block, matched).with_context(|| {
+                            format!(
+                                "翻译数据与原 EPUB 不匹配：文档 '{}' 的 block {}",
+                                doc.name, block.index
+                            )
+                        })?;
                         // ToC pages or blocks with page_type "toc": use "original / translation" format
                         let effective_toc = is_toc_page || block.page_type == "toc";
                         let replacement = if effective_toc {
@@ -590,6 +632,13 @@ impl EpubHandler {
                     }
                 }
             }
+            if match_failures > 0 {
+                anyhow::bail!(
+                    "文档 '{}' 有 {} 个待回填 block 无法定位；拒绝生成部分翻译 EPUB",
+                    doc.name,
+                    match_failures
+                );
+            }
             replacements.sort_by(|a, b| b.0.cmp(&a.0));
             if !replacements.is_empty() {
                 for (start, end, replacement) in replacements {
@@ -597,15 +646,7 @@ impl EpubHandler {
                 }
                 staged_documents.push((doc_index, new_content));
             }
-            if match_failures > 0 {
-                tracing::warn!(
-                    "Doc '{}': {} block match failures, {} position failures (out of {} blocks)",
-                    doc.id,
-                    match_failures,
-                    position_failures,
-                    blocks.len()
-                );
-            } else if position_failures > 0 {
+            if position_failures > 0 {
                 tracing::warn!(
                     "Doc '{}': {} element position failures (out of {} elements)",
                     doc.id,
@@ -613,6 +654,19 @@ impl EpubHandler {
                     matched_elements.len() + position_failures
                 );
             }
+        }
+
+        let mut unknown_file_ids: Vec<&str> = by_file
+            .keys()
+            .map(String::as_str)
+            .filter(|file_id| !processed_file_ids.contains(file_id))
+            .collect();
+        if !unknown_file_ids.is_empty() {
+            unknown_file_ids.sort_unstable();
+            anyhow::bail!(
+                "翻译数据包含原 EPUB 中不存在的 file_id: {}",
+                unknown_file_ids.join(", ")
+            );
         }
 
         // 所有文档都能安全回填后再一次性提交，避免后续块失败时留下半修改 handler。
@@ -783,6 +837,27 @@ impl EpubHandler {
             serde_json::from_str(&content).context("Failed to parse translation data JSON")?;
         Ok(data)
     }
+}
+
+fn validate_translation_block_identity(
+    block: &TranslationBlock,
+    matched: &MatchedElement,
+) -> Result<()> {
+    if block.src_text != matched.raw_text.trim() {
+        anyhow::bail!("源文本不一致");
+    }
+    if !block.source_sha256.is_empty() {
+        if !crate::unit_identity::source_hash_matches(&block.src_text, &block.source_sha256) {
+            anyhow::bail!("translation_data 的 source_sha256 无效");
+        }
+        if block.source_sha256 != matched.source_sha256 {
+            anyhow::bail!("translation_data 的 source_sha256 与当前 EPUB 不一致");
+        }
+    }
+    if !block.unit_id.is_empty() && block.unit_id != matched.unit_id {
+        anyhow::bail!("translation_data 的 unit_id 与当前 EPUB 不一致");
+    }
+    Ok(())
 }
 
 // ── Free helper functions (avoid borrow issues with &mut self) ───────────
@@ -1059,15 +1134,9 @@ fn replace_tag_content_toc(html: &str, original_text: &str, translated: &str) ->
         return Ok(html.to_string());
     }
 
-    // Find the original text within the HTML and replace just the text,
-    // preserving surrounding tags like <a href="..."> etc.
-    if html.contains(original_text) {
-        Ok(html.replacen(original_text, &escaped_toc_text, 1))
-    } else if html.contains(&escape_html_text(original_text)) {
-        Ok(html.replacen(&escape_html_text(original_text), &escaped_toc_text, 1))
-    } else {
-        append_toc_translation_preserving_markup(html, translated)
-    }
+    // 始终保留目录原文，并用带 class/lang 的独立节点追加译文。
+    // 这也保证二次抽取时可以忽略生成节点、继续得到稳定源文身份。
+    append_toc_translation_preserving_markup(html, translated)
 }
 
 fn append_toc_translation_preserving_markup(html: &str, translated: &str) -> Result<String> {
@@ -1301,6 +1370,7 @@ mod tests {
         let mut second = block(0, "AB", "甲乙");
         second.file_id = "chapter2".to_string();
         second.file_name = "Text/chapter2.xhtml".to_string();
+        second.unit_id = crate::unit_identity::unit_id("epub", "Text/chapter2.xhtml", "AB", 0);
         second.page_type = "toc".to_string();
 
         let error = handler
@@ -1321,6 +1391,56 @@ mod tests {
             before
         );
         assert!(handler.documents.iter().all(|document| !document.modified));
+    }
+
+    #[test]
+    fn injection_rejects_stale_source_text_without_modifying_document() {
+        let mut handler = test_handler("<html><body><p>当前原文</p></body></html>");
+        let before = handler.documents[0].content.clone();
+        let stale = block(0, "旧原文", "错误译文");
+
+        let error = handler
+            .inject_translations(&[stale], TranslationMode::Bilingual, None)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("翻译数据与原 EPUB 不匹配"));
+        assert_eq!(handler.documents[0].content, before);
+        assert!(!handler.documents[0].modified);
+    }
+
+    #[test]
+    fn injection_rejects_unknown_file_id_and_duplicate_indices() {
+        let mut handler = test_handler("<html><body><p>原文</p></body></html>");
+        let mut unknown = block(0, "原文", "译文");
+        unknown.file_id = "missing".to_string();
+        unknown.file_name = "Text/missing.xhtml".to_string();
+        let error = handler
+            .inject_translations(&[unknown], TranslationMode::Bilingual, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("不存在的 file_id"));
+
+        let duplicate = block(0, "原文", "另一译文");
+        let error = handler
+            .inject_translations(
+                &[block(0, "原文", "译文"), duplicate],
+                TranslationMode::Bilingual,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("重复 block index"));
+    }
+
+    #[test]
+    fn injection_rejects_tampered_unit_id() {
+        let mut handler = test_handler("<html><body><p>原文</p></body></html>");
+        let mut tampered = block(0, "原文", "译文");
+        tampered.unit_id = "unit-v1:tampered".to_string();
+
+        let error = handler
+            .inject_translations(&[tampered], TranslationMode::Bilingual, None)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unit_id 与当前 EPUB 不一致"));
     }
 
     fn write_epub_entry(
@@ -1400,10 +1520,12 @@ mod tests {
         let mut handler = test_handler(
             r#"<?xml version="1.0" encoding="utf-8"?><html><body><p class="calibre2">「そうだな」</p><p class="calibre2">「そうだな」</p></body></html>"#,
         );
-        let blocks = vec![
+        let mut blocks = vec![
             block(0, "「そうだな」", "「是啊。」"),
             block(1, "「そうだな」", "「没错。」"),
         ];
+        blocks[1].unit_id =
+            crate::unit_identity::unit_id("epub", "Text/chapter.xhtml", "「そうだな」", 1);
 
         handler
             .inject_translations(&blocks, TranslationMode::Bilingual, None)
@@ -1592,7 +1714,8 @@ mod tests {
             .unwrap();
 
         let content = &handler.documents[0].content;
-        assert_eq!(content.matches("第一章 / 第一章").count(), 1);
+        assert_eq!(content.matches("orion-toc-translation").count(), 1);
+        assert_eq!(content.matches("> / 第一章</span>").count(), 1);
         assert!(content.contains(r#"href='ch1.xhtml'"#));
     }
 
@@ -1737,7 +1860,8 @@ mod tests {
 
         let nav = read_epub_entry(&output, "OPS/Text/nav.xhtml");
         assert!(nav.contains(r#"href='../Text/ch1.xhtml#p1'"#));
-        assert!(nav.contains("第一章 / 第一章"));
+        assert_eq!(nav.matches("orion-toc-translation").count(), 1);
+        assert!(nav.contains("> / 第一章</span>"));
         assert!(XmlDocument::parse(&nav).is_ok());
 
         let _ = std::fs::remove_file(input);
