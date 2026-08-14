@@ -234,7 +234,7 @@ fn re_digits() -> &'static Regex {
 fn re_cjk_numbers() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"[〇零一二三四五六七八九十百千万萬億亿兆]+").expect("CJK number regex")
+        Regex::new(r"[〇零一二两兩三四五六七八九十百千万萬億亿兆]+").expect("CJK number regex")
     })
 }
 
@@ -272,7 +272,7 @@ fn cjk_numeric_value(token: &str) -> Option<u128> {
         match character {
             '〇' | '零' => Some(0),
             '一' => Some(1),
-            '二' => Some(2),
+            '二' | '两' | '兩' => Some(2),
             '三' => Some(3),
             '四' => Some(4),
             '五' => Some(5),
@@ -333,8 +333,25 @@ fn cjk_numeric_value(token: &str) -> Option<u128> {
 fn canonical_cjk_numbers(text: &str) -> BTreeMap<String, usize> {
     let mut numbers = BTreeMap::new();
     for matched in re_cjk_numbers().find_iter(text) {
-        if let Some(value) = cjk_numeric_value(matched.as_str()) {
+        let token = matched.as_str();
+        if let Some(value) = cjk_numeric_value(token) {
             *numbers.entry(value.to_string()).or_default() += 1;
+        }
+        let has_unit = token.chars().any(|character| {
+            matches!(
+                character,
+                '十' | '百' | '千' | '万' | '萬' | '億' | '亿' | '兆'
+            )
+        });
+        // `四五分钟` can render `4～5分`, while `一五` can also mean 15.
+        // Add digit alternatives only to the permissive CJK side; unmatched
+        // alternatives are ignored rather than treated as new hard numbers.
+        if !has_unit && token.chars().count() > 1 {
+            for character in token.chars() {
+                if let Some(value) = cjk_numeric_value(&character.to_string()) {
+                    *numbers.entry(value.to_string()).or_default() += 1;
+                }
+            }
         }
     }
     numbers
@@ -359,6 +376,46 @@ fn cancel_matching_counts(left: &mut BTreeMap<String, usize>, right: &mut BTreeM
     right.retain(|_, count| *count > 0);
 }
 
+fn cancel_localized_24_hour_time(
+    src: &str,
+    dst: &str,
+    src_arabic: &mut BTreeMap<String, usize>,
+    dst_cjk: &mut BTreeMap<String, usize>,
+) {
+    if !["下午", "晚上", "傍晚", "午后", "午後"]
+        .iter()
+        .any(|marker| dst.contains(marker))
+    {
+        return;
+    }
+    let normalized_src = fullwidth_to_halfwidth(src);
+    let source_hours = src_arabic
+        .keys()
+        .filter_map(|key| key.parse::<u8>().ok().map(|hour| (key.clone(), hour)))
+        .filter(|(_, hour)| (13..=23).contains(hour))
+        .collect::<Vec<_>>();
+    for (source_key, hour) in source_hours {
+        if !normalized_src.contains(&format!("{hour}時"))
+            && !normalized_src.contains(&format!("{hour}时"))
+        {
+            continue;
+        }
+        let target_key = (hour - 12).to_string();
+        let cancelled = src_arabic
+            .get(&source_key)
+            .copied()
+            .unwrap_or_default()
+            .min(dst_cjk.get(&target_key).copied().unwrap_or_default());
+        if cancelled == 0 {
+            continue;
+        }
+        *src_arabic.get_mut(&source_key).expect("source hour exists") -= cancelled;
+        *dst_cjk.get_mut(&target_key).expect("target hour exists") -= cancelled;
+    }
+    src_arabic.retain(|_, count| *count > 0);
+    dst_cjk.retain(|_, count| *count > 0);
+}
+
 /// Compare explicit Arabic numerals while accepting equivalent Chinese/Japanese
 /// numeral spellings on the opposite side. CJK-only numerals are not themselves
 /// enforced yet because names and lexicalized expressions need span typing.
@@ -371,6 +428,7 @@ fn unmatched_arabic_numbers(
     cancel_matching_counts(&mut src_arabic, &mut dst_arabic);
 
     let mut dst_cjk = canonical_cjk_numbers(dst);
+    cancel_localized_24_hour_time(src, dst, &mut src_arabic, &mut dst_cjk);
     cancel_matching_counts(&mut src_arabic, &mut dst_cjk);
     let mut src_cjk = canonical_cjk_numbers(src);
     cancel_matching_counts(&mut dst_arabic, &mut src_cjk);
@@ -958,6 +1016,9 @@ mod tests {
             ("一五インチ以上", "15英寸以上"),
             ("七十二点", "72分"),
             ("１８０度", "一百八十度"),
+            ("２人以上", "两人以上"),
+            ("４～５分", "四五分钟"),
+            ("17時", "下午五点"),
         ];
 
         for (src, dst) in cases {
