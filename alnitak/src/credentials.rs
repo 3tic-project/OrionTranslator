@@ -3,8 +3,13 @@
 //! 文件内容经 XOR 混淆 + 十六进制编码，避免明文落盘。
 //! 密钥硬编码为 `114514`，仅作本地混淆，**不是**强加密。
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,6 +20,7 @@ use crate::types::ModelPreset;
 const OBFUSCATION_KEY: &[u8] = b"114514";
 const STORE_VERSION: u32 = 1;
 const FILE_NAME: &str = "llm_credentials.v1";
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresetCredentials {
@@ -123,9 +129,7 @@ pub fn credentials_file_path() -> Result<PathBuf> {
     let dir = if cfg!(target_os = "macos") {
         base.join("Library/Application Support/OrionTranslator")
     } else if cfg!(target_os = "windows") {
-        base.join("AppData")
-            .join("Roaming")
-            .join("OrionTranslator")
+        base.join("AppData").join("Roaming").join("OrionTranslator")
     } else {
         base.join(".config").join("orion-translator")
     };
@@ -134,24 +138,23 @@ pub fn credentials_file_path() -> Result<PathBuf> {
 }
 
 pub fn load_store() -> CredentialStore {
-    match load_store_from_path(&match credentials_file_path() {
+    load_store_from_path(&match credentials_file_path() {
         Ok(p) => p,
         Err(_) => return CredentialStore::default(),
-    }) {
-        Ok(store) => store,
-        Err(_) => CredentialStore::default(),
-    }
+    })
+    .unwrap_or_default()
 }
 
 pub fn load_store_from_path(path: &Path) -> Result<CredentialStore> {
     if !path.exists() {
         return Ok(CredentialStore::default());
     }
+    reject_symlink(path)?;
+    set_private_permissions(path)?;
     let encoded = fs::read_to_string(path)
         .with_context(|| format!("读取凭证文件失败: {}", path.display()))?;
     let json = deobfuscate(encoded.trim())?;
-    let mut store: CredentialStore =
-        serde_json::from_str(&json).context("解析凭证 JSON 失败")?;
+    let mut store: CredentialStore = serde_json::from_str(&json).context("解析凭证 JSON 失败")?;
     store.version = STORE_VERSION;
     // 确保三个预设至少有默认 URL
     store.deepseek = store
@@ -178,9 +181,101 @@ pub fn save_store_to_path(store: &CredentialStore, path: &Path) -> Result<()> {
     }
     let json = serde_json::to_string(store).context("序列化凭证失败")?;
     let encoded = obfuscate(&json);
-    fs::write(path, encoded.as_bytes())
-        .with_context(|| format!("写入凭证文件失败: {}", path.display()))?;
+    atomic_private_write(path, encoded.as_bytes())?;
     Ok(())
+}
+
+fn reject_symlink(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("读取凭证文件元数据失败: {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!("拒绝读取符号链接凭证文件: {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> Result<()> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("读取凭证文件权限失败: {}", path.display()))?;
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("收紧凭证文件权限失败: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn create_private_temp(path: &Path) -> Result<(PathBuf, File)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("凭证路径缺少父目录: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("凭证文件名不是合法 UTF-8: {}", path.display()))?;
+
+    for _ in 0..100 {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            sequence
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temp_path) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("创建临时凭证文件失败: {}", temp_path.display()));
+            }
+        }
+    }
+
+    Err(anyhow!("无法创建唯一的临时凭证文件"))
+}
+
+fn atomic_private_write(path: &Path, contents: &[u8]) -> Result<()> {
+    if path.exists() {
+        reject_symlink(path)?;
+    }
+    let (temp_path, mut file) = create_private_temp(path)?;
+    let result = (|| -> Result<()> {
+        file.write_all(contents)
+            .with_context(|| format!("写入临时凭证文件失败: {}", temp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("刷新临时凭证文件失败: {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("同步临时凭证文件失败: {}", temp_path.display()))?;
+        drop(file);
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "原子替换凭证文件失败: {} -> {}",
+                temp_path.display(),
+                path.display()
+            )
+        })?;
+        set_private_permissions(path)?;
+        if let Some(parent) = path.parent() {
+            if let Ok(directory) = File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn obfuscate(plaintext: &str) -> String {
@@ -218,7 +313,7 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
     if hex.is_empty() {
         return Ok(Vec::new());
     }
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(anyhow!("十六进制长度必须为偶数"));
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
@@ -281,11 +376,81 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn credential_file_permissions_are_private() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("orion_cred_mode_test_{stamp}.v1"));
+        save_store_to_path(&CredentialStore::default(), &path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_existing_store_repairs_permissions() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("orion_cred_repair_test_{stamp}.v1"));
+        save_store_to_path(&CredentialStore::default(), &path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        load_store_from_path(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn empty_fields_filled_with_defaults() {
         let filled = PresetCredentials::default().filled_with_defaults(ModelPreset::DeepSeek);
         assert_eq!(filled.llm_url, ModelPreset::DeepSeek.llm_url());
         assert_eq!(filled.model, ModelPreset::DeepSeek.model_name());
         assert!(filled.api_key.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires the user's saved provider credentials and network access"]
+    async fn live_saved_credentials_can_translate_minimal_probe() {
+        let store = load_store_from_path(&credentials_file_path().unwrap()).unwrap();
+        let active = store.active_preset();
+        let preset = std::iter::once(active)
+            .chain(ModelPreset::ALL)
+            .find(|preset| {
+                let credentials = store.get(*preset);
+                !credentials.api_key.trim().is_empty()
+                    && !credentials.llm_url.trim().is_empty()
+                    && !credentials.model.trim().is_empty()
+            })
+            .expect("没有可用于在线探针的已保存凭据");
+        let credentials = store.get(preset);
+        let client = alnilam::llm::LlmClient::with_params(
+            &credentials.llm_url,
+            &credentials.model,
+            1,
+            0.0,
+            None,
+            None,
+            String::new(),
+            None,
+            Some(credentials.api_key.clone()),
+        )
+        .unwrap();
+
+        let translated = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            client.test_translation(),
+        )
+        .await
+        .expect("在线探针超时")
+        .expect("在线探针请求失败");
+        assert!(!translated.trim().is_empty());
     }
 }
