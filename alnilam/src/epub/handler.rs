@@ -432,8 +432,10 @@ impl EpubHandler {
         }
 
         let mut count = 0;
+        let mut staged_documents = Vec::new();
 
-        for doc in &mut self.documents {
+        for doc_index in 0..self.documents.len() {
+            let doc = &self.documents[doc_index];
             let blocks = match by_file.get(&doc.id) {
                 Some(b) => b,
                 None => continue,
@@ -525,11 +527,19 @@ impl EpubHandler {
                                 })?
                         } else {
                             match mode {
-                                crate::config::TranslationMode::Replace => replace_tag_content(
-                                    &matched.html,
-                                    translated,
-                                    &matched.raw_text,
-                                ),
+                                crate::config::TranslationMode::Replace => {
+                                    replace_tag_content(
+                                        &matched.html,
+                                        translated,
+                                        &matched.raw_text,
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "Replace 回填失败：文档 '{}' 的 block {}",
+                                            doc.name, block.index
+                                        )
+                                    })?
+                                }
                                 crate::config::TranslationMode::Bilingual => {
                                     let new_tag = create_translation_tag(
                                         &matched.html,
@@ -570,8 +580,7 @@ impl EpubHandler {
                 for (start, end, replacement) in replacements {
                     new_content.replace_range(start..end, &replacement);
                 }
-                doc.content = new_content;
-                doc.modified = true;
+                staged_documents.push((doc_index, new_content));
             }
             if match_failures > 0 {
                 tracing::warn!(
@@ -589,6 +598,12 @@ impl EpubHandler {
                     matched_elements.len() + position_failures
                 );
             }
+        }
+
+        // 所有文档都能安全回填后再一次性提交，避免后续块失败时留下半修改 handler。
+        for (doc_index, content) in staged_documents {
+            self.documents[doc_index].content = content;
+            self.documents[doc_index].modified = true;
         }
 
         tracing::info!("Injected {} translations.", count);
@@ -925,9 +940,10 @@ fn extract_leading_whitespace(raw_text: &str) -> &str {
 /// Replace the text content of an HTML tag, preserving leading whitespace from original.
 ///
 /// - 无子标签时：直接替换 inner HTML（与旧行为一致）
-/// - 有 `ruby`/`em`/`a` 等内联结构时：优先在标记内替换连续原文；否则保留标签骨架，
-///   把译文写入第一个非空白文本节点并清空后续文本节点（避免丢失链接/ruby 外壳）
-fn replace_tag_content(html: &str, new_text: &str, raw_text: &str) -> String {
+/// - 仅有样式标签且原文是连续文本时：在原位置替换，保留样式标签
+/// - 有 ruby、链接、媒体/矢量元素，或原文跨多个文本节点时：隐藏并保留原 inner tree，
+///   另写一个中文显示节点；避免把译文塞进 ruby base 后清空 `rt` 等语义破坏
+fn replace_tag_content(html: &str, new_text: &str, raw_text: &str) -> Result<String> {
     if let (Some(open_end), Some(close_start)) = (html.find('>'), html.rfind('<')) {
         if open_end < close_start {
             let leading_ws = extract_leading_whitespace(raw_text);
@@ -941,82 +957,82 @@ fn replace_tag_content(html: &str, new_text: &str, raw_text: &str) -> String {
 
             // 纯文本叶子：整段替换
             if !inner.contains('<') {
-                return format!("{}{}{}", &html[..=open_end], escaped, &html[close_start..]);
+                return Ok(format!(
+                    "{}{}{}",
+                    &html[..=open_end],
+                    escaped,
+                    &html[close_start..]
+                ));
             }
 
-            // 内联结构：先尝试把连续原文替换为译文（保留周围标签）
+            if contains_replace_protected_markup(inner) {
+                return replace_with_hidden_source(html, inner, &escaped);
+            }
+
+            // 仅对连续文本做精确替换；跨节点文本没有可靠的译文到节点映射。
             let src_plain = raw_text.trim();
             if !src_plain.is_empty() {
                 if html.contains(src_plain) {
-                    return html.replacen(src_plain, &escaped, 1);
+                    return Ok(html.replacen(src_plain, &escaped, 1));
                 }
                 let esc_src = escape_html_text(src_plain);
                 if html.contains(&esc_src) {
-                    return html.replacen(&esc_src, &escaped, 1);
+                    return Ok(html.replacen(&esc_src, &escaped, 1));
                 }
             }
 
-            // 回退：保留标签，仅改写文本节点
-            return replace_text_nodes_preserving_markup(html, &escaped);
+            return replace_with_hidden_source(html, inner, &escaped);
         }
     }
-    html.to_string()
+    anyhow::bail!("Replace 目标不是可识别的闭合 HTML 元素")
 }
 
-/// 保留所有标签属性与嵌套结构，将首个非空白文本节点替换为 `escaped_text`，
-/// 其余非空白文本节点清空（空白文本原样保留）。
-fn replace_text_nodes_preserving_markup(html: &str, escaped_text: &str) -> String {
-    let mut out = String::with_capacity(html.len() + escaped_text.len());
-    let mut in_tag = false;
-    let mut text_buf = String::new();
-    let mut first_text_done = false;
+fn replace_with_hidden_source(
+    html: &str,
+    inner: &str,
+    escaped_translation: &str,
+) -> Result<String> {
+    let translated = format!(
+        r#"<span class="orion-translation orion-replace-translation" lang="zh-CN" xml:lang="zh-CN">{escaped_translation}</span>"#
+    );
+    let existing_translation = Regex::new(
+        r#"(?is)<span\b[^>]*class\s*=\s*["'][^"']*\borion-replace-translation\b[^"']*["'][^>]*>.*?</span\s*>"#,
+    )?;
+    if existing_translation.is_match(inner) {
+        return Ok(existing_translation
+            .replace(html, translated.as_str())
+            .to_string());
+    }
 
-    let flush_text = |buf: &mut String, out: &mut String, first_done: &mut bool, text: &str| {
-        if buf.is_empty() {
-            return;
-        }
-        let only_ws = buf.chars().all(|c| c.is_whitespace());
-        if only_ws {
-            out.push_str(buf);
-        } else if !*first_done {
-            out.push_str(text);
-            *first_done = true;
-        }
-        // 后续非空白文本丢弃，标签仍保留
-        buf.clear();
+    let hidden_source = format!(
+        r#"<span class="orion-source-hidden" aria-hidden="true" style="display:none !important;">{inner}</span>"#
+    );
+    let open_end = html
+        .find('>')
+        .ok_or_else(|| anyhow::anyhow!("Replace 目标缺少开始标签"))?;
+    let close_start = html
+        .rfind('<')
+        .ok_or_else(|| anyhow::anyhow!("Replace 目标缺少结束标签"))?;
+    if open_end >= close_start {
+        anyhow::bail!("Replace 目标标签边界无效");
+    }
+    Ok(format!(
+        "{}{}{}{}",
+        &html[..=open_end],
+        hidden_source,
+        translated,
+        &html[close_start..]
+    ))
+}
+
+fn contains_replace_protected_markup(inner: &str) -> bool {
+    let fragment = Html::parse_fragment(inner);
+    let Ok(selector) = Selector::parse(
+        "ruby, rt, rp, a, img, picture, svg, math, audio, video, object, iframe, canvas",
+    ) else {
+        return true;
     };
-
-    for ch in html.chars() {
-        match ch {
-            '<' => {
-                flush_text(&mut text_buf, &mut out, &mut first_text_done, escaped_text);
-                in_tag = true;
-                out.push(ch);
-            }
-            '>' if in_tag => {
-                in_tag = false;
-                out.push(ch);
-            }
-            c if in_tag => out.push(c),
-            c => text_buf.push(c),
-        }
-    }
-    flush_text(&mut text_buf, &mut out, &mut first_text_done, escaped_text);
-
-    if !first_text_done {
-        // 没有可用文本节点时回退为整段 inner 替换
-        if let (Some(open_end), Some(close_start)) = (out.find('>'), out.rfind('<')) {
-            if open_end < close_start {
-                return format!(
-                    "{}{}{}",
-                    &out[..=open_end],
-                    escaped_text,
-                    &out[close_start..]
-                );
-            }
-        }
-    }
-    out
+    fragment.select(&selector).next().is_some()
 }
 
 /// Replace tag content for ToC pages: "original / translation" format.
@@ -1208,24 +1224,86 @@ mod tests {
     }
 
     #[test]
-    fn replace_tag_content_preserves_nested_inline_tags() {
+    fn replace_tag_content_hides_and_preserves_semantic_inline_markup() {
         let html = "<p><ruby>星<rt>ほし</rt></ruby>を<em>見た</em><a href=\"#n1\">※</a></p>";
         let raw = "星を見た※";
-        let out = replace_tag_content(html, "看见了星星※", raw);
-        // 链接与 ruby 外壳必须保留
-        assert!(out.contains("href=\"#n1\""), "link attr lost: {out}");
-        assert!(out.contains("<ruby>"), "ruby lost: {out}");
-        assert!(out.contains("<em>"), "em lost: {out}");
-        assert!(out.contains("看见了星星※"), "translation missing: {out}");
-        // 不应再变成纯文本 inner
-        assert!(out.contains('<'), "structure flattened: {out}");
+        let out = replace_tag_content(html, "看见了星星※", raw).unwrap();
+
+        assert!(out.contains(r#"class="orion-source-hidden""#));
+        assert!(out.contains("<ruby>星<rt>ほし</rt></ruby>"));
+        assert!(out.contains("href=\"#n1\""));
+        assert!(out.contains(r#"class="orion-translation orion-replace-translation""#));
+        assert!(out.contains("看见了星星※"));
+
+        let updated = replace_tag_content(&out, "看到了星星※", raw).unwrap();
+        assert_eq!(updated.matches("orion-source-hidden").count(), 1);
+        assert_eq!(updated.matches("orion-replace-translation").count(), 1);
+        assert!(updated.contains("看到了星星※"));
     }
 
     #[test]
     fn replace_tag_content_plain_inner_still_works() {
         let html = "<p>こんにちは</p>";
-        let out = replace_tag_content(html, "你好", "こんにちは");
+        let out = replace_tag_content(html, "你好", "こんにちは").unwrap();
         assert_eq!(out, "<p>你好</p>");
+    }
+
+    #[test]
+    fn replace_tag_content_keeps_safe_style_wrapper_for_contiguous_text() {
+        let html = "<p><em>こんにちは</em></p>";
+        let out = replace_tag_content(html, "你好", "こんにちは").unwrap();
+
+        assert_eq!(out, "<p><em>你好</em></p>");
+    }
+
+    #[test]
+    fn replace_tag_content_hides_text_split_across_style_nodes() {
+        let html = "<p>こん<em>にち</em>は</p>";
+        let out = replace_tag_content(html, "你好", "こんにちは").unwrap();
+
+        assert!(out.contains(r#"class="orion-source-hidden""#));
+        assert!(out.contains("こん<em>にち</em>は"));
+        assert!(out.contains("你好"));
+    }
+
+    #[test]
+    fn failed_replace_injection_is_transactional_across_documents() {
+        let mut handler = test_handler("<html><body><p>第一段</p></body></html>");
+        handler.documents.push(DocumentItem {
+            id: "chapter2".to_string(),
+            name: "Text/chapter2.xhtml".to_string(),
+            content: "<html><body><p><a href='a'>A</a><a href='b'>B</a></p></body></html>"
+                .to_string(),
+            modified: false,
+        });
+        let before: Vec<String> = handler
+            .documents
+            .iter()
+            .map(|document| document.content.clone())
+            .collect();
+        let mut second = block(0, "AB", "甲乙");
+        second.file_id = "chapter2".to_string();
+        second.file_name = "Text/chapter2.xhtml".to_string();
+        second.page_type = "toc".to_string();
+
+        let error = handler
+            .inject_translations(
+                &[block(0, "第一段", "第一节"), second],
+                TranslationMode::Replace,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("无法安全回填目录文档"));
+        assert_eq!(
+            handler
+                .documents
+                .iter()
+                .map(|document| document.content.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert!(handler.documents.iter().all(|document| !document.modified));
     }
 
     fn write_epub_entry(
