@@ -21,7 +21,7 @@ use crate::context::{
 };
 use crate::epub::{EpubHandler, TranslationBlock};
 use crate::io_utils::{atomic_write, ensure_distinct_paths};
-use crate::llm::{glossary, BatchTranslationResponse, LlmClient};
+use crate::llm::{glossary, BatchContract, BatchTranslationResponse, LlmClient};
 use crate::txt;
 
 const STEP2_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -265,6 +265,32 @@ fn parser_diagnostic_summary(response: &BatchTranslationResponse) -> String {
     } else {
         details.join(", ")
     }
+}
+
+fn epub_batch_contract(data: &[TranslationBlock], indices: &[usize]) -> Result<BatchContract> {
+    BatchContract::new(
+        indices
+            .iter()
+            .map(|&index| data[index].unit_id.clone())
+            .collect(),
+        &indices
+            .iter()
+            .map(|&index| data[index].source_sha256.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn txt_batch_contract(data: &[txt::TxtBlock], indices: &[usize]) -> Result<BatchContract> {
+    BatchContract::new(
+        indices
+            .iter()
+            .map(|&index| data[index].unit_id.clone())
+            .collect(),
+        &indices
+            .iter()
+            .map(|&index| data[index].source_sha256.clone())
+            .collect::<Vec<_>>(),
+    )
 }
 
 // ============================================================================
@@ -1024,12 +1050,41 @@ fn check_and_fix_translations(
 /// 允许稀疏下标，从而在断点恢复时只重发未完成项。
 fn process_batch_response(
     response: BatchTranslationResponse,
+    expected_contract: &BatchContract,
     unit_indices: &[usize],
     src_text_at: impl Fn(usize) -> String,
     checker: &ResponseChecker,
     fixer: &AutoFixer,
     error_records: &Arc<Mutex<Vec<ErrorRecord>>>,
 ) -> BatchOutcome {
+    if response.contract != *expected_contract {
+        let mut failure_causes = HashMap::new();
+        for &idx in unit_indices {
+            failure_causes.insert(
+                idx,
+                FailureCause::new(
+                    ErrorType::JsonStructureError.to_string(),
+                    format!(
+                        "批次 revision/UnitId 映射不匹配，拒绝提交；expected={}, actual={}",
+                        expected_contract.revision, response.contract.revision
+                    ),
+                    "batch_contract",
+                    0,
+                ),
+            );
+        }
+        warn!(
+            "批次契约不匹配，拒绝提交全部 {} 个单元: expected={}, actual={}",
+            unit_indices.len(),
+            expected_contract.revision,
+            response.contract.revision
+        );
+        return BatchOutcome {
+            api_failed: unit_indices.to_vec(),
+            failure_causes,
+            ..BatchOutcome::default()
+        };
+    }
     if response.diagnostics.has_issues() {
         let diagnostic_summary = parser_diagnostic_summary(&response);
         let mut failure_causes = HashMap::new();
@@ -1907,6 +1962,7 @@ pub async fn translate_epub(
 
             // 只提交未完成单元，避免断点恢复时整批重发覆盖已译内容
             let texts: Vec<String> = pending.iter().map(|&i| data[i].src_text.clone()).collect();
+            let contract = epub_batch_contract(&data, &pending)?;
 
             let context = build_context_for_batch_precomputed(
                 precomputed.as_ref().as_ref(),
@@ -1918,12 +1974,18 @@ pub async fn translate_epub(
             );
 
             match llm
-                .translate_batch_detailed(&texts, &context, &batch_num.to_string())
+                .translate_batch_detailed_with_contract(
+                    &texts,
+                    &context,
+                    &batch_num.to_string(),
+                    contract.clone(),
+                )
                 .await
             {
                 Ok(response) => {
                     let outcome = process_batch_response(
                         response,
+                        &contract,
                         &pending,
                         |idx| data[idx].src_text.clone(),
                         &checker,
@@ -2052,6 +2114,7 @@ pub async fn translate_epub(
                         .iter()
                         .map(|&i| data_c[i].src_text.clone())
                         .collect();
+                    let contract = epub_batch_contract(&data_c, &pending)?;
 
                     let context = build_context_for_batch_precomputed(
                         pc.as_ref().as_ref(),
@@ -2063,11 +2126,17 @@ pub async fn translate_epub(
                     );
 
                     let response = llm
-                        .translate_batch_detailed(&texts, &context, &batch_num.to_string())
+                        .translate_batch_detailed_with_contract(
+                            &texts,
+                            &context,
+                            &batch_num.to_string(),
+                            contract.clone(),
+                        )
                         .await?;
 
                     Ok::<_, anyhow::Error>(process_batch_response(
                         response,
+                        &contract,
                         &pending,
                         |idx| data_c[idx].src_text.clone(),
                         &chk,
@@ -2764,6 +2833,7 @@ pub async fn translate_txt(
             }
 
             let texts: Vec<String> = pending.iter().map(|&i| data[i].src_text.clone()).collect();
+            let contract = txt_batch_contract(&data, &pending)?;
 
             let context = build_context_for_batch_precomputed(
                 precomputed.as_ref().as_ref(),
@@ -2775,12 +2845,18 @@ pub async fn translate_txt(
             );
 
             match llm
-                .translate_batch_detailed(&texts, &context, &batch_num.to_string())
+                .translate_batch_detailed_with_contract(
+                    &texts,
+                    &context,
+                    &batch_num.to_string(),
+                    contract.clone(),
+                )
                 .await
             {
                 Ok(response) => {
                     let outcome = process_batch_response(
                         response,
+                        &contract,
                         &pending,
                         |idx| data[idx].src_text.clone(),
                         &checker,
@@ -2905,6 +2981,7 @@ pub async fn translate_txt(
                         .iter()
                         .map(|&i| data_c[i].src_text.clone())
                         .collect();
+                    let contract = txt_batch_contract(&data_c, &pending)?;
 
                     let context = build_context_for_batch_precomputed(
                         pc.as_ref().as_ref(),
@@ -2916,11 +2993,17 @@ pub async fn translate_txt(
                     );
 
                     let response = llm
-                        .translate_batch_detailed(&texts, &context, &batch_num.to_string())
+                        .translate_batch_detailed_with_contract(
+                            &texts,
+                            &context,
+                            &batch_num.to_string(),
+                            contract.clone(),
+                        )
                         .await?;
 
                     Ok::<_, anyhow::Error>(process_batch_response(
                         response,
+                        &contract,
                         &pending,
                         |idx| data_c[idx].src_text.clone(),
                         &chk,
@@ -3374,6 +3457,14 @@ mod tests {
         }
     }
 
+    fn test_batch_contract(count: usize) -> BatchContract {
+        let unit_ids: Vec<String> = (0..count).map(|index| format!("unit-{index}")).collect();
+        let hashes: Vec<String> = (0..count)
+            .map(|index| crate::unit_identity::source_sha256(&format!("source-{index}")))
+            .collect();
+        BatchContract::new(unit_ids, &hashes).unwrap()
+    }
+
     #[test]
     fn pending_indices_skips_already_translated() {
         let mut done = HashMap::new();
@@ -3393,14 +3484,17 @@ mod tests {
         let mut translations = HashMap::new();
         translations.insert(1usize, "二号".to_string());
         translations.insert(2usize, "五号".to_string());
+        let contract = test_batch_contract(2);
         let response = BatchTranslationResponse {
             translations,
             diagnostics: ParseDiagnostics::default(),
+            contract: contract.clone(),
         };
 
         let sources = ["零", "一", "二", "三", "四", "五"];
         let outcome = process_batch_response(
             response,
+            &contract,
             &[2, 5],
             |idx| sources[idx].to_string(),
             &checker,
@@ -3421,16 +3515,19 @@ mod tests {
 
         let mut translations = HashMap::new();
         translations.insert(1usize, "仅第一项".to_string());
+        let contract = test_batch_contract(2);
         let response = BatchTranslationResponse {
             translations,
             diagnostics: ParseDiagnostics {
                 missing_indices: vec![2],
                 ..ParseDiagnostics::default()
             },
+            contract: contract.clone(),
         };
 
         let outcome = process_batch_response(
             response,
+            &contract,
             &[10, 11],
             |idx| format!("src{idx}"),
             &checker,
@@ -3449,6 +3546,7 @@ mod tests {
         let checker = ResponseChecker::new("ja", "zh", 0.80, 3);
         let fixer = AutoFixer::new("ja", "zh");
         let error_records = Arc::new(Mutex::new(Vec::new()));
+        let contract = test_batch_contract(2);
         let response = BatchTranslationResponse {
             translations: HashMap::from([
                 (1usize, "第一项".to_string()),
@@ -3458,10 +3556,12 @@ mod tests {
                 duplicate_indices: vec![1],
                 ..ParseDiagnostics::default()
             },
+            contract: contract.clone(),
         };
 
         let outcome = process_batch_response(
             response,
+            &contract,
             &[20, 21],
             |idx| format!("src{idx}"),
             &checker,
@@ -3471,6 +3571,47 @@ mod tests {
 
         assert!(outcome.fixed.is_empty());
         assert_eq!(outcome.api_failed, vec![20, 21]);
+    }
+
+    #[test]
+    fn process_batch_response_rejects_wrong_batch_revision_atomically() {
+        let checker = ResponseChecker::new("ja", "zh", 0.80, 3);
+        let fixer = AutoFixer::new("ja", "zh");
+        let error_records = Arc::new(Mutex::new(Vec::new()));
+        let expected = test_batch_contract(2);
+        let actual = BatchContract::new(
+            vec!["other-0".to_string(), "other-1".to_string()],
+            &[
+                crate::unit_identity::source_sha256("source-0"),
+                crate::unit_identity::source_sha256("source-1"),
+            ],
+        )
+        .unwrap();
+        let response = BatchTranslationResponse {
+            translations: HashMap::from([
+                (1usize, "第一项".to_string()),
+                (2usize, "第二项".to_string()),
+            ]),
+            diagnostics: ParseDiagnostics::default(),
+            contract: actual,
+        };
+
+        let outcome = process_batch_response(
+            response,
+            &expected,
+            &[30, 31],
+            |idx| format!("src{idx}"),
+            &checker,
+            &fixer,
+            &error_records,
+        );
+
+        assert!(outcome.fixed.is_empty());
+        assert_eq!(outcome.api_failed, vec![30, 31]);
+        assert!(outcome
+            .failure_causes
+            .values()
+            .all(|cause| cause.stage == "batch_contract"));
     }
 
     #[test]

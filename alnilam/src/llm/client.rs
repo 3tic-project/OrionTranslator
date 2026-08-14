@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use reqwest::header::RETRY_AFTER;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use tracing::{debug, warn};
 
 use crate::config;
@@ -141,6 +143,57 @@ pub struct LlmClient {
 pub struct BatchTranslationResponse {
     pub translations: HashMap<usize, String>,
     pub diagnostics: ParseDiagnostics,
+    pub contract: BatchContract,
+}
+
+/// 本地批次提交契约。模型仍使用兼容的 1..N 数字 JSONL key；该映射用于确保
+/// 返回对象只会提交到创建它的稳定 UnitId 序列。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchContract {
+    pub revision: String,
+    pub unit_ids: Vec<String>,
+}
+
+impl BatchContract {
+    pub fn new(unit_ids: Vec<String>, source_hashes: &[String]) -> Result<Self> {
+        if unit_ids.is_empty() || unit_ids.len() != source_hashes.len() {
+            anyhow::bail!(
+                "批次契约单元数量无效: unit_ids={}, source_hashes={}",
+                unit_ids.len(),
+                source_hashes.len()
+            );
+        }
+        let mut seen = HashSet::with_capacity(unit_ids.len());
+        let mut hasher = Sha256::new();
+        hasher.update(b"orion-batch-v1");
+        for (unit_id, source_hash) in unit_ids.iter().zip(source_hashes) {
+            if unit_id.is_empty() || source_hash.is_empty() {
+                anyhow::bail!("批次契约含空 UnitId/source hash");
+            }
+            if !seen.insert(unit_id.as_str()) {
+                anyhow::bail!("批次契约含重复 UnitId: {}", unit_id);
+            }
+            for value in [unit_id, source_hash] {
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+        }
+        Ok(Self {
+            revision: format!("batch-v1:{:x}", hasher.finalize()),
+            unit_ids,
+        })
+    }
+
+    fn legacy(texts: &[String]) -> Result<Self> {
+        let unit_ids: Vec<String> = (1..=texts.len())
+            .map(|index| format!("legacy-position-{index}"))
+            .collect();
+        let source_hashes: Vec<String> = texts
+            .iter()
+            .map(|text| crate::unit_identity::source_sha256(text))
+            .collect();
+        Self::new(unit_ids, &source_hashes)
+    }
 }
 
 impl LlmClient {
@@ -502,6 +555,25 @@ impl LlmClient {
         context: &[String],
         batch_id: &str,
     ) -> Result<BatchTranslationResponse> {
+        let contract = BatchContract::legacy(texts)?;
+        self.translate_batch_detailed_with_contract(texts, context, batch_id, contract)
+            .await
+    }
+
+    pub async fn translate_batch_detailed_with_contract(
+        &self,
+        texts: &[String],
+        context: &[String],
+        batch_id: &str,
+        contract: BatchContract,
+    ) -> Result<BatchTranslationResponse> {
+        if texts.len() != contract.unit_ids.len() {
+            anyhow::bail!(
+                "批次文本与契约数量不一致: texts={}, units={}",
+                texts.len(),
+                contract.unit_ids.len()
+            );
+        }
         let (prompt_text, glossary_chars) = if self.is_orion_model() {
             let glossary_text = self.orion_glossary_for_request(texts, context);
             let glossary_chars = glossary_text
@@ -531,6 +603,7 @@ impl LlmClient {
                 Ok(BatchTranslationResponse {
                     translations: parsed.translations,
                     diagnostics: parsed.diagnostics,
+                    contract,
                 })
             }
             None => {
@@ -541,6 +614,7 @@ impl LlmClient {
                         missing_indices: (1..=texts.len()).collect(),
                         ..ParseDiagnostics::default()
                     },
+                    contract,
                 })
             }
         }
@@ -737,6 +811,22 @@ mod tests {
     fn zero_retry_budget_still_allows_the_initial_request() {
         assert_eq!(network_attempts(0), 1);
         assert_eq!(network_attempts(3), 4);
+    }
+
+    #[test]
+    fn batch_contract_is_order_sensitive_and_rejects_duplicates() {
+        let hashes = vec![
+            crate::unit_identity::source_sha256("A"),
+            crate::unit_identity::source_sha256("B"),
+        ];
+        let first = BatchContract::new(vec!["unit-a".into(), "unit-b".into()], &hashes).unwrap();
+        let same = BatchContract::new(vec!["unit-a".into(), "unit-b".into()], &hashes).unwrap();
+        let reordered =
+            BatchContract::new(vec!["unit-b".into(), "unit-a".into()], &hashes).unwrap();
+
+        assert_eq!(first, same);
+        assert_ne!(first.revision, reordered.revision);
+        assert!(BatchContract::new(vec!["dup".into(), "dup".into()], &hashes).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
