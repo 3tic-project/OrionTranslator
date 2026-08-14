@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use betelgeuse::{
@@ -14,6 +15,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 
 use crate::config::validate_css_length;
+use crate::io_utils::{atomic_write, atomic_write_with, ensure_distinct_paths};
 
 use super::format_fixer;
 
@@ -66,6 +68,8 @@ pub struct EpubHandler {
     toc_map: HashMap<String, String>,
     /// All items in the ZIP
     raw_items: HashMap<String, Vec<u8>>,
+    /// 原 ZIP 条目顺序；保存时保留，避免 HashMap 遍历造成不可复现输出。
+    raw_item_order: Vec<String>,
     /// Spine order (list of item IDs)
     spine_ids: Vec<String>,
     /// Map: item_id -> file_name
@@ -83,6 +87,7 @@ impl EpubHandler {
             documents: Vec::new(),
             toc_map: HashMap::new(),
             raw_items: HashMap::new(),
+            raw_item_order: Vec::new(),
             spine_ids: Vec::new(),
             manifest: HashMap::new(),
             media_types: HashMap::new(),
@@ -98,14 +103,24 @@ impl EpubHandler {
         let mut archive =
             zip::ZipArchive::new(file).with_context(|| "Failed to read EPUB as ZIP")?;
 
+        self.documents.clear();
+        self.toc_map.clear();
+        self.raw_items.clear();
+        self.raw_item_order.clear();
+
         // Read all files
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).context("Failed to read ZIP entry")?;
             let name = entry.name().to_string();
+            validate_zip_entry_name(&name)?;
+            if self.raw_items.contains_key(&name) {
+                anyhow::bail!("EPUB 包含重复 ZIP 条目: {}", name);
+            }
             let mut content = Vec::new();
             entry
                 .read_to_end(&mut content)
                 .with_context(|| format!("Failed to read: {}", name))?;
+            self.raw_item_order.push(name.clone());
             self.raw_items.insert(name, content);
         }
 
@@ -502,6 +517,12 @@ impl EpubHandler {
                         let effective_toc = is_toc_page || block.page_type == "toc";
                         let replacement = if effective_toc {
                             replace_tag_content_toc(&matched.html, &block.src_text, translated)
+                                .with_context(|| {
+                                    format!(
+                                        "无法安全回填目录文档 '{}' 的 block {}",
+                                        doc.name, block.index
+                                    )
+                                })?
                         } else {
                             match mode {
                                 crate::config::TranslationMode::Replace => replace_tag_content(
@@ -579,6 +600,10 @@ impl EpubHandler {
     /// Save the modified EPUB
     pub fn save(&mut self, output_path: &str, apply_fixes: bool) -> Result<()> {
         tracing::info!("Saving to {}...", output_path);
+        let output = Path::new(output_path);
+        if !self.epub_path.is_empty() {
+            ensure_distinct_paths(Path::new(&self.epub_path), output)?;
+        }
 
         if apply_fixes {
             self.apply_format_fixes();
@@ -589,24 +614,19 @@ impl EpubHandler {
             .documents
             .iter()
             .filter(|doc| doc.modified)
-            .filter_map(|doc| {
+            .map(|doc| -> Result<(String, Vec<u8>)> {
                 let xhtml = restore_xhtml_void_elements(&doc.content);
-                // 尽力做 XML 合法性探查（失败不阻断写回，但留下可观测信号）
-                if let Err(e) = roxmltree::Document::parse(&xhtml) {
-                    tracing::warn!(
-                        "Modified document '{}' is not well-formed XML after void restore: {}",
-                        doc.name,
-                        e
-                    );
-                }
+                validate_xhtml_xml(&xhtml).with_context(|| {
+                    format!(
+                        "修改后的文档 '{}' 在 XHTML 空元素恢复后仍不是良构 XML",
+                        doc.name
+                    )
+                })?;
                 self.raw_item_key_for_document(&doc.name)
                     .map(|key| (key, xhtml.into_bytes()))
-                    .or_else(|| {
-                        tracing::warn!("Could not find raw EPUB item for document '{}'", doc.name);
-                        None
-                    })
+                    .ok_or_else(|| anyhow::anyhow!("无法定位文档 '{}' 对应的 EPUB 条目", doc.name))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         tracing::info!(
             "Writing {} modified document(s); {} unchanged document(s) keep original ZIP bytes",
             updates.len(),
@@ -616,13 +636,18 @@ impl EpubHandler {
             self.raw_items.insert(key, content);
         }
 
-        // Write the new EPUB
-        let output_file = std::fs::File::create(output_path)
-            .with_context(|| format!("Failed to create output: {}", output_path))?;
-        let mut zip_writer = zip::ZipWriter::new(output_file);
+        let mimetype = self
+            .raw_items
+            .get("mimetype")
+            .ok_or_else(|| anyhow::anyhow!("EPUB 缺少 mimetype 条目"))?;
+        if mimetype.as_slice() != b"application/epub+zip" {
+            anyhow::bail!("EPUB mimetype 内容无效");
+        }
 
-        // Write mimetype first (uncompressed, as required by EPUB spec)
-        if let Some(mimetype) = self.raw_items.get("mimetype") {
+        atomic_write_with(output, |output_file| {
+            let mut zip_writer = zip::ZipWriter::new(output_file);
+
+            // Write mimetype first (uncompressed, as required by EPUB spec)
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zip_writer
@@ -631,25 +656,41 @@ impl EpubHandler {
             zip_writer
                 .write_all(mimetype)
                 .context("Failed to write mimetype content")?;
-        }
 
-        // Write all other files
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+            // Write all other files
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
 
-        for (name, content) in &self.raw_items {
-            if name == "mimetype" {
-                continue;
+            let mut write_order = self.raw_item_order.clone();
+            let known: HashSet<&str> = write_order.iter().map(String::as_str).collect();
+            let mut added: Vec<String> = self
+                .raw_items
+                .keys()
+                .filter(|name| !known.contains(name.as_str()))
+                .cloned()
+                .collect();
+            added.sort();
+            write_order.extend(added);
+
+            for name in write_order {
+                if name == "mimetype" {
+                    continue;
+                }
+                let content = self
+                    .raw_items
+                    .get(&name)
+                    .ok_or_else(|| anyhow::anyhow!("保存时找不到原 ZIP 条目内容: {}", name))?;
+                zip_writer
+                    .start_file(name.as_str(), options)
+                    .with_context(|| format!("Failed to start file: {}", name))?;
+                zip_writer
+                    .write_all(content)
+                    .with_context(|| format!("Failed to write: {}", name))?;
             }
-            zip_writer
-                .start_file(name.as_str(), options)
-                .with_context(|| format!("Failed to start file: {}", name))?;
-            zip_writer
-                .write_all(content)
-                .with_context(|| format!("Failed to write: {}", name))?;
-        }
 
-        zip_writer.finish().context("Failed to finish ZIP")?;
+            zip_writer.finish().context("Failed to finish ZIP")?;
+            Ok(())
+        })?;
         tracing::info!("Done.");
         Ok(())
     }
@@ -699,7 +740,7 @@ impl EpubHandler {
     pub fn save_translation_data(data: &[TranslationBlock], output_path: &str) -> Result<()> {
         let json =
             serde_json::to_string_pretty(data).context("Failed to serialize translation data")?;
-        std::fs::write(output_path, json)
+        atomic_write(Path::new(output_path), json.as_bytes())
             .with_context(|| format!("Failed to write: {}", output_path))?;
         tracing::info!("Translation data saved to {}", output_path);
         Ok(())
@@ -720,6 +761,17 @@ fn is_xml_element(node: roxmltree::Node<'_, '_>, local_name: &str) -> bool {
     node.is_element() && node.tag_name().name().eq_ignore_ascii_case(local_name)
 }
 
+fn validate_zip_entry_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.starts_with('/')
+        || name.contains('\\')
+        || name.split('/').any(|component| component == "..")
+    {
+        anyhow::bail!("EPUB 包含不安全 ZIP 条目路径: {}", name);
+    }
+    Ok(())
+}
+
 fn xml_node_text(node: roxmltree::Node<'_, '_>) -> String {
     node.descendants()
         .filter_map(|child| child.text())
@@ -727,6 +779,17 @@ fn xml_node_text(node: roxmltree::Node<'_, '_>) -> String {
         .join("")
         .trim()
         .to_string()
+}
+
+fn validate_xhtml_xml(xhtml: &str) -> Result<()> {
+    // EPUB 2/3 中合法 XHTML 常带外部 DOCTYPE。roxmltree 不解析外部实体，
+    // 但默认会仅因 DTD 声明而拒绝文档，因此这里显式允许声明后再做良构校验。
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..roxmltree::ParsingOptions::default()
+    };
+    roxmltree::Document::parse_with_options(xhtml, options)?;
+    Ok(())
 }
 
 fn tag_name_from_html(html: &str) -> Option<&str> {
@@ -944,7 +1007,12 @@ fn replace_text_nodes_preserving_markup(html: &str, escaped_text: &str) -> Strin
         // 没有可用文本节点时回退为整段 inner 替换
         if let (Some(open_end), Some(close_start)) = (out.find('>'), out.rfind('<')) {
             if open_end < close_start {
-                return format!("{}{}{}", &out[..=open_end], escaped_text, &out[close_start..]);
+                return format!(
+                    "{}{}{}",
+                    &out[..=open_end],
+                    escaped_text,
+                    &out[close_start..]
+                );
             }
         }
     }
@@ -953,34 +1021,57 @@ fn replace_text_nodes_preserving_markup(html: &str, escaped_text: &str) -> Strin
 
 /// Replace tag content for ToC pages: "original / translation" format.
 /// Only replaces the text content, preserving all HTML structure (<a> links, <span>, etc.)
-fn replace_tag_content_toc(html: &str, original_text: &str, translated: &str) -> String {
+fn replace_tag_content_toc(html: &str, original_text: &str, translated: &str) -> Result<String> {
     let toc_text = format!("{} / {}", original_text, translated);
     let escaped_toc_text = escape_html_text(&toc_text);
     if html.contains(&toc_text) || html.contains(&escaped_toc_text) {
-        return html.to_string();
+        return Ok(html.to_string());
     }
 
     // Find the original text within the HTML and replace just the text,
     // preserving surrounding tags like <a href="..."> etc.
     if html.contains(original_text) {
-        html.replacen(original_text, &escaped_toc_text, 1)
+        Ok(html.replacen(original_text, &escaped_toc_text, 1))
     } else if html.contains(&escape_html_text(original_text)) {
-        html.replacen(&escape_html_text(original_text), &escaped_toc_text, 1)
+        Ok(html.replacen(&escape_html_text(original_text), &escaped_toc_text, 1))
     } else {
-        // Fallback: if exact text not found in HTML (e.g. split across child elements),
-        // replace inner content of the outermost tag
-        if let (Some(open_end), Some(close_start)) = (html.find('>'), html.rfind('<')) {
-            if open_end < close_start {
-                return format!(
-                    "{}{}{}",
-                    &html[..=open_end],
-                    escaped_toc_text,
-                    &html[close_start..]
-                );
-            }
-        }
-        html.to_string()
+        append_toc_translation_preserving_markup(html, translated)
     }
+}
+
+fn append_toc_translation_preserving_markup(html: &str, translated: &str) -> Result<String> {
+    let generated = format!(
+        r#"<span class="orion-toc-translation" lang="zh-CN" xml:lang="zh-CN"> / {}</span>"#,
+        escape_html_text(translated)
+    );
+    let existing = Regex::new(
+        r#"(?is)<span\b[^>]*class\s*=\s*["'][^"']*\borion-toc-translation\b[^"']*["'][^>]*>.*?</span\s*>"#,
+    )?;
+    if existing.is_match(html) {
+        return Ok(existing.replace(html, generated.as_str()).to_string());
+    }
+
+    let anchor_open = Regex::new(r"(?is)<a\b[^>]*>")?;
+    let anchor_close = Regex::new(r"(?is)</a\s*>")?;
+    let anchor_count = anchor_open.find_iter(html).count();
+    if anchor_count == 1 {
+        if let Some(close) = anchor_close.find_iter(html).last() {
+            let mut output = html.to_string();
+            output.insert_str(close.start(), &generated);
+            return Ok(output);
+        }
+        anyhow::bail!("目录项含未闭合的链接，无法安全追加译文");
+    }
+    if anchor_count > 1 {
+        anyhow::bail!("单个目录块包含多个链接，无法可靠判断译文所属链接");
+    }
+
+    if let Some(close_start) = html.rfind("</") {
+        let mut output = html.to_string();
+        output.insert_str(close_start, &generated);
+        return Ok(output);
+    }
+    anyhow::bail!("目录块缺少闭合标签，无法安全追加译文")
 }
 
 /// Create a new translation tag to insert after the original
@@ -1003,6 +1094,9 @@ fn create_translation_tag(
         let mut attrs = remove_attr(attrs_part, "id");
         attrs = remove_attr(&attrs, "class");
         attrs = remove_attr(&attrs, "style");
+        attrs = remove_attr(&attrs, "lang");
+        attrs = remove_attr(&attrs, "xml:lang");
+        attrs = remove_attr(&attrs, "dir");
 
         let mut attrs_out = attrs.trim().to_string();
         let class_value = if existing_class.trim().is_empty() {
@@ -1027,15 +1121,17 @@ fn create_translation_tag(
         if !style_value.is_empty() {
             append_attr(&mut attrs_out, "style", &style_value);
         }
+        append_attr(&mut attrs_out, "lang", "zh-CN");
+        append_attr(&mut attrs_out, "xml:lang", "zh-CN");
 
         attrs_out
     } else if let Some(gap_value) = gap {
         format!(
-            " class=\"orion-translation\" style=\"margin-bottom:{};\"",
+            " class=\"orion-translation\" style=\"margin-bottom:{};\" lang=\"zh-CN\" xml:lang=\"zh-CN\"",
             escape_html_attribute(gap_value)
         )
     } else {
-        " class=\"orion-translation\"".to_string()
+        " class=\"orion-translation\" lang=\"zh-CN\" xml:lang=\"zh-CN\"".to_string()
     };
 
     // Ensure attrs_str starts with a space (for "<tag attrs>")
@@ -1078,6 +1174,7 @@ mod tests {
             }],
             toc_map: HashMap::new(),
             raw_items: HashMap::new(),
+            raw_item_order: Vec::new(),
             spine_ids: Vec::new(),
             manifest: HashMap::new(),
             media_types: HashMap::new(),
@@ -1185,6 +1282,22 @@ mod tests {
         let mut content = String::new();
         entry.read_to_string(&mut content).unwrap();
         content
+    }
+
+    fn read_epub_entry_order(path: &std::path::Path) -> Vec<String> {
+        let file = std::fs::File::open(path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn rejects_unsafe_zip_entry_names() {
+        assert!(validate_zip_entry_name("Text/ch1.xhtml").is_ok());
+        assert!(validate_zip_entry_name("../outside").is_err());
+        assert!(validate_zip_entry_name("/absolute").is_err());
+        assert!(validate_zip_entry_name(r"Text\chapter.xhtml").is_err());
     }
 
     #[test]
@@ -1309,6 +1422,13 @@ mod tests {
     }
 
     #[test]
+    fn xhtml_validation_accepts_standard_doctype_but_rejects_malformed_xml() {
+        let valid = r#"<?xml version="1.0"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><body><p>正文</p></body></html>"#;
+        assert!(validate_xhtml_xml(valid).is_ok());
+        assert!(validate_xhtml_xml("<html><body><p>broken</body></html>").is_err());
+    }
+
+    #[test]
     fn bilingual_injection_replaces_existing_translation_block() {
         let mut handler = test_handler(
             r#"<html><body><p class='body' id='p1'>原文</p>
@@ -1353,6 +1473,96 @@ mod tests {
     }
 
     #[test]
+    fn toc_with_nested_ruby_appends_translation_without_flattening_structure() {
+        let original = r#"<html><body><nav><p><a href='ch1.xhtml#p1'><span>時々<ruby>穿<rt>は</rt></ruby>いてない</span></a></p></nav></body></html>"#;
+        let mut handler = test_handler(original);
+        handler.toc_pages.insert("Text/chapter.xhtml".to_string());
+        let mut toc_block = block(0, "時々穿いてない", "偶尔没穿");
+        toc_block.page_type = "toc".to_string();
+
+        handler
+            .inject_translations(&[toc_block], TranslationMode::Bilingual, None)
+            .unwrap();
+
+        assert!(handler.documents[0].content.contains("href='ch1.xhtml#p1'"));
+        assert!(handler.documents[0].content.contains("<ruby>"));
+        assert!(handler.documents[0].content.contains("<rt>は</rt>"));
+        assert!(handler.documents[0]
+            .content
+            .contains(r#"class="orion-toc-translation""#));
+        assert!(handler.documents[0].content.contains(" / 偶尔没穿"));
+
+        // 重新注入只更新生成节点，不重复追加。
+        let mut updated = block(0, "時々穿いてない", "偶尔没穿呢");
+        updated.page_type = "toc".to_string();
+        handler
+            .inject_translations(&[updated], TranslationMode::Bilingual, None)
+            .unwrap();
+        assert_eq!(
+            handler.documents[0]
+                .content
+                .matches("orion-toc-translation")
+                .count(),
+            1
+        );
+        assert!(handler.documents[0].content.contains(" / 偶尔没穿呢"));
+    }
+
+    #[test]
+    fn bilingual_translation_declares_chinese_language() {
+        let mut handler = test_handler(
+            r#"<html><body><p lang='ja' xml:lang='ja' dir='ltr'>原文</p></body></html>"#,
+        );
+
+        handler
+            .inject_translations(
+                &[block(0, "原文", "译文")],
+                TranslationMode::Bilingual,
+                None,
+            )
+            .unwrap();
+
+        let content = &handler.documents[0].content;
+        assert!(content.contains(r#"lang="zh-CN""#));
+        assert!(content.contains(r#"xml:lang="zh-CN""#));
+        assert!(!content.contains(r#"orion-translation" lang="ja""#));
+    }
+
+    #[test]
+    fn save_rejects_same_input_and_output_without_truncating_source() {
+        let input = unique_temp_epub("same_path");
+        write_minimal_epub(&input);
+        let before = std::fs::read(&input).unwrap();
+        let mut handler = EpubHandler::new(&input.to_string_lossy());
+        handler.load().unwrap();
+
+        let error = handler.save(&input.to_string_lossy(), false).unwrap_err();
+
+        assert!(error.to_string().contains("同一文件"));
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        let _ = std::fs::remove_file(input);
+    }
+
+    #[test]
+    fn invalid_modified_xhtml_does_not_replace_existing_output() {
+        let input = unique_temp_epub("invalid_input");
+        let output = unique_temp_epub("invalid_output");
+        write_minimal_epub(&input);
+        std::fs::write(&output, b"existing-output").unwrap();
+        let mut handler = EpubHandler::new(&input.to_string_lossy());
+        handler.load().unwrap();
+        handler.documents[0].content = "<html><body><p>broken</body></html>".to_string();
+        handler.documents[0].modified = true;
+
+        let error = handler.save(&output.to_string_lossy(), false).unwrap_err();
+
+        assert!(error.to_string().contains("不是良构 XML"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing-output");
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
     fn minimal_epub_round_trip_preserves_structure_and_links() {
         let input = unique_temp_epub("input");
         let output = unique_temp_epub("output");
@@ -1385,12 +1595,20 @@ mod tests {
             .unwrap();
         handler.save(&output.to_string_lossy(), false).unwrap();
 
+        assert_eq!(
+            read_epub_entry_order(&output),
+            read_epub_entry_order(&input),
+            "ZIP条目顺序应与原书一致"
+        );
+
         let chapter = read_epub_entry(&output, "OPS/Text/ch1.xhtml");
         assert!(chapter.contains(r#"<p id='p1'>「そうだな」</p>"#));
         assert!(chapter.contains("「是啊。」"));
         assert!(chapter.contains("「没错。」"));
         assert!(chapter.contains("太郎跑了。"));
         assert_eq!(chapter.matches("orion-translation").count(), 3);
+        assert_eq!(chapter.matches(r#" lang="zh-CN""#).count(), 3);
+        assert_eq!(chapter.matches(r#"xml:lang="zh-CN""#).count(), 3);
         assert!(XmlDocument::parse(&chapter).is_ok());
 
         let nav = read_epub_entry(&output, "OPS/Text/nav.xhtml");

@@ -117,6 +117,16 @@ fn fix_css_writing_mode(raw_items: &mut HashMap<String, Vec<u8>>) {
 /// Fix OPF: set page-progression-direction to ltr
 fn fix_opf_direction(raw_items: &mut HashMap<String, Vec<u8>>) {
     let keys: Vec<String> = raw_items.keys().cloned().collect();
+    let direction_re = match Regex::new(
+        r#"(?i)page-progression-direction\s*=\s*"[^"]*"|page-progression-direction\s*=\s*'[^']*'"#,
+    ) {
+        Ok(regex) => regex,
+        Err(_) => return,
+    };
+    let spine_re = match Regex::new(r#"<spine\b([^>]*?)>"#) {
+        Ok(regex) => regex,
+        Err(_) => return,
+    };
 
     for key in &keys {
         if key.ends_with(".opf") {
@@ -125,24 +135,15 @@ fn fix_opf_direction(raw_items: &mut HashMap<String, Vec<u8>>) {
                     let mut new_opf = opf_str.clone();
 
                     // Replace existing page-progression-direction
-                    if let Ok(re) = Regex::new(
-                        r#"(?i)page-progression-direction\s*=\s*"[^"]*"|page-progression-direction\s*=\s*'[^']*'"#,
-                    ) {
-                        if re.is_match(&new_opf) {
-                            new_opf = re
-                                .replace_all(&new_opf, r#"page-progression-direction="ltr""#)
-                                .to_string();
-                        } else {
-                            // Insert page-progression-direction if not present
-                            if let Ok(spine_re) = Regex::new(r#"<spine\b([^>]*?)>"#) {
-                                new_opf = spine_re
-                                    .replace(
-                                        &new_opf,
-                                        r#"<spine page-progression-direction="ltr"$1>"#,
-                                    )
-                                    .to_string();
-                            }
-                        }
+                    if direction_re.is_match(&new_opf) {
+                        new_opf = direction_re
+                            .replace_all(&new_opf, r#"page-progression-direction="ltr""#)
+                            .to_string();
+                    } else {
+                        // Insert page-progression-direction if not present
+                        new_opf = spine_re
+                            .replace(&new_opf, r#"<spine page-progression-direction="ltr"$1>"#)
+                            .to_string();
                     }
 
                     if new_opf != opf_str {
@@ -155,6 +156,7 @@ fn fix_opf_direction(raw_items: &mut HashMap<String, Vec<u8>>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::epub::handler::DocumentItem;
