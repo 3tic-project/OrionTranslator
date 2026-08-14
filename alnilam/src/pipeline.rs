@@ -1783,8 +1783,9 @@ pub async fn translate_epub(
     }
 
     let glossary_entries = load_glossary_entries(config)?;
+    let hard_glossary_entries = glossary::hard_quality_constraints(&glossary_entries);
     let checker = ResponseChecker::new("ja", "zh", 0.80, config.max_retry)
-        .with_glossary_entries(glossary_entries.clone());
+        .with_glossary_entries(hard_glossary_entries.clone());
     let fixer = AutoFixer::new("ja", "zh");
     let error_records: Arc<Mutex<Vec<ErrorRecord>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -2376,7 +2377,7 @@ pub async fn translate_epub(
         }
 
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry)
-            .with_glossary_entries(glossary_entries.clone());
+            .with_glossary_entries(hard_glossary_entries.clone());
         let fixer_retry = AutoFixer::new("ja", "zh");
         let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
 
@@ -2658,8 +2659,9 @@ pub async fn translate_txt(
     }
 
     let glossary_entries = load_glossary_entries(config)?;
+    let hard_glossary_entries = glossary::hard_quality_constraints(&glossary_entries);
     let checker = ResponseChecker::new("ja", "zh", 0.80, config.max_retry)
-        .with_glossary_entries(glossary_entries.clone());
+        .with_glossary_entries(hard_glossary_entries.clone());
     let fixer = AutoFixer::new("ja", "zh");
     let error_records: Arc<Mutex<Vec<ErrorRecord>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -3240,7 +3242,7 @@ pub async fn translate_txt(
         }
 
         let checker_retry = ResponseChecker::new("ja", "zh", 0.80, config.max_retry)
-            .with_glossary_entries(glossary_entries.clone());
+            .with_glossary_entries(hard_glossary_entries.clone());
         let fixer_retry = AutoFixer::new("ja", "zh");
         let failure_causes_shared = Arc::new(Mutex::new(failure_causes.clone()));
 

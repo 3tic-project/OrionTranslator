@@ -100,6 +100,23 @@ pub fn load_glossary_with_confirmed_aliases(path: &std::path::Path) -> Result<Ve
     Ok(entries)
 }
 
+/// Select terms that are safe to enforce as hard post-translation constraints.
+///
+/// Legacy v1 glossary rows remain prompt guidance: they do not encode whether a
+/// surname, given name, nickname, or full name is required at a specific mention.
+/// Ruby aliases confirmed through the v2 review sidecar are explicit decisions.
+/// Advanced v1 users can also opt a row in with `enforcement=hard` in `info`.
+pub fn hard_quality_constraints(entries: &[GlossaryEntry]) -> Vec<GlossaryEntry> {
+    entries
+        .iter()
+        .filter(|entry| {
+            let info = entry.info.to_ascii_lowercase();
+            info.starts_with("ruby_alias:") || info.contains("enforcement=hard")
+        })
+        .cloned()
+        .collect()
+}
+
 /// 将术语表格式化为通用模型 prompt 中的文本格式
 /// 输出格式：
 /// src -> dst   #info
@@ -736,6 +753,11 @@ mod tests {
             format_matched_glossary_for_orion(&loaded, &["シラジノオトが来た。".to_string()])
                 .unwrap();
         assert!(prompt.contains("シラジノオト→白地野音"));
+        let hard = hard_quality_constraints(&loaded);
+        assert_eq!(hard.len(), 2);
+        assert!(hard
+            .iter()
+            .all(|entry| entry.info.starts_with("ruby_alias:")));
 
         let _ = std::fs::remove_file(glossary_path);
         let _ = std::fs::remove_file(review_path);
@@ -773,5 +795,26 @@ mod tests {
 
         let _ = std::fs::remove_file(glossary_path);
         let _ = std::fs::remove_file(review_path);
+    }
+
+    #[test]
+    fn legacy_flat_terms_are_prompt_guidance_unless_explicitly_hard() {
+        let entries = vec![
+            GlossaryEntry {
+                src: "真里".to_string(),
+                dst: "笔名真里".to_string(),
+                info: "人物".to_string(),
+            },
+            GlossaryEntry {
+                src: "LOCKED".to_string(),
+                dst: "锁定".to_string(),
+                info: "user; enforcement=hard".to_string(),
+            },
+        ];
+
+        let hard = hard_quality_constraints(&entries);
+
+        assert_eq!(hard.len(), 1);
+        assert_eq!(hard[0].src, "LOCKED");
     }
 }
