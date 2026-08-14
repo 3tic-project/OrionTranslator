@@ -381,7 +381,7 @@ pub async fn generate_glossary(
     );
 
     // Generate translations (or raw entries for Orion models)
-    let translations = if config.skip_llm_translation {
+    let (translations, generation_issues) = if config.skip_llm_translation {
         emit(
             &progress,
             GlossaryProgressEvent::Log {
@@ -391,14 +391,17 @@ pub async fn generate_glossary(
             },
         );
         // Create raw entries with empty dst/info for Orion models
-        characters
-            .into_keys()
-            .map(|name| llm::TranslationEntry {
-                src: name,
-                dst: String::new(),
-                info: String::new(),
-            })
-            .collect()
+        (
+            characters
+                .into_keys()
+                .map(|name| llm::TranslationEntry {
+                    src: name,
+                    dst: String::new(),
+                    info: String::new(),
+                })
+                .collect(),
+            Vec::new(),
+        )
     } else {
         // LLM translation for generic models
         emit(
@@ -411,14 +414,10 @@ pub async fn generate_glossary(
 
         let llm_client =
             llm::LlmClient::new(&config.llm_url, &config.llm_api_key, &config.llm_model);
-        let translations = llm_client
-            .translate_all(&characters, config.llm_workers, progress.clone())
+        let report = llm_client
+            .translate_all_detailed(&characters, config.llm_workers, progress.clone())
             .await;
-
-        if translations.is_empty() {
-            anyhow::bail!("术语翻译结果为空");
-        }
-        translations
+        (report.entries, report.issues)
     };
 
     // Ruby 证据只生成审核清单，不在缺乏分类/确认时自动提升为强制术语。
@@ -428,6 +427,44 @@ pub async fn generate_glossary(
 
     let json = serde_json::to_string_pretty(&translations)?;
     atomic_write(output_path, json.as_bytes())?;
+
+    if !config.skip_llm_translation {
+        let report_path = glossary_generation_report_path(output_path);
+        let unresolved = generation_issues
+            .iter()
+            .filter(|issue| issue.kind == llm::GlossaryIssueKind::Unresolved)
+            .count();
+        let rejected = generation_issues
+            .iter()
+            .filter(|issue| issue.kind == llm::GlossaryIssueKind::Rejected)
+            .count();
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "resolved_entries": translations.len(),
+            "unresolved_clusters": unresolved,
+            "rejected_clusters": rejected,
+            "issues": generation_issues,
+        });
+        atomic_write(
+            &report_path,
+            serde_json::to_string_pretty(&report)?.as_bytes(),
+        )?;
+        emit(
+            &progress,
+            GlossaryProgressEvent::Log {
+                message: format!(
+                    "术语生成报告: {}（resolved={}，unresolved={}，rejected={}）",
+                    report_path.display(),
+                    translations.len(),
+                    unresolved,
+                    rejected
+                ),
+            },
+        );
+        if translations.is_empty() {
+            anyhow::bail!("术语翻译结果为空；诊断已保存到 {}", report_path.display());
+        }
+    }
 
     if !config.ruby_annotations.is_empty() {
         let review_path = ruby_review_path(output_path);
@@ -471,6 +508,14 @@ pub fn ruby_review_path(glossary_path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("glossary");
     glossary_path.with_file_name(format!("{stem}.ruby-candidates.json"))
+}
+
+pub fn glossary_generation_report_path(glossary_path: &Path) -> PathBuf {
+    let stem = glossary_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("glossary");
+    glossary_path.with_file_name(format!("{stem}.generation-report.json"))
 }
 
 pub fn save_ruby_alias_review(path: &Path, review: &[RubyAliasReviewEntry]) -> Result<()> {
@@ -1113,6 +1158,10 @@ mod tests {
         assert_eq!(
             ruby_review_path(Path::new("book_glossary.json")),
             PathBuf::from("book_glossary.ruby-candidates.json")
+        );
+        assert_eq!(
+            glossary_generation_report_path(Path::new("book_glossary.json")),
+            PathBuf::from("book_glossary.generation-report.json")
         );
     }
 

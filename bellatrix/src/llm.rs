@@ -129,6 +129,14 @@ struct ResponseMessage {
     content: String,
 }
 
+fn first_response_content(response: &ChatResponse) -> Result<&str> {
+    response
+        .choices
+        .first()
+        .map(|choice| choice.message.content.as_str())
+        .ok_or_else(|| anyhow::anyhow!("LLM response choices 为空"))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmResult {
     #[serde(default)]
@@ -143,6 +151,43 @@ pub struct TranslationEntry {
     pub src: String,
     pub dst: String,
     pub info: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GlossaryIssueKind {
+    Rejected,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GlossaryGenerationIssue {
+    pub source: String,
+    pub aliases: Vec<String>,
+    pub kind: GlossaryIssueKind,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GlossaryTranslationReport {
+    pub entries: Vec<TranslationEntry>,
+    pub issues: Vec<GlossaryGenerationIssue>,
+}
+
+impl GlossaryTranslationReport {
+    pub fn unresolved_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|issue| issue.kind == GlossaryIssueKind::Unresolved)
+            .count()
+    }
+
+    pub fn rejected_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|issue| issue.kind == GlossaryIssueKind::Rejected)
+            .count()
+    }
 }
 
 pub struct LlmClient {
@@ -188,6 +233,17 @@ impl LlmClient {
         max_concurrent: usize,
         progress: GlossaryProgressCallback,
     ) -> Vec<TranslationEntry> {
+        self.translate_all_detailed(characters, max_concurrent, progress)
+            .await
+            .entries
+    }
+
+    pub async fn translate_all_detailed(
+        &self,
+        characters: &HashMap<String, CharacterInfo>,
+        max_concurrent: usize,
+        progress: GlossaryProgressCallback,
+    ) -> GlossaryTranslationReport {
         // 0 permits 会导致 acquire 永久阻塞
         let max_concurrent = max_concurrent.max(1);
         let clusters = build_name_clusters(characters);
@@ -202,6 +258,12 @@ impl LlmClient {
 
         let mut handles = Vec::new();
         for cluster in clusters {
+            let task_source = cluster.key.clone();
+            let task_aliases = cluster
+                .aliases
+                .iter()
+                .map(|alias| alias.name.clone())
+                .collect::<Vec<_>>();
             let sem = semaphore.clone();
             let client = client.clone();
             let api_url = api_url.clone();
@@ -223,19 +285,32 @@ impl LlmClient {
                 );
                 result
             });
-            handles.push(handle);
+            handles.push((task_source, task_aliases, handle));
         }
 
-        let mut results = Vec::new();
-        for handle in handles {
+        let mut report = GlossaryTranslationReport::default();
+        for (source, aliases, handle) in handles {
             match handle.await {
-                Ok(mut entries) => results.append(&mut entries),
-                Err(e) => warn!("LLM任务失败: {}", e),
+                Ok(mut outcome) => {
+                    report.entries.append(&mut outcome.entries);
+                    if let Some(issue) = outcome.issue {
+                        report.issues.push(issue);
+                    }
+                }
+                Err(error) => {
+                    warn!("LLM任务失败: {}", error);
+                    report.issues.push(GlossaryGenerationIssue {
+                        source,
+                        aliases,
+                        kind: GlossaryIssueKind::Unresolved,
+                        reason: format!("task join failure: {error}"),
+                    });
+                }
             }
         }
 
-        propagate_gender_within_canonical(&mut results);
-        results
+        propagate_gender_within_canonical(&mut report.entries);
+        report
     }
 }
 
@@ -539,18 +614,60 @@ fn gender_hint_from_alias_name(name: &str) -> (i32, i32) {
     (male, female)
 }
 
+struct ClusterTranslationOutcome {
+    entries: Vec<TranslationEntry>,
+    issue: Option<GlossaryGenerationIssue>,
+}
+
+impl ClusterTranslationOutcome {
+    fn rejected(cluster: &NameCluster, reason: impl Into<String>) -> Self {
+        Self {
+            entries: Vec::new(),
+            issue: Some(cluster_issue(cluster, GlossaryIssueKind::Rejected, reason)),
+        }
+    }
+
+    fn unresolved(cluster: &NameCluster, reason: impl Into<String>) -> Self {
+        Self {
+            entries: Vec::new(),
+            issue: Some(cluster_issue(
+                cluster,
+                GlossaryIssueKind::Unresolved,
+                reason,
+            )),
+        }
+    }
+}
+
+fn cluster_issue(
+    cluster: &NameCluster,
+    kind: GlossaryIssueKind,
+    reason: impl Into<String>,
+) -> GlossaryGenerationIssue {
+    GlossaryGenerationIssue {
+        source: cluster.key.clone(),
+        aliases: cluster
+            .aliases
+            .iter()
+            .map(|alias| alias.name.clone())
+            .collect(),
+        kind,
+        reason: reason.into(),
+    }
+}
+
 async fn translate_cluster(
     client: &Client,
     api_url: &str,
     api_key: &str,
     model: &str,
     cluster: NameCluster,
-) -> Vec<TranslationEntry> {
+) -> ClusterTranslationOutcome {
     if is_pure_title(&cluster.key) {
-        return vec![];
+        return ClusterTranslationOutcome::rejected(&cluster, "纯称谓，不作为实体术语");
     }
     if is_family_like(&cluster.key) {
-        return vec![];
+        return ClusterTranslationOutcome::rejected(&cluster, "家庭/群体称呼，不作为人物实体");
     }
 
     let context = build_context_for_cluster(&cluster);
@@ -566,14 +683,23 @@ async fn translate_cluster(
     .await
     {
         Ok(Some(v)) => v,
-        Ok(None) => return vec![],
-        Err(e) => {
-            warn!("LLM翻译失败 {}: {}", cluster.key, e);
-            return vec![];
+        Ok(None) => {
+            return ClusterTranslationOutcome::rejected(
+                &cluster,
+                "模型判定不是人物名或无法给出合法译名",
+            )
+        }
+        Err(error) => {
+            warn!("LLM翻译失败 {}: {}", cluster.key, error);
+            return ClusterTranslationOutcome::unresolved(
+                &cluster,
+                format!("LLM/protocol failure: {error}"),
+            );
         }
     };
 
     let mut out = Vec::new();
+    let mut unresolved_aliases = Vec::new();
     for alias in &cluster.aliases {
         if is_pure_title(&alias.name) {
             continue;
@@ -584,6 +710,7 @@ async fn translate_cluster(
         let dst = build_alias_dst(&cluster.key, &inferred.base_dst, &alias.name);
         if contains_kana(&dst) || dst.contains(' ') {
             warn!("dst含假名或空格，跳过: {} -> {}", alias.name, dst);
+            unresolved_aliases.push(alias.name.clone());
             continue;
         }
 
@@ -595,7 +722,22 @@ async fn translate_cluster(
         });
     }
 
-    out
+    let issue = if unresolved_aliases.is_empty() {
+        None
+    } else {
+        Some(cluster_issue(
+            &cluster,
+            GlossaryIssueKind::Unresolved,
+            format!(
+                "alias 目标仍含假名或空格: {}",
+                unresolved_aliases.join(" / ")
+            ),
+        ))
+    };
+    ClusterTranslationOutcome {
+        entries: out,
+        issue,
+    }
 }
 
 struct InferredBase {
@@ -659,7 +801,7 @@ async fn infer_base_name(
         }
 
         let chat_resp: ChatResponse = resp.json().await?;
-        let content = &chat_resp.choices[0].message.content;
+        let content = first_response_content(&chat_resp)?;
         let data = match parse_json_from_llm(content) {
             Ok(v) => v,
             Err(e) if attempt < 3 => {
@@ -1031,5 +1173,35 @@ mod tests {
         assert_eq!(build_alias_dst("星野", "星野", "星野先生"), "星野老师");
         assert_eq!(build_alias_dst("美波", "美波", "美波監督"), "美波");
         assert_eq!(build_alias_dst("ゆづ", "柚", "ゆづ姉"), "柚");
+    }
+
+    #[test]
+    fn empty_choices_is_a_protocol_error_not_a_panic() {
+        let response = ChatResponse { choices: vec![] };
+        let error = first_response_content(&response).unwrap_err();
+        assert!(error.to_string().contains("choices 为空"));
+    }
+
+    #[test]
+    fn glossary_report_counts_visible_outcomes() {
+        let report = GlossaryTranslationReport {
+            entries: vec![],
+            issues: vec![
+                GlossaryGenerationIssue {
+                    source: "候補A".to_string(),
+                    aliases: vec!["候補A".to_string()],
+                    kind: GlossaryIssueKind::Unresolved,
+                    reason: "protocol".to_string(),
+                },
+                GlossaryGenerationIssue {
+                    source: "先生".to_string(),
+                    aliases: vec!["先生".to_string()],
+                    kind: GlossaryIssueKind::Rejected,
+                    reason: "title".to_string(),
+                },
+            ],
+        };
+        assert_eq!(report.unresolved_count(), 1);
+        assert_eq!(report.rejected_count(), 1);
     }
 }
