@@ -82,6 +82,8 @@ novel_error_report.json           # 错误报告
 
 新生成的翻译数据为每个单元写入稳定 `unit_id` 与 `source_sha256`，恢复时按身份映射并整份拒绝重复、未知或哈希不一致的快照，不再依赖 JSON 数组位置。旧版 JSON 仍可用于离线 `export`，但不会作为新版断点快照直接复用。
 
+批量请求继续使用 Orion 模型训练时熟悉的 `1..N` 数字 JSONL key；管线会同时生成顺序敏感的 `batch_revision` 和数字位置→UnitId 契约。响应对象只有在 revision 与完整 UnitId 顺序都吻合时才允许提交，避免并发结果误投到其他批次。
+
 ### 安全重导出与术语审核
 
 已有 `translation_data.json` 时可完全离线重导出；该命令默认不执行竖排/RTL/SVG 等有损格式修复，并拒绝输入输出同路径。EPUB 回填还会校验 file/block/source 身份；未知文件、重复 block、源文或新格式 UnitId/hash 不一致时整次导出失败，不生成缺段成品：
