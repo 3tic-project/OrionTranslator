@@ -10,9 +10,9 @@ EPUB/TXT 日译中翻译管线核心，同时作为 CLI 工具和库使用。
 - **断点续翻**：自动保存工作区快照；单元携带稳定 `unit_id + source_sha256`，恢复按身份映射且对重复/篡改快照整份拒收；只重发未完成单元
 - **批次契约**：保留模型兼容的数字 JSONL key，同时用顺序敏感 `batch_revision + position→UnitId` 约束本地响应提交，跨批对象不匹配时整批拒收
 - **上下文感知**：规则化场景检测（对话/叙述/标题/场景切换）+ 智能上下文选择
-- **质量保障**：假名残留、韩文残留、长度异常、相似度检测；通过项仅做安全引号/标点正规化，失败项才激进修复并复检
+- **质量保障**：区分未译假名正文与受保护的谜题/署名 token；已确认术语、数字和占位符为重试后也不会关闭的硬检查；通过项仅做安全引号/标点正规化，失败项才激进修复并复检
 - **Provider 重试**：按 HTTP/transport/protocol 强类型分类；401/403/422 等永久错误立即停止，408/425/429/5xx 与瞬时传输错误在明确预算内重试，支持秒数型 `Retry-After`
-- **术语表生成/审核**：内嵌 NER（via bellatrix）；双通道抽取 ruby base/reading，并生成默认不自动提升的别名审核清单
+- **术语表生成/审核**：内嵌 NER（via bellatrix）；双通道抽取 ruby base/reading，显式报告 resolved/unresolved/rejected 结果，并生成可持久确认/拒绝的别名审核清单
 - **术语匹配**：带假名/ASCII 边界和 leftmost-longest 重叠解析，避免 `アイ` 命中 `アイテム`
 - **EPUB 保真**：未改章节保留 ZIP 原始 XHTML；目录跨节点时在原链接内追加中文节点；Replace 遇到复杂内联树时隐藏并保留源节点、另显示中文节点，避免清空 ruby/链接内容
 - **事务输出**：EPUB/TXT/快照原子写入，拒绝输入输出同路径；EPUB 重导出对 file/block/source/UnitId 身份做全量硬校验，拒绝静默缺段
@@ -27,7 +27,7 @@ alnilam/
 ├── rules/
 │   └── ja2zh_context_rules.json  # 上下文检测规则（770 条）
 └── src/
-    ├── main.rs                 # CLI 入口（translate / export / glossary / glossary-audit）
+    ├── main.rs                 # CLI 入口（translate / export / glossary / glossary-audit / glossary-review）
     ├── lib.rs                  # 库导出
     ├── config.rs               # PipelineConfig 配置 + 默认值
     ├── pipeline.rs             # EPUB/TXT 翻译编排（并发批处理 + 重试）
@@ -78,7 +78,18 @@ alnilam export novel.epub \
 # 离线审查 ruby 读音、平片假名复现与术语冲突
 alnilam glossary-audit novel.epub \
   --glossary-path novel_glossary.json
+
+# 人工确认低风险发音 alias（candidate_id 来自审核清单）
+alnilam glossary-review novel_glossary.ruby-candidates.json \
+  --candidate-id ruby-v1:... \
+  --classification phonetic_reading \
+  --decision confirmed \
+  --target 白地野音
 ```
+
+术语生成同时写出 `*_glossary.generation-report.json`，其中区分成功解析、模型/协议未解决和明确拒绝的实体 cluster；不会再把空 `choices` 或单个 cluster 失败静默丢掉。
+
+`glossary-audit` 输出 schema v2 `*.ruby-candidates.json`。候选包含稳定 ID、证据、保守分类建议、人工分类、`pending|confirmed|rejected` 决定和 revision。机器建议本身不会启用 alias；只有人工确认为 `phonetic_reading`、`orthographic_alias` 或 `nickname_cue` 且具有目标译名的候选，才会把平/片假名变体加入 prompt 和 `TERM_MISSING` 硬检查。语义 ruby、普通注音、双关 token、待审核和已拒绝候选始终不会进入翻译约束；同一 surface 多译会在翻译前硬失败。
 
 `replace` 对纯文本块直接替换；对 ruby、链接、媒体或跨文本节点块，保留原 inner tree 到 `orion-source-hidden`（内联 `display:none !important`），并以 `orion-replace-translation` 显示中文。这是单语视觉输出的止损策略，不代表已完成所有阅读器的可访问性/显示兼容验证；发布前仍应执行阅读器冒烟测试。
 

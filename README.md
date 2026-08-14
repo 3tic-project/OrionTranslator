@@ -104,7 +104,21 @@ cargo run -p alnilam -- glossary-audit novel.epub \
   --glossary-path novel_glossary.json
 ```
 
-审核结果写入 `*.ruby-candidates.json`。`review_required`、`high_ambiguity_review` 和 `conflict` 必须审核；工具不会把语义 ruby 或短假名候选自动提升为强制术语。
+审核结果写入 schema v2 `*.ruby-candidates.json`。`review_required`、`high_ambiguity_review` 和 `conflict` 必须审核；每个候选包含稳定 `candidate_id`、证据、保守分类建议、人工决定和 revision。机器建议不会自动改变翻译约束。
+
+确认低风险发音 alias：
+
+```bash
+cargo run -p alnilam -- glossary-review novel_glossary.ruby-candidates.json \
+  --candidate-id ruby-v1:... \
+  --classification phonetic_reading \
+  --decision confirmed \
+  --target 白地野音
+```
+
+只有人工确认为 `phonetic_reading`、`orthographic_alias` 或 `nickname_cue` 且具有目标译名的候选，才会把平/片假名变体加入翻译 prompt，并在译后执行不可被重试阈值关闭的 `TERM_MISSING` 检查。语义 ruby、普通注音、双关、待审核和已拒绝候选不会成为强制术语；同一 surface 多译会在翻译前硬失败。审核 revision 也计入恢复 manifest，改变决定后不会复用旧译文。
+
+生成术语表时还会写出 `*_glossary.generation-report.json`，区分 `resolved`、`unresolved` 和 `rejected` cluster，避免空响应或单个实体失败被静默省略。
 
 GUI 凭据文件在 Unix/macOS 上以 `0600` 原子保存。当前内容仍是本地 XOR 混淆而非系统密钥库加密，不应在共享账户或不可信备份中视为强加密。
 
@@ -288,6 +302,8 @@ alnilam glossary novel.epub \
   --llm-model "deepseek-v4-flash"
 ```
 
+生成结果旁会写出 `*_glossary.generation-report.json` 和 `*_glossary.ruby-candidates.json`。前者暴露未解决/被拒绝的实体 cluster，后者保存 ruby alias 的证据与人工审核状态；确认后的低风险 alias 会在后续翻译时自动加载。
+
 ### 3. 桌面 GUI
 
 ```bash
@@ -332,6 +348,8 @@ DeepSeek / 火山引擎默认关闭思考模式（`thinking.type=disabled`），
 | `*_translation_data.json` | 翻译数据（断点续翻用） |
 | `*_error_report.json` | 翻译错误报告 |
 | `*_glossary.json` | 术语表 |
+| `*_glossary.generation-report.json` | 术语生成 resolved/unresolved/rejected 报告 |
+| `*_glossary.ruby-candidates.json` | Ruby alias 证据、分类和确认/拒绝状态 |
 | `*_characters.json` | NER 人物候选列表 |
 | `*_output.json` | NER + LLM 术语条目 |
 
