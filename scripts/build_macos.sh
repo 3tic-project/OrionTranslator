@@ -10,12 +10,26 @@ set -euo pipefail
 APP_NAME="OrionTranslator"
 APP_BUNDLE="${APP_NAME}.app"
 BINARY_NAME="alnitak"
-VERSION="0.1.0"
 IDENTIFIER="com.orion.translator"
-DMG_NAME="${APP_NAME}-${VERSION}-macOS"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VERSION="$(awk '
+    /^\[package\]$/ { in_package = 1; next }
+    in_package && /^\[/ { exit }
+    in_package && /^version[[:space:]]*=/ {
+        value = $0
+        sub(/^[^=]*=[[:space:]]*"/, "", value)
+        sub(/"[[:space:]]*$/, "", value)
+        print value
+        exit
+    }
+' "${PROJECT_ROOT}/alnitak/Cargo.toml")"
+if [ -z "${VERSION}" ]; then
+    echo "❌ 无法从 alnitak/Cargo.toml 读取版本号"
+    exit 1
+fi
+DMG_NAME="${APP_NAME}-${VERSION}-macOS"
 DIST_DIR="${PROJECT_ROOT}/dist"
 BUILD_DIR="${DIST_DIR}/.build_macos"
 APP_DIR="${BUILD_DIR}/${APP_BUNDLE}"

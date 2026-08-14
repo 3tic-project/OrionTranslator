@@ -11,11 +11,25 @@ set -euo pipefail
 # ── 常量 ──────────────────────────────────────────────────────
 APP_NAME="OrionTranslator"
 BINARY_NAME="alnitak"
-VERSION="0.1.0"
-ZIP_NAME="${APP_NAME}-${VERSION}-Windows-x86_64"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VERSION="$(awk '
+    /^\[package\]$/ { in_package = 1; next }
+    in_package && /^\[/ { exit }
+    in_package && /^version[[:space:]]*=/ {
+        value = $0
+        sub(/^[^=]*=[[:space:]]*"/, "", value)
+        sub(/"[[:space:]]*$/, "", value)
+        print value
+        exit
+    }
+' "${PROJECT_ROOT}/alnitak/Cargo.toml")"
+if [ -z "${VERSION}" ]; then
+    echo "❌ 无法从 alnitak/Cargo.toml 读取版本号"
+    exit 1
+fi
+ZIP_NAME="${APP_NAME}-${VERSION}-Windows-x86_64"
 DIST_DIR="${PROJECT_ROOT}/dist"
 BUILD_DIR="${DIST_DIR}/.build_windows"
 

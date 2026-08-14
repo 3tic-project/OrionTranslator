@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "alnitak"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "alnilam",
  "anyhow",

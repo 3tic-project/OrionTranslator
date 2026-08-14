@@ -132,7 +132,8 @@ impl OrionApp {
                 .default_value(&creds.api_key)
         });
 
-        let mut log_messages = vec!["Orion 翻译器就绪".into()];
+        let mut log_messages =
+            vec![format!("Orion 翻译器 v{} 就绪", env!("CARGO_PKG_VERSION")).into()];
         if let Ok(path) = credentials::credentials_file_path() {
             if path.exists() {
                 log_messages.push(

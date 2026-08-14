@@ -68,8 +68,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION:-0.1.0}"
+          CARGO_VERSION="$(awk '
+            /^\[package\]$/ { in_package = 1; next }
+            in_package && /^\[/ { exit }
+            in_package && /^version[[:space:]]*=/ {
+              value = $0
+              sub(/^[^=]*=[[:space:]]*"/, "", value)
+              sub(/"[[:space:]]*$/, "", value)
+              print value
+              exit
+            }
+          ' alnitak/Cargo.toml)"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${CARGO_VERSION}"
+          fi
           DMG_NAME="${APP_NAME}-${VERSION}-${{ matrix.suffix }}"
           RUST_TARGET="${{ matrix.rust_target }}"
 
@@ -199,8 +213,14 @@ jobs:
       - name: Package ZIP (完整版 + 轻量版)
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
-          if (-not $version -or $version -eq "") { $version = "0.1.0" }
+          $cargoVersionLine = Select-String -Path "alnitak/Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $cargoVersionLine) { throw "Cannot read alnitak package version" }
+          $cargoVersion = $cargoVersionLine.Matches[0].Groups[1].Value
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $version = $cargoVersion
+          }
           $baseName = "${{ env.APP_NAME }}-$version-Windows-x86_64"
           $exeSrc   = "target/x86_64-pc-windows-msvc/release/${{ env.BINARY_NAME }}.exe"
 
