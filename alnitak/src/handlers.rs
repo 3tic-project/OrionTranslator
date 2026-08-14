@@ -1112,7 +1112,8 @@ impl OrionApp {
         };
 
         let glossary_config = bellatrix::GlossaryConfig {
-            lines: Vec::new(), // will be populated in background thread
+            lines: Vec::new(),            // will be populated in background thread
+            ruby_annotations: Vec::new(), // will be populated for EPUB
             model_dir,
             ner_batch_size: 16,
             min_count: 2,
@@ -1145,15 +1146,17 @@ impl OrionApp {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_lowercase();
-                    let lines = match ext.as_str() {
-                        "epub" => betelgeuse::extract_epub_lines(&file_path),
-                        "txt" => betelgeuse::extract_txt_lines(&file_path),
-                        _ => Err(anyhow::anyhow!(
-                            "不支持的文件格式: .{} (仅支持 .epub / .txt)",
-                            ext
-                        )),
-                    }?;
-                    config.lines = lines;
+                    match ext.as_str() {
+                        "epub" => {
+                            let extraction = betelgeuse::extract_epub_text(&file_path)?;
+                            config.lines = extraction.lines;
+                            config.ruby_annotations = extraction.ruby_annotations;
+                        }
+                        "txt" => {
+                            config.lines = betelgeuse::extract_txt_lines(&file_path)?;
+                        }
+                        _ => anyhow::bail!("不支持的文件格式: .{} (仅支持 .epub / .txt)", ext),
+                    }
 
                     let rt =
                         tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");

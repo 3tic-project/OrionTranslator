@@ -80,6 +80,46 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
+    /// 使用已有 translation_data.json 无模型重导出 EPUB/TXT
+    Export {
+        /// 原始 EPUB/TXT 文件路径
+        input: PathBuf,
+
+        /// 已有翻译数据 JSON
+        #[arg(long)]
+        translation_data: PathBuf,
+
+        /// 输出 EPUB/TXT 文件路径（必须与输入不同）
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// 翻译模式: bilingual(双语) 或 replace(替换)
+        #[arg(short, long, default_value = "bilingual")]
+        mode: String,
+
+        /// 双语译文段落底部间距；0 表示禁用
+        #[arg(long, default_value = config::DEFAULT_TRANSLATION_GAP)]
+        gap: String,
+
+        /// 显式启用竖排转横排、RTL 转 LTR、SVG 简化等有损格式修复
+        #[arg(long)]
+        apply_fixes: bool,
+    },
+
+    /// 离线审查已有术语表与 EPUB ruby/后文假名覆盖，不调用模型
+    GlossaryAudit {
+        /// 原始 EPUB 文件
+        file: PathBuf,
+
+        /// 已有 v1 术语表 JSON
+        #[arg(long)]
+        glossary_path: PathBuf,
+
+        /// 审核清单输出路径（默认: *.ruby-candidates.json）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
     /// 自动生成术语表（NER实体识别 + LLM翻译）
     Glossary {
         /// 输入 EPUB/TXT 文件路径
@@ -244,6 +284,61 @@ async fn main() -> Result<()> {
 
 async fn run_subcommand(cmd: Commands) -> Result<()> {
     match cmd {
+        Commands::Export {
+            input,
+            translation_data,
+            output,
+            mode,
+            gap,
+            apply_fixes,
+        } => {
+            if !input.exists() {
+                anyhow::bail!("输入文件不存在: {}", input.display());
+            }
+            if !translation_data.exists() {
+                anyhow::bail!("翻译数据不存在: {}", translation_data.display());
+            }
+            pipeline::validate_distinct_input_output(&input, &output)?;
+
+            let mode = match mode.as_str() {
+                "bilingual" => config::TranslationMode::Bilingual,
+                "replace" => config::TranslationMode::Replace,
+                other => anyhow::bail!("不支持的翻译模式: {}", other),
+            };
+            let gap = if gap == "0" { None } else { Some(gap) };
+            if let Some(value) = gap.as_deref() {
+                config::validate_css_length(value)?;
+            }
+
+            let extension = input
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            match extension.as_str() {
+                "epub" => {
+                    let data = alnilam::epub::EpubHandler::load_translation_data(
+                        &translation_data.to_string_lossy(),
+                    )?;
+                    pipeline::export_epub_from_data(
+                        &input,
+                        &data,
+                        &output,
+                        mode,
+                        gap.as_deref(),
+                        apply_fixes,
+                        &None,
+                    )?;
+                }
+                "txt" => {
+                    let data =
+                        pipeline::load_txt_translation_data(&translation_data.to_string_lossy())?;
+                    pipeline::export_txt_from_data(&data, &output, mode, &None)?;
+                }
+                other => anyhow::bail!("不支持的输入格式: .{}", other),
+            }
+            println!("导出完成: {}", output.display());
+        }
         Commands::Glossary {
             file,
             model_dir,
@@ -315,8 +410,10 @@ async fn run_subcommand(cmd: Commands) -> Result<()> {
                     }
                 }));
 
+            let (lines, ruby_annotations) = extract_text_data(&file)?;
             let config = bellatrix::GlossaryConfig {
-                lines: extract_text_lines(&file)?,
+                lines,
+                ruby_annotations,
                 model_dir,
                 ner_batch_size,
                 min_count,
@@ -339,13 +436,56 @@ async fn run_subcommand(cmd: Commands) -> Result<()> {
             let result = bellatrix::generate_glossary(config, progress).await?;
             println!("📁 术语表输出: {}", result.display());
         }
+        Commands::GlossaryAudit {
+            file,
+            glossary_path,
+            output,
+        } => {
+            if !file.exists() {
+                anyhow::bail!("输入文件不存在: {}", file.display());
+            }
+            if !glossary_path.exists() {
+                anyhow::bail!("术语表不存在: {}", glossary_path.display());
+            }
+            let (lines, ruby_annotations) = extract_text_data(&file)?;
+            if ruby_annotations.is_empty() {
+                anyhow::bail!("EPUB 中未抽取到 ruby 标注");
+            }
+            let glossary = alnilam::llm::glossary::load_glossary(&glossary_path)?;
+            let translations: Vec<bellatrix::llm::TranslationEntry> = glossary
+                .into_iter()
+                .map(|entry| bellatrix::llm::TranslationEntry {
+                    src: entry.src,
+                    dst: entry.dst,
+                    info: entry.info,
+                })
+                .collect();
+            let review =
+                bellatrix::build_ruby_alias_review(&ruby_annotations, &lines, &translations);
+            let output = output.unwrap_or_else(|| bellatrix::ruby_review_path(&glossary_path));
+            pipeline::validate_distinct_input_output(&glossary_path, &output)?;
+            bellatrix::save_ruby_alias_review(&output, &review)?;
+
+            let actionable = review
+                .iter()
+                .filter(|entry| bellatrix::is_actionable_review_status(&entry.status))
+                .count();
+            println!(
+                "Ruby审核完成: {}（共 {} 条，{} 条需审核）",
+                output.display(),
+                review.len(),
+                actionable
+            );
+        }
     }
 
     Ok(())
 }
 
 /// Extract text lines from an EPUB or TXT file
-fn extract_text_lines(path: &std::path::Path) -> Result<Vec<String>> {
+fn extract_text_data(
+    path: &std::path::Path,
+) -> Result<(Vec<String>, Vec<betelgeuse::RubyAnnotation>)> {
     let ext = path
         .extension()
         .unwrap_or_default()
@@ -354,12 +494,12 @@ fn extract_text_lines(path: &std::path::Path) -> Result<Vec<String>> {
 
     match ext.as_str() {
         "epub" => {
-            let lines = betelgeuse::extract_epub_lines(path)?;
-            Ok(lines)
+            let extraction = betelgeuse::extract_epub_text(path)?;
+            Ok((extraction.lines, extraction.ruby_annotations))
         }
         "txt" => {
             let lines = betelgeuse::extract_txt_lines(path)?;
-            Ok(lines)
+            Ok((lines, Vec::new()))
         }
         _ => {
             anyhow::bail!("不支持的文件格式: .{} (仅支持 .epub / .txt)", ext);
