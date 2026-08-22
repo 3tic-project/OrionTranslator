@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "betelgeuse",   # EPUB/TXT text extraction library
+    "modernbert-ner", # ModernBERT-JA NER inference (CPU + WGPU)
     "rigel",        # NER HTTP API server (standalone deploy)
     "bellatrix",    # Embedded NER inference library
     "mintaka",      # NER CLI tool (HTTP client mode)

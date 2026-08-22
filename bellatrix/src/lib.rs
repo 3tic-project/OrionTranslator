@@ -1,27 +1,233 @@
+#![recursion_limit = "512"]
+
 pub mod detector;
-pub mod embedding;
 pub mod llm;
-pub mod loader;
-pub mod model;
-pub mod ner;
-pub mod tokenizer;
+
+/// Compatibility re-exports for callers that used `bellatrix::ner` types.
+pub mod ner {
+    pub use modernbert_ner::{NerEntity, NerResult};
+}
 
 use anyhow::Result;
-use burn::tensor::backend::Backend;
 use log::info;
+use modernbert_ner::{CpuNerPipeline, InferOptions, NerResult};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use crate::loader::{build_model_config, load_ner_config, load_ner_model_from_safetensors};
-use crate::ner::NerPipeline;
-use crate::tokenizer::JapaneseBertTokenizer;
-use burn::module::Module;
+const NER_MAX_LENGTH: usize = 256;
+const AUTO_BENCH_LINES: usize = 400;
+
+/// Runtime backend used by the embedded ModernBERT NER pipeline.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NerBackend {
+    Cpu,
+    Gpu,
+    #[default]
+    Auto,
+}
+
+impl NerBackend {
+    pub const ALL: [Self; 3] = [Self::Cpu, Self::Gpu, Self::Auto];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Cpu => 0,
+            Self::Gpu => 1,
+            Self::Auto => 2,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Cpu,
+            1 => Self::Gpu,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Gpu => "GPU",
+            Self::Auto => "Auto",
+        }
+    }
+}
+
+pub(crate) enum LoadedNerPipeline {
+    Cpu(CpuNerPipeline),
+    #[cfg(feature = "wgpu")]
+    Gpu(modernbert_ner::NerPipeline<burn::backend::Wgpu>),
+}
+
+impl LoadedNerPipeline {
+    /// Run the same length-aware packing and scheduling path used by the
+    /// standalone modernbert-ner CLI. CPU packs are dynamically distributed
+    /// across workers; GPU packs remain sequential on one device queue.
+    pub(crate) fn predict_document(
+        &self,
+        texts: &[String],
+        progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+    ) -> Result<Vec<NerResult>> {
+        match self {
+            Self::Cpu(pipeline) => predict_document_cpu(pipeline, texts, progress),
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(pipeline) => catch_unwind(AssertUnwindSafe(|| {
+                let options = &pipeline.options;
+                let packs = modernbert_ner::pack_texts(
+                    texts,
+                    options.max_sentences,
+                    options.max_tokens,
+                    options.sort_by_length,
+                );
+                let total = packs.len();
+                let mut pack_results = Vec::with_capacity(total);
+                for (index, pack) in packs.iter().enumerate() {
+                    let refs: Vec<&str> = pack.texts.iter().map(String::as_str).collect();
+                    pack_results.push(pipeline.predict_batch(&refs)?);
+                    if let Some(report) = progress {
+                        report(index + 1, total);
+                    }
+                }
+                Ok::<_, anyhow::Error>(modernbert_ner::pack::unsort_results(
+                    texts.len(),
+                    &packs,
+                    pack_results,
+                ))
+            }))
+            .map_err(|payload| {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("WGPU 推理发生未知 panic");
+                anyhow::anyhow!("GPU NER 推理失败: {detail}")
+            })?,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Cpu(_) => "CPU",
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(_) => "GPU (WGPU)",
+        }
+    }
+
+    fn scheduling_summary(&self) -> String {
+        let (options, workers) = match self {
+            Self::Cpu(pipeline) => (&pipeline.options, cpu_worker_limit()),
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(pipeline) => (&pipeline.options, 1),
+        };
+        format!(
+            "NER 调度：{}，batch 上限 {}，token 预算 {}，长度排序 {}，worker {}",
+            self.label(),
+            options.max_sentences,
+            options.max_tokens,
+            if options.sort_by_length {
+                "开启"
+            } else {
+                "关闭"
+            },
+            workers,
+        )
+    }
+}
+
+fn cpu_worker_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .max(1)
+}
+
+fn predict_document_cpu(
+    pipeline: &CpuNerPipeline,
+    texts: &[String],
+    progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+) -> Result<Vec<NerResult>> {
+    let options = &pipeline.options;
+    let packs = modernbert_ner::pack_texts(
+        texts,
+        options.max_sentences,
+        options.max_tokens,
+        options.sort_by_length,
+    );
+    if packs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let jobs = cpu_worker_limit().min(packs.len());
+    let workers: Vec<CpuNerPipeline> = (0..jobs).map(|_| pipeline.clone()).collect();
+
+    // Longest-processing-time order avoids leaving one expensive pack as the
+    // tail of a worker. Results are restored to document order below.
+    let mut order: Vec<usize> = (0..packs.len()).collect();
+    order.sort_by_key(|&index| {
+        std::cmp::Reverse(
+            packs[index]
+                .texts
+                .iter()
+                .map(|text| text.chars().count())
+                .sum::<usize>(),
+        )
+    });
+
+    let cursor = AtomicUsize::new(0);
+    let completed = Mutex::new(0usize);
+    let total = packs.len();
+    let partials: Vec<Vec<(usize, Vec<NerResult>)>> = workers
+        .into_par_iter()
+        .map(|worker| -> Result<Vec<(usize, Vec<NerResult>)>> {
+            let mut local = Vec::new();
+            loop {
+                let slot = cursor.fetch_add(1, Ordering::Relaxed);
+                if slot >= total {
+                    break;
+                }
+                let pack_index = order[slot];
+                let pack = &packs[pack_index];
+                let refs: Vec<&str> = pack.texts.iter().map(String::as_str).collect();
+                local.push((pack_index, worker.predict_batch(&refs)?));
+                if let Some(report) = progress {
+                    // Serialize the counter and callback so concurrent workers
+                    // cannot publish progress in decreasing order.
+                    let mut done = completed.lock().expect("NER progress mutex poisoned");
+                    *done += 1;
+                    report(*done, total);
+                }
+            }
+            Ok(local)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut by_pack: Vec<Option<Vec<NerResult>>> = (0..packs.len()).map(|_| None).collect();
+    for partial in partials {
+        for (pack_index, results) in partial {
+            by_pack[pack_index] = Some(results);
+        }
+    }
+    let pack_results = by_pack
+        .into_iter()
+        .map(|results| results.expect("missing NER pack result"))
+        .collect();
+    Ok(modernbert_ner::pack::unsort_results(
+        texts.len(),
+        &packs,
+        pack_results,
+    ))
+}
 
 /// Progress callback for glossary generation
 pub type GlossaryProgressCallback = Option<Arc<dyn Fn(GlossaryProgressEvent) + Send + Sync>>;
@@ -52,85 +258,204 @@ fn emit(cb: &GlossaryProgressCallback, event: GlossaryProgressEvent) {
     }
 }
 
-/// Load the NER pipeline from a model directory.
-/// Returns an `Arc<Mutex<NerPipeline>>` that can be shared across tasks.
-pub fn load_ner_pipeline<B: Backend + 'static>(
-    model_dir: &str,
-    device: B::Device,
-) -> Result<Arc<Mutex<NerPipeline<B>>>> {
-    let model_path = format!("{}/model.safetensors", model_dir);
-    let config_path = format!("{}/config.json", model_dir);
-    let vocab_path = format!("{}/vocab.txt", model_dir);
+fn infer_options(batch_size: usize, gpu: bool) -> InferOptions {
+    let default_batch = if gpu { 128 } else { 24 };
+    InferOptions {
+        max_sentences: if batch_size == 0 {
+            default_batch
+        } else {
+            batch_size
+        },
+        max_tokens: if gpu { 32_768 } else { 1_536 },
+        sort_by_length: true,
+        skip_scores: false,
+    }
+}
 
-    // Verify all required files exist, with clear error messages
+fn validate_model_dir(model_dir: &Path) -> Result<()> {
     let model_dir_abs =
-        std::fs::canonicalize(model_dir).unwrap_or_else(|_| std::path::PathBuf::from(model_dir));
-    for (name, path) in [
-        ("config.json", &config_path),
-        ("model.safetensors", &model_path),
-        ("vocab.txt", &vocab_path),
-    ] {
-        if !Path::new(path).exists() {
+        std::fs::canonicalize(model_dir).unwrap_or_else(|_| model_dir.to_path_buf());
+    for name in ["config.json", "model.safetensors", "tokenizer.json"] {
+        let path = model_dir.join(name);
+        if !path.is_file() {
             anyhow::bail!(
-                "NER模型文件不存在: {}\n  查找路径: {}\n  模型目录: {} ({})",
+                "ModernBERT NER模型文件不存在: {}\n  查找路径: {}\n  模型目录: {}",
                 name,
-                path,
-                model_dir,
+                path.display(),
                 model_dir_abs.display()
             );
         }
     }
+    Ok(())
+}
 
-    info!("Loading NER config from: {}", config_path);
-    let ner_config = load_ner_config(Path::new(&config_path))
-        .map_err(|e| anyhow::anyhow!("加载NER配置失败 ({}): {}", config_path, e))?;
-    info!(
-        "Model config: hidden_size={}, layers={}, labels={:?}",
-        ner_config.hidden_size, ner_config.num_hidden_layers, ner_config.id2label
-    );
+fn load_cpu_pipeline(model_dir: &Path, batch_size: usize) -> Result<LoadedNerPipeline> {
+    let pipeline = modernbert_ner::load_pipeline_cpu(model_dir, NER_MAX_LENGTH)?
+        .with_options(infer_options(batch_size, false));
+    Ok(LoadedNerPipeline::Cpu(pipeline))
+}
 
-    let model_config = build_model_config(&ner_config);
-    let num_labels = ner_config.num_labels();
+#[cfg(feature = "wgpu")]
+fn load_gpu_pipeline(model_dir: &Path, batch_size: usize) -> Result<LoadedNerPipeline> {
+    let loaded = catch_unwind(AssertUnwindSafe(|| {
+        modernbert_ner::load_pipeline_wgpu(model_dir, NER_MAX_LENGTH)
+            .map(|pipeline| pipeline.with_options(infer_options(batch_size, true)))
+    }))
+    .map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("WGPU 初始化发生未知 panic");
+        anyhow::anyhow!("GPU 后端初始化失败: {detail}")
+    })??;
 
-    info!("Loading weights from: {}", model_path);
-    let record = load_ner_model_from_safetensors::<B>(Path::new(&model_path), &ner_config, &device)
-        .map_err(|e| anyhow::anyhow!("加载NER模型权重失败 ({}): {}", model_path, e))?;
+    Ok(LoadedNerPipeline::Gpu(loaded))
+}
 
-    let model = model_config
-        .init_for_token_classification::<B>(num_labels, &device)
-        .load_record(record);
-    info!("NER model loaded successfully");
+#[cfg(not(feature = "wgpu"))]
+fn load_gpu_pipeline(_model_dir: &Path, _batch_size: usize) -> Result<LoadedNerPipeline> {
+    anyhow::bail!("当前构建未启用 WGPU，无法使用 GPU NER 后端")
+}
 
-    let default_dict_path = format!("{}/system.dic.zst", model_dir);
-    let dict_path: Option<String> = std::env::var("MECAB_DICT_PATH").ok().or_else(|| {
-        if Path::new(&default_dict_path).exists() {
-            Some(default_dict_path.clone())
-        } else {
-            None
+fn benchmark_sample(lines: &[String]) -> Vec<String> {
+    let valid: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.trim().chars().count() >= 2)
+        .collect();
+    if valid.len() <= AUTO_BENCH_LINES {
+        return valid.into_iter().cloned().collect();
+    }
+
+    let stride = valid.len() as f64 / AUTO_BENCH_LINES as f64;
+    (0..AUTO_BENCH_LINES)
+        .map(|index| valid[((index as f64 * stride) as usize).min(valid.len() - 1)].clone())
+        .collect()
+}
+
+fn run_benchmark(pipeline: &LoadedNerPipeline, sample: &[String]) -> Result<f64> {
+    if sample.is_empty() {
+        anyhow::bail!("没有可用于 NER 后端基准测试的有效文本");
+    }
+
+    // Warm exactly the shapes that will be timed. In particular, Burn/WGPU
+    // autotunes per shape, so a smaller warmup batch would charge compilation
+    // work only to the GPU's timed pass.
+    pipeline.predict_document(sample, None)?;
+
+    let chars: usize = sample.iter().map(|line| line.chars().count()).sum();
+    let started = Instant::now();
+    pipeline.predict_document(sample, None)?;
+    Ok(chars as f64 / started.elapsed().as_secs_f64().max(1e-9))
+}
+
+fn load_ner_pipeline(
+    model_dir: &Path,
+    backend: NerBackend,
+    lines: &[String],
+    batch_size: usize,
+    progress: &GlossaryProgressCallback,
+) -> Result<LoadedNerPipeline> {
+    validate_model_dir(model_dir)?;
+
+    match backend {
+        NerBackend::Cpu => {
+            emit(
+                progress,
+                GlossaryProgressEvent::StageStarted {
+                    stage: "初始化".to_string(),
+                    detail: "加载 ModernBERT NER（CPU）...".to_string(),
+                },
+            );
+            load_cpu_pipeline(model_dir, batch_size)
         }
-    });
+        NerBackend::Gpu => {
+            emit(
+                progress,
+                GlossaryProgressEvent::StageStarted {
+                    stage: "初始化".to_string(),
+                    detail: "加载 ModernBERT NER（GPU/WGPU）...".to_string(),
+                },
+            );
+            load_gpu_pipeline(model_dir, batch_size)
+        }
+        NerBackend::Auto => {
+            let sample = benchmark_sample(lines);
+            let sample_chars: usize = sample.iter().map(|line| line.chars().count()).sum();
+            emit(
+                progress,
+                GlossaryProgressEvent::StageStarted {
+                    stage: "后端基准".to_string(),
+                    detail: format!(
+                        "抽样 {} 行 / {} 字，预热后比较 CPU 与 GPU...",
+                        sample.len(),
+                        sample_chars
+                    ),
+                },
+            );
 
-    info!("Loading tokenizer from: {}", vocab_path);
-    let tokenizer_obj = JapaneseBertTokenizer::new(&vocab_path, dict_path.as_deref(), 512)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "加载分词器失败 (vocab: {}, dict: {:?}): {}",
-                vocab_path,
-                dict_path,
-                e
-            )
-        })?;
-    info!("NER tokenizer loaded successfully");
+            let cpu = load_cpu_pipeline(model_dir, batch_size)?;
+            let cpu_rate = run_benchmark(&cpu, &sample)?;
+            emit(
+                progress,
+                GlossaryProgressEvent::Log {
+                    message: format!("Auto 基准：CPU {:.0} 字/秒", cpu_rate),
+                },
+            );
 
-    let pipeline = NerPipeline::new(
-        model,
-        tokenizer_obj,
-        ner_config.id2label.clone(),
-        ner_config.pad_token_id,
-        device,
-    );
+            let gpu_attempt = catch_unwind(AssertUnwindSafe(|| {
+                let gpu = load_gpu_pipeline(model_dir, batch_size)?;
+                let rate = run_benchmark(&gpu, &sample)?;
+                Ok::<_, anyhow::Error>((gpu, rate))
+            }));
 
-    Ok(Arc::new(Mutex::new(pipeline)))
+            match gpu_attempt {
+                Ok(Ok((gpu, gpu_rate))) => {
+                    emit(
+                        progress,
+                        GlossaryProgressEvent::Log {
+                            message: format!("Auto 基准：GPU {:.0} 字/秒", gpu_rate),
+                        },
+                    );
+                    if gpu_rate > cpu_rate {
+                        emit(
+                            progress,
+                            GlossaryProgressEvent::Log {
+                                message: "Auto 已选择 GPU（当前文档抽样更快）".to_string(),
+                            },
+                        );
+                        Ok(gpu)
+                    } else {
+                        emit(
+                            progress,
+                            GlossaryProgressEvent::Log {
+                                message: "Auto 已选择 CPU（当前文档抽样更快）".to_string(),
+                            },
+                        );
+                        Ok(cpu)
+                    }
+                }
+                Ok(Err(error)) => {
+                    emit(
+                        progress,
+                        GlossaryProgressEvent::Log {
+                            message: format!("Auto：GPU 不可用，回退 CPU：{error:#}"),
+                        },
+                    );
+                    Ok(cpu)
+                }
+                Err(_) => {
+                    emit(
+                        progress,
+                        GlossaryProgressEvent::Log {
+                            message: "Auto：GPU 后端发生异常，已安全回退 CPU".to_string(),
+                        },
+                    );
+                    Ok(cpu)
+                }
+            }
+        }
+    }
 }
 
 /// Configuration for glossary generation
@@ -142,8 +467,10 @@ pub struct GlossaryConfig {
     pub ruby_annotations: Vec<betelgeuse::RubyAnnotation>,
     /// NER model directory
     pub model_dir: String,
-    /// NER batch size
+    /// NER batch size. 0 selects backend-tuned defaults (CPU 24 / GPU 128).
     pub ner_batch_size: usize,
+    /// CPU, GPU, or a short benchmark before full inference.
+    pub ner_backend: NerBackend,
     /// Minimum character occurrence count
     pub min_count: usize,
     /// LLM API URL
@@ -278,11 +605,8 @@ impl RubyAliasReviewDocument {
 }
 
 impl GlossaryConfig {
-    /// 校验会触发 panic/永久等待的参数（`step_by(0)`、0-permit semaphore）。
+    /// 校验会触发永久等待或无意义结果的参数。
     pub fn validate(&self) -> Result<()> {
-        if self.ner_batch_size == 0 {
-            anyhow::bail!("ner_batch_size 必须 >= 1（当前为 0，会导致 step_by panic）");
-        }
         if !self.skip_llm_translation && self.llm_workers == 0 {
             anyhow::bail!("llm_workers 必须 >= 1（当前为 0，会导致信号量永久等待）");
         }
@@ -294,39 +618,18 @@ impl GlossaryConfig {
 }
 
 /// Run the full glossary generation pipeline:
-/// 1. Load NER model (wgpu)
+/// 1. Load the ModernBERT NER model on the requested backend
 /// 2. Run NER to detect characters from provided text lines
 /// 3. Use LLM to translate names and generate glossary
 /// 4. Save glossary JSON
 ///
 /// Callers must extract text lines from EPUB/TXT before calling this.
 /// Returns the path to the saved glossary file.
-#[cfg(feature = "wgpu")]
 pub async fn generate_glossary(
     config: GlossaryConfig,
     progress: GlossaryProgressCallback,
 ) -> Result<std::path::PathBuf> {
-    use burn::backend::wgpu::{Wgpu, WgpuDevice};
-
     config.validate()?;
-
-    emit(
-        &progress,
-        GlossaryProgressEvent::StageStarted {
-            stage: "初始化".to_string(),
-            detail: "加载NER模型 (WGPU)...".to_string(),
-        },
-    );
-
-    let device = WgpuDevice::default();
-    let pipeline = load_ner_pipeline::<Wgpu>(&config.model_dir, device)?;
-
-    emit(
-        &progress,
-        GlossaryProgressEvent::Log {
-            message: "NER模型加载完成".to_string(),
-        },
-    );
 
     let lines = &config.lines;
     if lines.is_empty() {
@@ -340,6 +643,28 @@ pub async fn generate_glossary(
         },
     );
 
+    let pipeline = load_ner_pipeline(
+        Path::new(&config.model_dir),
+        config.ner_backend,
+        lines,
+        config.ner_batch_size,
+        &progress,
+    )?;
+
+    info!("ModernBERT NER loaded on {}", pipeline.label());
+    emit(
+        &progress,
+        GlossaryProgressEvent::Log {
+            message: format!("ModernBERT NER 模型加载完成，使用 {}", pipeline.label()),
+        },
+    );
+    emit(
+        &progress,
+        GlossaryProgressEvent::Log {
+            message: pipeline.scheduling_summary(),
+        },
+    );
+
     // Run NER detection
     emit(
         &progress,
@@ -349,23 +674,15 @@ pub async fn generate_glossary(
         },
     );
 
-    // `pipeline` (Arc<Mutex<NerPipeline>>) is moved into detect_characters_embedded.
-    // When that function returns, the Arc's reference count drops to zero and
-    // the model weights / GPU buffers are freed before LLM translation starts.
-    let characters = detector::detect_characters_embedded(
-        lines,
-        pipeline,
-        config.ner_batch_size,
-        config.min_count,
-        progress.clone(),
-    )
-    .await?;
+    let characters =
+        detector::detect_characters_embedded(lines, &pipeline, config.min_count, progress.clone())
+            .await?;
 
-    // NER pipeline Arc was consumed above — GPU memory is released here.
+    drop(pipeline);
     emit(
         &progress,
         GlossaryProgressEvent::Log {
-            message: "NER模型已卸载，GPU内存已释放".to_string(),
+            message: "NER模型已卸载，推理内存已释放".to_string(),
         },
     );
 
@@ -1024,6 +1341,7 @@ mod tests {
             ruby_annotations: Vec::new(),
             model_dir: ".".into(),
             ner_batch_size: 8,
+            ner_backend: NerBackend::Auto,
             min_count: 1,
             llm_url: "http://127.0.0.1/v1".into(),
             llm_api_key: String::new(),
@@ -1035,10 +1353,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_batch_and_workers() {
+    fn validate_accepts_auto_batch_and_rejects_zero_workers() {
         let mut cfg = sample_config();
         cfg.ner_batch_size = 0;
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
 
         let mut cfg = sample_config();
         cfg.llm_workers = 0;
@@ -1057,6 +1375,84 @@ mod tests {
     fn is_generic_model_detects_orion_substring() {
         assert!(!is_generic_model("Orion-Qwen3-1.7B-SFT"));
         assert!(is_generic_model("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn ner_backend_order_matches_gui_and_roundtrips() {
+        assert_eq!(
+            NerBackend::ALL.map(NerBackend::label),
+            ["CPU", "GPU", "Auto"]
+        );
+        for (index, backend) in NerBackend::ALL.into_iter().enumerate() {
+            assert_eq!(NerBackend::from_index(index), backend);
+            let json = serde_json::to_string(&backend).unwrap();
+            assert_eq!(serde_json::from_str::<NerBackend>(&json).unwrap(), backend);
+        }
+    }
+
+    #[test]
+    fn backend_tuned_batch_defaults_match_modernbert_cli() {
+        let cpu = infer_options(0, false);
+        assert_eq!((cpu.max_sentences, cpu.max_tokens), (24, 1_536));
+
+        let gpu = infer_options(0, true);
+        assert_eq!((gpu.max_sentences, gpu.max_tokens), (128, 32_768));
+
+        assert_eq!(infer_options(48, false).max_sentences, 48);
+        assert_eq!(infer_options(48, true).max_sentences, 48);
+    }
+
+    #[test]
+    fn auto_benchmark_sample_is_short_and_spans_document() {
+        let lines: Vec<String> = (0..1000)
+            .map(|index| format!("第{index}行の文章"))
+            .collect();
+        let sample = benchmark_sample(&lines);
+        assert_eq!(sample.len(), AUTO_BENCH_LINES);
+        assert_eq!(sample.first(), lines.first());
+        assert!(sample.last().unwrap().contains("997"));
+    }
+
+    #[test]
+    #[ignore = "loads the real checkpoint and initializes the system GPU"]
+    fn auto_backend_benchmarks_real_cpu_and_gpu() {
+        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../alnilam/ner_model");
+        if !model_dir.join("model.safetensors").is_file() {
+            return;
+        }
+
+        let seeds = [
+            "橘真児は東京で美咲と会った。",
+            "艾莉同学は教室へ向かった。",
+            "健太と志保子が廊下で話している。",
+            "沙由美ちゃんが図書館から帰ってきた。",
+        ];
+        let lines: Vec<String> = (0..AUTO_BENCH_LINES)
+            .map(|index| format!("{} 第{}章", seeds[index % seeds.len()], index + 1))
+            .collect();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = events.clone();
+        let progress: GlossaryProgressCallback = Some(Arc::new(move |event| {
+            if let GlossaryProgressEvent::Log { message } = event {
+                captured.lock().unwrap().push(message);
+            }
+        }));
+
+        let pipeline = load_ner_pipeline(&model_dir, NerBackend::Auto, &lines, 0, &progress)
+            .expect("Auto backend should select a working pipeline");
+        let results = pipeline
+            .predict_document(&lines, None)
+            .expect("selected backend inference");
+        assert_eq!(results.len(), lines.len());
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|message| message.contains("CPU")));
+        assert!(events
+            .iter()
+            .any(|message| message.contains("GPU") || message.contains("回退 CPU")));
+        for event in events.iter() {
+            eprintln!("{event}");
+        }
     }
 
     fn ruby(base: &str, reading: &str) -> betelgeuse::RubyAnnotation {

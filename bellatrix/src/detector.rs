@@ -1,11 +1,8 @@
-use crate::ner::{NerEntity, NerPipeline};
-use crate::{emit, GlossaryProgressCallback, GlossaryProgressEvent};
+use crate::ner::NerEntity;
+use crate::{emit, GlossaryProgressCallback, GlossaryProgressEvent, LoadedNerPipeline};
 use anyhow::Result;
-use burn::tensor::backend::Backend;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 const PERSON_TYPES: &[&str] = &["PER", "PERSON"];
 const MIN_SCORE: f32 = 0.9;
@@ -110,17 +107,12 @@ fn process_batch_entities(
 }
 
 /// Detect characters using an embedded NER pipeline (no HTTP).
-pub async fn detect_characters_embedded<B: Backend + 'static>(
+pub(crate) async fn detect_characters_embedded(
     lines: &[String],
-    pipeline: Arc<Mutex<NerPipeline<B>>>,
-    batch_size: usize,
+    pipeline: &LoadedNerPipeline,
     min_count: usize,
     progress: GlossaryProgressCallback,
 ) -> Result<HashMap<String, CharacterInfo>> {
-    if batch_size == 0 {
-        anyhow::bail!("NER batch_size 必须 >= 1");
-    }
-
     // Filter valid lines
     let mut valid_lines: Vec<String> = Vec::new();
     let mut line_indices: Vec<usize> = Vec::new();
@@ -148,55 +140,24 @@ pub async fn detect_characters_embedded<B: Backend + 'static>(
         return Ok(HashMap::new());
     }
 
-    // Create batches
-    let mut batches: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
-    for i in (0..valid_lines.len()).step_by(batch_size) {
-        let end = (i + batch_size).min(valid_lines.len());
-        let batch_texts = valid_lines[i..end].to_vec();
-        let batch_indices_slice = line_indices[i..end].to_vec();
-        batches.push((batch_texts, batch_indices_slice));
-    }
-
-    let total_batches = batches.len();
     emit(
         &progress,
         GlossaryProgressEvent::Log {
-            message: format!(
-                "开始NER批量处理 ({} 个批次，每批 {} 行)",
-                total_batches, batch_size
-            ),
+            message: "开始 NER 长度打包与后端优化推理".to_string(),
         },
     );
 
-    let mut character_mentions: HashMap<String, Vec<Mention>> = HashMap::new();
-
-    for (batch_idx, (batch_texts, batch_idx_list)) in batches.into_iter().enumerate() {
-        // Run inference under lock
-        let texts_ref: Vec<&str> = batch_texts.iter().map(|s| s.as_str()).collect();
-        let results = {
-            let pipe = pipeline.lock().await;
-            pipe.predict_batch(&texts_ref)?
-        };
-
-        // Convert NerResult → entities per text
-        let entities_per_text: Vec<Vec<NerEntity>> =
-            results.into_iter().map(|r| r.entities).collect();
-
-        let batch_mentions =
-            process_batch_entities(&entities_per_text, &batch_texts, &batch_idx_list, lines);
-
-        for (name, mentions) in batch_mentions {
-            character_mentions.entry(name).or_default().extend(mentions);
-        }
-
+    let report_progress = |completed, total| {
         emit(
             &progress,
-            GlossaryProgressEvent::NerProgress {
-                completed: batch_idx + 1,
-                total: total_batches,
-            },
+            GlossaryProgressEvent::NerProgress { completed, total },
         );
-    }
+    };
+    let results = pipeline.predict_document(&valid_lines, Some(&report_progress))?;
+    let entities_per_text: Vec<Vec<NerEntity>> =
+        results.into_iter().map(|result| result.entities).collect();
+    let character_mentions =
+        process_batch_entities(&entities_per_text, &valid_lines, &line_indices, lines);
 
     // Filter by min_count
     let mut characters: HashMap<String, CharacterInfo> = HashMap::new();

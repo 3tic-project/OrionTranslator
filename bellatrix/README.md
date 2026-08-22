@@ -1,10 +1,12 @@
 # Bellatrix
 
-嵌入式 NER 模型推理 + 术语表生成库。使用 Burn 框架在进程内直接运行 BERT Token Classification 模型，无需启动 HTTP 服务。
+嵌入式 NER + 术语表生成库。底层使用 `modernbert-ner` 在进程内运行 ModernBERT-JA Token Classification 模型，无需启动 HTTP 服务。
 
 ## 功能
 
-- **嵌入式推理**：BERT NER 模型直接在进程内运行（wgpu / ndarray 后端）
+- **嵌入式推理**：专用 CPU 引擎或 WGPU 后端
+- **自动选后端**：从当前文档均匀抽样最多 400 行，分别完整预热、测速并使用更快的后端；GPU 不可用时回退 CPU
+- **优化调度**：按长度打包；CPU 默认 24 行 / 1536 token 并使用全部逻辑核动态调度，GPU 默认 128 行 / 32768 token
 - **人物检测**：从日语文本中识别人名实体，按出现频次聚合
 - **术语表生成**：NER 识别 → 人名聚类 → LLM 翻译 → 术语表 JSON，一键完成
 - **进度回调**：`GlossaryProgressCallback` 支持实时进度上报
@@ -13,12 +15,7 @@
 
 ```
 bellatrix/src/
-├── lib.rs          # 公共 API：generate_glossary(), GlossaryConfig, load_ner_pipeline()
-├── model.rs        # BERT 模型定义（Burn Module）
-├── embedding.rs    # BERT 嵌入层
-├── loader.rs       # SafeTensors → Burn 权重加载（candle-core）
-├── tokenizer.rs    # 日语 BERT 字符级分词器（vibrato/MeCab）
-├── ner.rs          # NER 推理管线（分词 → 推理 → BIO 解码）
+├── lib.rs          # 公共 API、CPU/GPU/Auto 选择和 Auto 基准
 ├── detector.rs     # 人物检测（批量 NER + 实体聚合 + 上下文收集）
 └── llm.rs          # LLM 人名翻译（聚类 + 性别推断 + 后缀映射）
 ```
@@ -26,12 +23,14 @@ bellatrix/src/
 ## 公共 API
 
 ```rust
-use bellatrix::{GlossaryConfig, generate_glossary, GlossaryProgressEvent};
+use bellatrix::{GlossaryConfig, NerBackend, generate_glossary};
 
 let config = GlossaryConfig {
     lines: text_lines,
     ruby_annotations, // TXT 可传 Vec::new()
     model_dir: "ner_model".to_string(),
+    ner_batch_size: 0, // 使用后端优化默认值
+    ner_backend: NerBackend::Auto,
     llm_url: "https://api.deepseek.com".to_string(),
     llm_model: "deepseek-v4-flash".to_string(),
     // ...
@@ -46,18 +45,17 @@ EPUB 有 ruby 证据时会额外生成 `*.ruby-candidates.json`。候选按 `con
 
 ```
 ner_model/
-├── model.safetensors   # BERT 权重
+├── model.safetensors   # ModernBERT-JA 权重
 ├── config.json         # HuggingFace 配置
-├── vocab.txt           # 词表
-└── system.dic.zst      # MeCab 词典（可选，提升分词精度）
+└── tokenizer.json      # HuggingFace tokenizer
 ```
 
 ## 编译特性
 
 | Feature | 说明 |
 |---------|------|
-| `wgpu`（默认） | GPU 推理 |
-| `ndarray` | CPU 推理 |
+| `wgpu`（默认） | 启用 GPU 推理；专用 CPU 引擎始终可用 |
+| `ndarray` | 启用 Burn CPU 参考后端（生产流程不使用） |
 
 ## 被依赖
 

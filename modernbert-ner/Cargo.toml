@@ -1,0 +1,40 @@
+[package]
+name = "modernbert-ner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "ModernBERT-JA token-classification NER inference (Burn: wgpu + CPU)"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "modernbert-ner"
+path = "src/main.rs"
+
+[features]
+default = ["ndarray", "wgpu"]
+# Burn `ndarray` reference backend. Not a fast path — it exists so the hand-written
+# kernels in `cpu.rs` can be cross-checked without a GPU. `burn/simd` is required
+# because burn is pulled in with default-features off.
+ndarray = ["burn/ndarray", "burn/simd"]
+# Likewise `fusion`/`autotune` are burn-wgpu defaults that default-features = false drops.
+# (`burn/metal` would compile kernels to MSL, but it fails shader validation on the
+# tested AMD/Metal driver, so it is deliberately not offered.)
+wgpu = ["burn/wgpu", "burn/fusion", "burn/autotune"]
+
+[dependencies]
+anyhow = "1.0"
+burn = { version = "0.20.1", default-features = false, features = ["std"] }
+candle-core = "0.8.4"
+clap = { version = "4.6", features = ["derive"] }
+log = "0.4"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+env_logger = "0.11"
+mimalloc = { version = "0.1.52", default-features = false }
+gemm = { version = "0.17", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3.23"

@@ -6,21 +6,17 @@ description = "Embedded NER model inference + glossary generation library"
 
 [features]
 default = ["wgpu"]
-wgpu = ["burn/wgpu"]
-ndarray = ["burn/ndarray"]
+wgpu = ["burn/wgpu", "modernbert-ner/wgpu"]
+ndarray = ["modernbert-ner/ndarray"]
 
 [dependencies]
-# Burn framework
+# Burn is retained only for the concrete WGPU pipeline type exposed by
+# modernbert-ner. The old BERT model implementation is no longer compiled.
 burn = { version = "0.20.1", default-features = false, features = [
-  "dataset",
   "std",
 ] }
-cubecl-runtime = { version = "0.9.0", features = [
-  "channel-mpsc",
-] }
-
-# Safetensors loading via candle
-candle-core = { version = "0.8.4" }
+modernbert-ner = { path = "../modernbert-ner", default-features = false }
+rayon = "1.10"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -30,15 +26,8 @@ sha2 = "0.10"
 # Error handling
 anyhow = "1.0"
 
-# Japanese tokenizer
-vibrato = "0.5"
-zstd = "0.13"
-
 # Logging
 log = "0.4"
-
-# Math
-libm = "0.2.8"
 
 # HTTP client (for LLM API calls)
 reqwest = { version = "0.12", features = ["json"] }
