@@ -25,7 +25,13 @@ cd OrionTranslator
 cargo build --release -p alnitak
 ./target/release/alnitak
 ```
-准备 `modernbert_ja_30m_combined_ja` 模型，在主程序同目录下创建 `ner_model` 文件夹并放入模型文件。
+默认使用 [3tic/Orion-NER-30M-v1](https://huggingface.co/3tic/Orion-NER-30M-v1)。发布构建脚本会下载并校验锁定版本；本地开发可提前执行：
+
+```bash
+./scripts/fetch_ner_model.sh
+```
+
+模型放在 `alnilam/ner_model`，发布包中位于主程序旁或 macOS App 的 Resources 目录。
 
 最后的结构应如下所示：
 

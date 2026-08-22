@@ -35,6 +35,10 @@ BUILD_DIR="${DIST_DIR}/.build_windows"
 
 NER_MODEL_SRC="${PROJECT_ROOT}/alnilam/ner_model"
 
+# A full release must contain the pinned default model. Reuse a verified local
+# copy when available; otherwise download it from Hugging Face.
+"${SCRIPT_DIR}/fetch_ner_model.sh" "${NER_MODEL_SRC}"
+
 # ── 检测目标平台 ──────────────────────────────────────────────
 OS="$(uname -s)"
 case "${OS}" in
@@ -98,12 +102,9 @@ BASE_NAME="${ZIP_NAME}"
 FULL_STAGE="${BUILD_DIR}/full"
 mkdir -p "${FULL_STAGE}"
 cp "${BINARY_SRC}" "${FULL_STAGE}/${BINARY_NAME}${EXE_SUFFIX}"
-if [ -d "${NER_MODEL_SRC}" ]; then
-    echo "📂 拷贝 NER 模型…"
-    cp -R "${NER_MODEL_SRC}" "${FULL_STAGE}/ner_model"
-else
-    echo "⚠️  警告: 找不到 NER 模型目录 ${NER_MODEL_SRC}"
-fi
+echo "📂 拷贝 Orion-NER-30M-v1…"
+cp -R "${NER_MODEL_SRC}" "${FULL_STAGE}/ner_model"
+"${SCRIPT_DIR}/fetch_ner_model.sh" --verify-only "${FULL_STAGE}/ner_model"
 FULL_ZIP="${DIST_DIR}/${BASE_NAME}-Full.zip"
 (cd "${FULL_STAGE}" && zip -r -9 "${FULL_ZIP}" .)
 echo "✅ 完整版: ${FULL_ZIP} ($(du -h "${FULL_ZIP}" | cut -f1))"

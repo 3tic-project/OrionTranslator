@@ -37,6 +37,10 @@ APP_DIR="${BUILD_DIR}/${APP_BUNDLE}"
 NER_MODEL_SRC="${PROJECT_ROOT}/alnilam/ner_model"
 LOGO_SRC="${PROJECT_ROOT}/assets/logo.png"
 
+# A release must contain the pinned default model. Reuse a verified local copy
+# when available; otherwise download it from Hugging Face.
+"${SCRIPT_DIR}/fetch_ner_model.sh" "${NER_MODEL_SRC}"
+
 # ── 清理 ──────────────────────────────────────────────────────
 echo "🧹 清理旧构建产物…"
 rm -rf "${BUILD_DIR}"
@@ -83,13 +87,10 @@ cp "${PROJECT_ROOT}/target/release/${BINARY_NAME}" "${APP_DIR}/Contents/MacOS/${
 # 拷贝图标
 cp "${ICNS_PATH}" "${APP_DIR}/Contents/Resources/AppIcon.icns"
 
-# 拷贝 NER 模型
-if [ -d "${NER_MODEL_SRC}" ]; then
-    echo "📂 拷贝 NER 模型…"
-    cp -R "${NER_MODEL_SRC}" "${APP_DIR}/Contents/Resources/ner_model"
-else
-    echo "⚠️  警告: 找不到 NER 模型目录 ${NER_MODEL_SRC}，跳过"
-fi
+# 拷贝并复验 NER 模型
+echo "📂 拷贝 Orion-NER-30M-v1…"
+cp -R "${NER_MODEL_SRC}" "${APP_DIR}/Contents/Resources/ner_model"
+"${SCRIPT_DIR}/fetch_ner_model.sh" --verify-only "${APP_DIR}/Contents/Resources/ner_model"
 
 # ── 写入 Info.plist ───────────────────────────────────────────
 PB=/usr/libexec/PlistBuddy
