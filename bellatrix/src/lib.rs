@@ -20,11 +20,13 @@ use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+use std::time::SystemTime;
 
 const NER_MAX_LENGTH: usize = 256;
-const AUTO_BENCH_LINES: usize = 400;
+const AUTO_BENCH_LINES: usize = 128;
+static AUTO_BACKEND_CACHE: OnceLock<Mutex<HashMap<String, NerBackend>>> = OnceLock::new();
 
 /// Runtime backend used by the embedded ModernBERT NER pipeline.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -333,6 +335,36 @@ fn benchmark_sample(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn auto_backend_cache_key(model_dir: &Path, batch_size: usize) -> String {
+    let canonical = fs::canonicalize(model_dir).unwrap_or_else(|_| model_dir.to_path_buf());
+    let weights = model_dir.join("model.safetensors");
+    let metadata = fs::metadata(weights).ok();
+    let size = metadata.as_ref().map(|value| value.len()).unwrap_or(0);
+    let modified = metadata
+        .and_then(|value| value.modified().ok())
+        .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    format!("{}:{size}:{modified}:{batch_size}", canonical.display())
+}
+
+fn cached_auto_backend(key: &str) -> Option<NerBackend> {
+    AUTO_BACKEND_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(key).copied())
+}
+
+fn remember_auto_backend(key: String, backend: NerBackend) {
+    if let Ok(mut cache) = AUTO_BACKEND_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.insert(key, backend);
+    }
+}
+
 fn run_benchmark(pipeline: &LoadedNerPipeline, sample: &[String]) -> Result<f64> {
     if sample.is_empty() {
         anyhow::bail!("没有可用于 NER 后端基准测试的有效文本");
@@ -380,6 +412,35 @@ fn load_ner_pipeline(
             load_gpu_pipeline(model_dir, batch_size)
         }
         NerBackend::Auto => {
+            let cache_key = auto_backend_cache_key(model_dir, batch_size);
+            if let Some(cached) = cached_auto_backend(&cache_key) {
+                let loaded = match cached {
+                    NerBackend::Cpu => load_cpu_pipeline(model_dir, batch_size),
+                    NerBackend::Gpu => load_gpu_pipeline(model_dir, batch_size),
+                    NerBackend::Auto => unreachable!("Auto is never cached as a concrete backend"),
+                };
+                match loaded {
+                    Ok(pipeline) => {
+                        emit(
+                            progress,
+                            GlossaryProgressEvent::Log {
+                                message: format!(
+                                    "Auto 复用本次应用会话的 {} 基准结果（模型或batch变化时自动重测）",
+                                    cached.label()
+                                ),
+                            },
+                        );
+                        return Ok(pipeline);
+                    }
+                    Err(error) => emit(
+                        progress,
+                        GlossaryProgressEvent::Log {
+                            message: format!("Auto 缓存后端加载失败，重新基准：{error:#}"),
+                        },
+                    ),
+                }
+            }
+
             let sample = benchmark_sample(lines);
             let sample_chars: usize = sample.iter().map(|line| line.chars().count()).sum();
             emit(
@@ -424,6 +485,7 @@ fn load_ner_pipeline(
                                 message: "Auto 已选择 GPU（当前文档抽样更快）".to_string(),
                             },
                         );
+                        remember_auto_backend(cache_key, NerBackend::Gpu);
                         Ok(gpu)
                     } else {
                         emit(
@@ -432,6 +494,7 @@ fn load_ner_pipeline(
                                 message: "Auto 已选择 CPU（当前文档抽样更快）".to_string(),
                             },
                         );
+                        remember_auto_backend(cache_key, NerBackend::Cpu);
                         Ok(cpu)
                     }
                 }
@@ -442,6 +505,7 @@ fn load_ner_pipeline(
                             message: format!("Auto：GPU 不可用，回退 CPU：{error:#}"),
                         },
                     );
+                    remember_auto_backend(cache_key, NerBackend::Cpu);
                     Ok(cpu)
                 }
                 Err(_) => {
@@ -451,6 +515,7 @@ fn load_ner_pipeline(
                             message: "Auto：GPU 后端发生异常，已安全回退 CPU".to_string(),
                         },
                     );
+                    remember_auto_backend(cache_key, NerBackend::Cpu);
                     Ok(cpu)
                 }
             }
@@ -1426,7 +1491,7 @@ mod tests {
         let sample = benchmark_sample(&lines);
         assert_eq!(sample.len(), AUTO_BENCH_LINES);
         assert_eq!(sample.first(), lines.first());
-        assert!(sample.last().unwrap().contains("997"));
+        assert!(sample.last().unwrap().contains("992"));
     }
 
     #[test]
@@ -1460,12 +1525,20 @@ mod tests {
             .predict_document(&lines, None)
             .expect("selected backend inference");
         assert_eq!(results.len(), lines.len());
+        drop(pipeline);
+
+        let cached = load_ner_pipeline(&model_dir, NerBackend::Auto, &lines, 0, &progress)
+            .expect("cached Auto backend should reload without benchmarking");
+        drop(cached);
 
         let events = events.lock().unwrap();
         assert!(events.iter().any(|message| message.contains("CPU")));
         assert!(events
             .iter()
             .any(|message| message.contains("GPU") || message.contains("回退 CPU")));
+        assert!(events
+            .iter()
+            .any(|message| message.contains("复用本次应用会话")));
         for event in events.iter() {
             eprintln!("{event}");
         }
