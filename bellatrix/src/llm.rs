@@ -3,8 +3,9 @@ use crate::{emit, GlossaryProgressCallback, GlossaryProgressEvent};
 use anyhow::Result;
 use log::warn;
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const SYSTEM_PROMPT: &str = r#"你是一个轻小说翻译助手。现在给出一段通过NER识别出的"候选人物称呼/人名"，请你根据上下文判断它是否为人物名（不是地名/组织/家庭/职务称谓等）。
@@ -18,10 +19,27 @@ const SYSTEM_PROMPT: &str = r#"你是一个轻小说翻译助手。现在给出�
 3) translated_chinese_name 必须是简体中文或常用汉字（允许保留原本为汉字的人名写法），但禁止包含任何平假名/片假名/半角片假名；禁止包含空格。
 4) 如果无法确定性别或全名：对应字段返回null，不要猜。
 5) full_name 仅在上下文出现明确全名或强证据时填写，否则为null。
-6) translated_chinese_name 必须针对"输入的称呼/人名本身"给出翻译（不要把 full_name 直接当作翻译名）。"#;
+6) translated_chinese_name 必须针对"输入的称呼/人名本身"给出翻译（不要把 full_name 直接当作翻译名）。
+7) 输入已经去除了さん/ちゃん/先生/先輩等称谓；translated_chinese_name 不得自行补回老师、前辈、小姐等称谓。"#;
+
+const FINAL_REVIEW_SYSTEM_PROMPT: &str = r#"你是轻小说人物术语表的总审校。输入是一批初步NER+LLM结果及上下文，你需要在整批范围内消除误识别、边界污染、重复人物和译名不一致。
+
+只输出一个JSON对象（不要Markdown、不要解释）：
+{"decisions":[{"src":"必须原样复制输入src","keep":true|false,"dst":"保留时的最终简体中文译名或null","gender":"男性"|"女性"|"动物"|null,"full_name":"明确全名或null","reason":"简短原因"}]}
+
+规则：
+1) 每个输入src必须恰好返回一次，不得新增、合并或遗漏src。
+2) NER边界沾上助词/副词/上下文片段、普通词、地点、组织、宫殿、物品、目录项、纯职务/身份称谓时 keep=false。
+3) 姓名加先生/先輩/様等仍可保留，但dst称谓只能出现一次；同一人物的全名、姓、名、昵称和带敬称形式必须使用一致的核心译名。
+4) 不要仅因短名就删除；结合上下文和同批长名判断。证据不足时保持初步结果，不要凭空改名。
+5) dst只能是简体中文/常用汉字，不得含假名、空白，不得出现“老师老师”等重复称谓。
+6) gender/full_name只有明确证据时填写；无法确定返回null。"#;
 
 const MAX_CONTEXT_ITEMS: usize = 10;
 const MAX_CONTEXT_CHARS_PER_ITEM: usize = 220;
+const FINAL_REVIEW_BATCH_SIZE: usize = 24;
+const FINAL_REVIEW_CONTEXT_ITEMS: usize = 2;
+const FINAL_REVIEW_CONTEXT_CHARS: usize = 180;
 
 const HONORIFIC_SUFFIXES: &[&str] = &[
     "さん",
@@ -168,10 +186,23 @@ pub struct GlossaryGenerationIssue {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GlossaryReviewChange {
+    pub source: String,
+    pub before_dst: String,
+    pub after_dst: Option<String>,
+    pub before_info: String,
+    pub after_info: Option<String>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlossaryTranslationReport {
     pub entries: Vec<TranslationEntry>,
     pub issues: Vec<GlossaryGenerationIssue>,
+    pub review_changes: Vec<GlossaryReviewChange>,
+    pub review_batches: usize,
+    pub review_failures: usize,
 }
 
 impl GlossaryTranslationReport {
@@ -246,7 +277,7 @@ impl LlmClient {
     ) -> GlossaryTranslationReport {
         // 0 permits 会导致 acquire 永久阻塞
         let max_concurrent = max_concurrent.max(1);
-        let clusters = build_name_clusters(characters);
+        let (clusters, preprocessing_issues) = build_name_clusters(characters);
         let total = clusters.len();
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
         let client = self.client.clone();
@@ -288,7 +319,10 @@ impl LlmClient {
             handles.push((task_source, task_aliases, handle));
         }
 
-        let mut report = GlossaryTranslationReport::default();
+        let mut report = GlossaryTranslationReport {
+            issues: preprocessing_issues,
+            ..GlossaryTranslationReport::default()
+        };
         for (source, aliases, handle) in handles {
             match handle.await {
                 Ok(mut outcome) => {
@@ -310,14 +344,286 @@ impl LlmClient {
         }
 
         propagate_gender_within_canonical(&mut report.entries);
+        self.final_review(characters, max_concurrent, &mut report, progress)
+            .await;
         report
+    }
+
+    async fn final_review(
+        &self,
+        characters: &HashMap<String, CharacterInfo>,
+        max_concurrent: usize,
+        report: &mut GlossaryTranslationReport,
+        progress: GlossaryProgressCallback,
+    ) {
+        if report.entries.is_empty() {
+            return;
+        }
+
+        let batches = build_final_review_batches(&report.entries);
+        report.review_batches = batches.len();
+        emit(
+            &progress,
+            GlossaryProgressEvent::StageStarted {
+                stage: "术语总审校".to_string(),
+                detail: format!(
+                    "分 {} 个关联批次复核误识别、边界和跨簇译名一致性...",
+                    batches.len()
+                ),
+            },
+        );
+
+        let semaphore =
+            std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.clamp(1, 3)));
+        let mut handles = Vec::new();
+        for (index, batch) in batches.into_iter().enumerate() {
+            let payload = build_final_review_payload(&batch, characters);
+            let expected_sources = batch
+                .iter()
+                .map(|entry| entry.src.clone())
+                .collect::<Vec<_>>();
+            let sem = semaphore.clone();
+            let client = self.client.clone();
+            let api_url = self.api_url.clone();
+            let api_key = self.api_key.clone();
+            let model = self.model.clone();
+            let task_sources = expected_sources.clone();
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("review semaphore closed");
+                review_batch(&client, &api_url, &api_key, &model, &payload, &task_sources).await
+            });
+            handles.push((index, expected_sources, handle));
+        }
+
+        let mut decisions = HashMap::new();
+        for (index, sources, handle) in handles {
+            match handle.await {
+                Ok(Ok(batch_decisions)) => {
+                    for decision in batch_decisions {
+                        decisions.insert(decision.src.clone(), decision);
+                    }
+                }
+                Ok(Err(error)) => {
+                    report.review_failures += 1;
+                    report.issues.push(GlossaryGenerationIssue {
+                        source: format!("final_review_batch_{}", index + 1),
+                        aliases: sources,
+                        kind: GlossaryIssueKind::Unresolved,
+                        reason: format!("总审校失败，已保留初步结果: {error}"),
+                    });
+                }
+                Err(error) => {
+                    report.review_failures += 1;
+                    report.issues.push(GlossaryGenerationIssue {
+                        source: format!("final_review_batch_{}", index + 1),
+                        aliases: sources,
+                        kind: GlossaryIssueKind::Unresolved,
+                        reason: format!("总审校任务失败，已保留初步结果: {error}"),
+                    });
+                }
+            }
+        }
+
+        let (reviewed, changes) =
+            apply_final_review_decisions(std::mem::take(&mut report.entries), decisions);
+        report.entries = reviewed;
+        report.review_changes.extend(changes);
+        propagate_gender_within_canonical(&mut report.entries);
+
+        emit(
+            &progress,
+            GlossaryProgressEvent::Log {
+                message: format!(
+                    "术语总审校完成：{} 个批次，{} 处调整，{} 个批次回退初步结果",
+                    report.review_batches,
+                    report.review_changes.len(),
+                    report.review_failures
+                ),
+            },
+        );
     }
 }
 
-fn parse_json_from_llm(content: &str) -> Result<LlmResult> {
+#[derive(Debug, Serialize)]
+struct FinalReviewItem {
+    src: String,
+    initial_dst: String,
+    initial_info: String,
+    canonical_hint: String,
+    count: usize,
+    contexts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FinalReviewResponse {
+    decisions: Vec<FinalReviewDecision>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FinalReviewDecision {
+    src: String,
+    keep: bool,
+    dst: Option<String>,
+    gender: Option<String>,
+    full_name: Option<String>,
+    reason: String,
+}
+
+async fn review_batch(
+    client: &Client,
+    api_url: &str,
+    api_key: &str,
+    model: &str,
+    payload: &[FinalReviewItem],
+    expected_sources: &[String],
+) -> Result<Vec<FinalReviewDecision>> {
+    let user_content = serde_json::to_string(payload)?;
+    let mut last_error = None;
+    for attempt in 1..=2 {
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                Message {
+                    role: "system".to_string(),
+                    content: FINAL_REVIEW_SYSTEM_PROMPT.to_string(),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: user_content.clone(),
+                },
+            ],
+            temperature: 0.0,
+            thinking: thinking_for_provider(api_url, model),
+        };
+
+        let outcome = async {
+            let response = client
+                .post(api_url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("LLM API returned {status}: {body}");
+            }
+            let chat: ChatResponse = response.json().await?;
+            let parsed: FinalReviewResponse = parse_json_object(first_response_content(&chat)?)?;
+            validate_review_decisions(parsed.decisions, expected_sources)
+        }
+        .await;
+
+        match outcome {
+            Ok(decisions) => return Ok(decisions),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("术语总审校失败")))
+}
+
+fn validate_review_decisions(
+    decisions: Vec<FinalReviewDecision>,
+    expected_sources: &[String],
+) -> Result<Vec<FinalReviewDecision>> {
+    let expected: HashSet<&str> = expected_sources.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    for decision in &decisions {
+        if !expected.contains(decision.src.as_str()) {
+            anyhow::bail!("总审校返回未知 src: {}", decision.src);
+        }
+        if !seen.insert(decision.src.as_str()) {
+            anyhow::bail!("总审校重复返回 src: {}", decision.src);
+        }
+        if decision.reason.trim().is_empty() {
+            anyhow::bail!("总审校缺少 reason: {}", decision.src);
+        }
+        if decision.keep {
+            let dst = decision
+                .dst
+                .as_deref()
+                .and_then(normalize_text)
+                .ok_or_else(|| anyhow::anyhow!("总审校保留项缺少 dst: {}", decision.src))?;
+            if contains_kana(&dst)
+                || dst.chars().any(char::is_whitespace)
+                || contains_traditional_hint(&dst)
+                || has_repeated_title(&dst)
+            {
+                anyhow::bail!("总审校 dst 非法: {} -> {}", decision.src, dst);
+            }
+        }
+    }
+    if seen.len() != expected.len() {
+        let missing = expected
+            .into_iter()
+            .filter(|source| !seen.contains(source))
+            .collect::<Vec<_>>();
+        anyhow::bail!("总审校遗漏 src: {}", missing.join(" / "));
+    }
+    Ok(decisions)
+}
+
+fn apply_final_review_decisions(
+    entries: Vec<TranslationEntry>,
+    mut decisions: HashMap<String, FinalReviewDecision>,
+) -> (Vec<TranslationEntry>, Vec<GlossaryReviewChange>) {
+    let mut reviewed = Vec::with_capacity(entries.len());
+    let mut changes = Vec::new();
+    for entry in entries {
+        let Some(decision) = decisions.remove(&entry.src) else {
+            reviewed.push(entry);
+            continue;
+        };
+
+        if !decision.keep {
+            changes.push(GlossaryReviewChange {
+                source: entry.src,
+                before_dst: entry.dst,
+                after_dst: None,
+                before_info: entry.info,
+                after_info: None,
+                reason: decision.reason,
+            });
+            continue;
+        }
+
+        let dst = decision
+            .dst
+            .as_deref()
+            .and_then(normalize_text)
+            .expect("validated review decision must have dst");
+        let gender = normalize_gender(decision.gender);
+        let full_name = decision.full_name.and_then(|name| normalize_text(&name));
+        let info = build_info(&full_name, &gender, &canonical_key(&entry.src));
+        if dst != entry.dst || info != entry.info {
+            changes.push(GlossaryReviewChange {
+                source: entry.src.clone(),
+                before_dst: entry.dst.clone(),
+                after_dst: Some(dst.clone()),
+                before_info: entry.info.clone(),
+                after_info: Some(info.clone()),
+                reason: decision.reason,
+            });
+        }
+        reviewed.push(TranslationEntry {
+            src: entry.src,
+            dst,
+            info,
+        });
+    }
+    (reviewed, changes)
+}
+
+fn parse_json_object<T: DeserializeOwned>(content: &str) -> Result<T> {
     let content = strip_leading_thinking_content(content);
 
-    if let Ok(result) = serde_json::from_str::<LlmResult>(content) {
+    if let Ok(result) = serde_json::from_str::<T>(content) {
         return Ok(result);
     }
 
@@ -337,13 +643,17 @@ fn parse_json_from_llm(content: &str) -> Result<LlmResult> {
     if let Some(start) = json_str.find('{') {
         if let Some(end) = json_str.rfind('}') {
             let json_slice = &json_str[start..=end];
-            if let Ok(result) = serde_json::from_str::<LlmResult>(json_slice) {
+            if let Ok(result) = serde_json::from_str::<T>(json_slice) {
                 return Ok(result);
             }
         }
     }
 
     anyhow::bail!("Failed to parse LLM response as JSON: {}", content)
+}
+
+fn parse_json_from_llm(content: &str) -> Result<LlmResult> {
+    parse_json_object(content)
 }
 
 fn normalize_chat_completions_endpoint(raw_url: &str) -> String {
@@ -390,10 +700,31 @@ fn strip_leading_thinking_content(content: &str) -> &str {
     remaining
 }
 
-fn build_name_clusters(characters: &HashMap<String, CharacterInfo>) -> Vec<NameCluster> {
+fn build_name_clusters(
+    characters: &HashMap<String, CharacterInfo>,
+) -> (Vec<NameCluster>, Vec<GlossaryGenerationIssue>) {
     let mut grouped: HashMap<String, Vec<AliasInfo>> = HashMap::new();
+    let mut issues = Vec::new();
 
     for (name, info) in characters {
+        if is_structurally_invalid_candidate(name) {
+            issues.push(GlossaryGenerationIssue {
+                source: name.trim().to_string(),
+                aliases: vec![name.clone()],
+                kind: GlossaryIssueKind::Rejected,
+                reason: "NER候选为空、纯符号或单个假名，已在LLM前过滤".to_string(),
+            });
+            continue;
+        }
+        if let Some(target) = attached_fragment_target(name, info.count, characters) {
+            issues.push(GlossaryGenerationIssue {
+                source: name.clone(),
+                aliases: vec![name.clone()],
+                kind: GlossaryIssueKind::Rejected,
+                reason: format!("NER边界污染：前缀片段附着到已识别称呼 {target}"),
+            });
+            continue;
+        }
         let key = canonical_key(name);
         let key = if key.is_empty() {
             name.trim().to_string()
@@ -431,7 +762,198 @@ fn build_name_clusters(characters: &HashMap<String, CharacterInfo>) -> Vec<NameC
             .then(a.key.cmp(&b.key))
             .then(a.primary.cmp(&b.primary))
     });
-    clusters
+    (clusters, issues)
+}
+
+const ATTACHED_FRAGMENT_PREFIXES: &[&str] = &[
+    "か",
+    "が",
+    "は",
+    "を",
+    "に",
+    "と",
+    "で",
+    "へ",
+    "の",
+    "も",
+    "や",
+    "より",
+    "ただ",
+    "また",
+    "でも",
+    "もし",
+    "まさか",
+    "そして",
+    "むしろ",
+];
+
+fn is_structurally_invalid_candidate(name: &str) -> bool {
+    let normalized = remove_name_whitespace(name);
+    if normalized.is_empty() {
+        return true;
+    }
+    if normalized.chars().count() == 1 && contains_kana(&normalized) {
+        return true;
+    }
+    normalized.chars().all(|ch| {
+        ch.is_ascii_punctuation()
+            || matches!(
+                ch,
+                '。' | '、'
+                    | '！'
+                    | '？'
+                    | '「'
+                    | '」'
+                    | '『'
+                    | '』'
+                    | '（'
+                    | '）'
+                    | '【'
+                    | '】'
+                    | '・'
+                    | '…'
+            )
+    })
+}
+
+fn attached_fragment_target<'a>(
+    name: &str,
+    count: usize,
+    characters: &'a HashMap<String, CharacterInfo>,
+) -> Option<&'a str> {
+    let normalized = remove_name_whitespace(name);
+    ATTACHED_FRAGMENT_PREFIXES.iter().find_map(|prefix| {
+        let target = normalized.strip_prefix(prefix)?;
+        if target.chars().count() < 2 {
+            return None;
+        }
+        characters
+            .get_key_value(target)
+            .filter(|(_, info)| info.count >= count)
+            .map(|(existing, _)| existing.as_str())
+    })
+}
+
+fn build_final_review_payload(
+    entries: &[TranslationEntry],
+    characters: &HashMap<String, CharacterInfo>,
+) -> Vec<FinalReviewItem> {
+    entries
+        .iter()
+        .map(|entry| {
+            let info = characters.get(&entry.src);
+            let mut mentions = info
+                .map(|character| character.content.iter().collect::<Vec<_>>())
+                .unwrap_or_default();
+            mentions.sort_by(|a, b| {
+                mention_score(b)
+                    .cmp(&mention_score(a))
+                    .then(a.line.cmp(&b.line))
+            });
+            let contexts = mentions
+                .into_iter()
+                .take(FINAL_REVIEW_CONTEXT_ITEMS)
+                .map(|mention| {
+                    truncate_context_item(&context_item_text(mention), FINAL_REVIEW_CONTEXT_CHARS)
+                })
+                .collect();
+            FinalReviewItem {
+                src: entry.src.clone(),
+                initial_dst: entry.dst.clone(),
+                initial_info: entry.info.clone(),
+                canonical_hint: canonical_key(&entry.src),
+                count: info.map(|character| character.count).unwrap_or(0),
+                contexts,
+            }
+        })
+        .collect()
+}
+
+fn build_final_review_batches(entries: &[TranslationEntry]) -> Vec<Vec<TranslationEntry>> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+
+    // Connected components keep short/full names and provisional aliases in
+    // the same LLM request. This is what lets the reviewer reconcile, e.g.,
+    // 慧月 / 朱慧月 / 朱 慧月 instead of judging each cluster independently.
+    let mut visited = vec![false; entries.len()];
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    for start in 0..entries.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut queue = vec![start];
+        let mut component = Vec::new();
+        while let Some(index) = queue.pop() {
+            component.push(index);
+            for candidate in 0..entries.len() {
+                if !visited[candidate]
+                    && review_entries_related(&entries[index], &entries[candidate])
+                {
+                    visited[candidate] = true;
+                    queue.push(candidate);
+                }
+            }
+        }
+        component.sort_unstable();
+        components.push(component);
+    }
+    components.sort_by_key(|component| component[0]);
+
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    for component in components {
+        if component.len() > FINAL_REVIEW_BATCH_SIZE {
+            if !current.is_empty() {
+                batches.push(std::mem::take(&mut current));
+            }
+            for chunk in component.chunks(FINAL_REVIEW_BATCH_SIZE) {
+                batches.push(chunk.iter().map(|&index| entries[index].clone()).collect());
+            }
+            continue;
+        }
+        if !current.is_empty() && current.len() + component.len() > FINAL_REVIEW_BATCH_SIZE {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.extend(component.into_iter().map(|index| entries[index].clone()));
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn review_entries_related(a: &TranslationEntry, b: &TranslationEntry) -> bool {
+    let a_tokens = review_relation_tokens(a);
+    let b_tokens = review_relation_tokens(b);
+    a_tokens.iter().any(|left| {
+        b_tokens.iter().any(|right| {
+            left == right
+                || (left.chars().count() >= 2
+                    && right.chars().count() >= 2
+                    && (left.contains(right) || right.contains(left)))
+        })
+    })
+}
+
+fn review_relation_tokens(entry: &TranslationEntry) -> Vec<String> {
+    let mut tokens = vec![
+        comparison_form(&canonical_key(&entry.src)),
+        comparison_form(&entry.dst),
+    ];
+    if let Some((Some(full_name), _)) = parse_info(&entry.info) {
+        tokens.push(comparison_form(&full_name));
+    }
+    tokens.retain(|token| token.chars().count() >= 2);
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn comparison_form(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 fn pick_primary_alias(key: &str, aliases: &[AliasInfo]) -> String {
@@ -899,8 +1421,12 @@ pub fn canonical_key(name: &str) -> String {
     strip_affixes(name)
 }
 
+fn remove_name_whitespace(name: &str) -> String {
+    name.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 pub fn strip_affixes(name: &str) -> String {
-    let mut s = name.replace('\u{3000}', "").trim().to_string();
+    let mut s = remove_name_whitespace(name);
     for p in HONORIFIC_PREFIXES {
         if s.starts_with(p) && s.chars().count() > p.chars().count() + 1 {
             s = s.strip_prefix(p).unwrap_or(&s).to_string();
@@ -1064,6 +1590,7 @@ fn mention_score(m: &Mention) -> i32 {
 }
 
 fn build_alias_dst(cluster_key: &str, base_dst: &str, alias: &str) -> String {
+    let alias = remove_name_whitespace(alias);
     if alias == cluster_key {
         return base_dst.to_string();
     }
@@ -1074,11 +1601,20 @@ fn build_alias_dst(cluster_key: &str, base_dst: &str, alias: &str) -> String {
             return base_dst.to_string();
         }
         if let Some(mapped) = map_suffix(&suffix) {
+            if base_dst.ends_with(mapped) {
+                return base_dst.to_string();
+            }
             return format!("{}{}", base_dst, mapped);
         }
     }
 
     base_dst.to_string()
+}
+
+fn has_repeated_title(value: &str) -> bool {
+    ["老师", "部长", "会长", "委员长", "店长", "课长", "社长"]
+        .iter()
+        .any(|title| value.contains(&format!("{title}{title}")))
 }
 
 fn map_suffix(s: &str) -> Option<&'static str> {
@@ -1171,8 +1707,173 @@ mod tests {
         assert_eq!(build_alias_dst("姫乃", "姬乃", "姫乃様"), "姬乃");
         assert_eq!(build_alias_dst("温水", "温水", "温水君"), "温水君");
         assert_eq!(build_alias_dst("星野", "星野", "星野先生"), "星野老师");
+        assert_eq!(build_alias_dst("森", "森老师", "森先生"), "森老师");
         assert_eq!(build_alias_dst("美波", "美波", "美波監督"), "美波");
         assert_eq!(build_alias_dst("ゆづ", "柚", "ゆづ姉"), "柚");
+    }
+
+    #[test]
+    fn canonical_key_removes_internal_name_whitespace() {
+        assert_eq!(canonical_key("黄 玲琳様"), "黄玲琳");
+        assert_eq!(canonical_key("朱\u{3000}慧月"), "朱慧月");
+    }
+
+    #[test]
+    fn cluster_prepass_rejects_attached_sentence_fragments() {
+        fn character(name: &str, count: usize) -> CharacterInfo {
+            CharacterInfo {
+                name: name.to_string(),
+                count,
+                content: Vec::new(),
+            }
+        }
+
+        let characters = HashMap::from([
+            ("めぐるちゃん".to_string(), character("めぐるちゃん", 30)),
+            ("かめぐるちゃん".to_string(), character("かめぐるちゃん", 2)),
+            (
+                "むしろめぐるちゃん".to_string(),
+                character("むしろめぐるちゃん", 1),
+            ),
+        ]);
+        let (clusters, issues) = build_name_clusters(&characters);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].aliases[0].name, "めぐるちゃん");
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().all(|issue| issue.reason.contains("边界污染")));
+    }
+
+    #[test]
+    fn cluster_prepass_rejects_single_kana_and_blank_candidates() {
+        fn character(name: &str) -> CharacterInfo {
+            CharacterInfo {
+                name: name.to_string(),
+                count: 2,
+                content: Vec::new(),
+            }
+        }
+        let characters = HashMap::from([
+            ("ん".to_string(), character("ん")),
+            ("ゃ".to_string(), character("ゃ")),
+            (" ".to_string(), character(" ")),
+            ("月".to_string(), character("月")),
+        ]);
+        let (clusters, issues) = build_name_clusters(&characters);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].key, "月");
+        assert_eq!(issues.len(), 3);
+    }
+
+    #[test]
+    fn final_review_batches_keep_related_names_together() {
+        let entries = vec![
+            TranslationEntry {
+                src: "慧月".into(),
+                dst: "朱慧月".into(),
+                info: "朱慧月,女性".into(),
+            },
+            TranslationEntry {
+                src: "无关人物".into(),
+                dst: "无关人物".into(),
+                info: String::new(),
+            },
+            TranslationEntry {
+                src: "朱 慧月様".into(),
+                dst: "朱慧月".into(),
+                info: "女性".into(),
+            },
+            TranslationEntry {
+                src: "月".into(),
+                dst: "朱慧月".into(),
+                info: "朱慧月".into(),
+            },
+        ];
+        let batches = build_final_review_batches(&entries);
+        let related_batch = batches
+            .iter()
+            .find(|batch| batch.iter().any(|entry| entry.src == "慧月"))
+            .unwrap();
+        assert!(related_batch.iter().any(|entry| entry.src == "朱 慧月様"));
+        assert!(related_batch.iter().any(|entry| entry.src == "月"));
+    }
+
+    #[test]
+    fn final_review_protocol_rejects_duplicate_titles_and_missing_sources() {
+        let expected = vec!["森先生".to_string()];
+        let duplicate_title = FinalReviewDecision {
+            src: "森先生".into(),
+            keep: true,
+            dst: Some("森老师老师".into()),
+            gender: None,
+            full_name: None,
+            reason: "人物".into(),
+        };
+        assert!(validate_review_decisions(vec![duplicate_title], &expected).is_err());
+        assert!(validate_review_decisions(Vec::new(), &expected).is_err());
+    }
+
+    #[test]
+    fn final_review_applies_rejection_and_cross_cluster_consistency() {
+        let entries = vec![
+            TranslationEntry {
+                src: "慧月".into(),
+                dst: "慧月".into(),
+                info: String::new(),
+            },
+            TranslationEntry {
+                src: "朱 慧月".into(),
+                dst: "朱慧月".into(),
+                info: "女性".into(),
+            },
+            TranslationEntry {
+                src: "黄麒宮".into(),
+                dst: "黄麒宫".into(),
+                info: String::new(),
+            },
+        ];
+        let decisions = HashMap::from([
+            (
+                "慧月".into(),
+                FinalReviewDecision {
+                    src: "慧月".into(),
+                    keep: true,
+                    dst: Some("朱慧月".into()),
+                    gender: Some("女性".into()),
+                    full_name: Some("朱慧月".into()),
+                    reason: "与全名一致".into(),
+                },
+            ),
+            (
+                "朱 慧月".into(),
+                FinalReviewDecision {
+                    src: "朱 慧月".into(),
+                    keep: true,
+                    dst: Some("朱慧月".into()),
+                    gender: Some("女性".into()),
+                    full_name: Some("朱慧月".into()),
+                    reason: "全名".into(),
+                },
+            ),
+            (
+                "黄麒宮".into(),
+                FinalReviewDecision {
+                    src: "黄麒宮".into(),
+                    keep: false,
+                    dst: None,
+                    gender: None,
+                    full_name: None,
+                    reason: "宫殿名".into(),
+                },
+            ),
+        ]);
+        let (reviewed, changes) = apply_final_review_decisions(entries, decisions);
+        assert_eq!(reviewed.len(), 2);
+        assert!(reviewed.iter().all(|entry| entry.dst == "朱慧月"));
+        assert!(reviewed.iter().all(|entry| entry.info.contains("女性")));
+        assert_eq!(changes.len(), 2);
+        assert!(changes
+            .iter()
+            .any(|change| change.source == "黄麒宮" && change.after_dst.is_none()));
     }
 
     #[test]
@@ -1200,6 +1901,7 @@ mod tests {
                     reason: "title".to_string(),
                 },
             ],
+            ..GlossaryTranslationReport::default()
         };
         assert_eq!(report.unresolved_count(), 1);
         assert_eq!(report.rejected_count(), 1);

@@ -698,7 +698,7 @@ pub async fn generate_glossary(
     );
 
     // Generate translations (or raw entries for Orion models)
-    let (translations, generation_issues) = if config.skip_llm_translation {
+    let translation_report = if config.skip_llm_translation {
         emit(
             &progress,
             GlossaryProgressEvent::Log {
@@ -708,8 +708,8 @@ pub async fn generate_glossary(
             },
         );
         // Create raw entries with empty dst/info for Orion models
-        (
-            characters
+        llm::GlossaryTranslationReport {
+            entries: characters
                 .into_keys()
                 .map(|name| llm::TranslationEntry {
                     src: name,
@@ -717,8 +717,8 @@ pub async fn generate_glossary(
                     info: String::new(),
                 })
                 .collect(),
-            Vec::new(),
-        )
+            ..llm::GlossaryTranslationReport::default()
+        }
     } else {
         // LLM translation for generic models
         emit(
@@ -731,11 +731,17 @@ pub async fn generate_glossary(
 
         let llm_client =
             llm::LlmClient::new(&config.llm_url, &config.llm_api_key, &config.llm_model);
-        let report = llm_client
+        llm_client
             .translate_all_detailed(&characters, config.llm_workers, progress.clone())
-            .await;
-        (report.entries, report.issues)
+            .await
     };
+    let llm::GlossaryTranslationReport {
+        entries: translations,
+        issues: generation_issues,
+        review_changes,
+        review_batches,
+        review_failures,
+    } = translation_report;
 
     // Ruby 证据只生成审核清单，不在缺乏分类/确认时自动提升为强制术语。
     // 这避免把 `桃谷<rt>ライバル</rt>` 一类语义 ruby 错绑成人名读音。
@@ -755,11 +761,20 @@ pub async fn generate_glossary(
             .iter()
             .filter(|issue| issue.kind == llm::GlossaryIssueKind::Rejected)
             .count();
+        let review_change_count = review_changes.len();
+        let review_rejected = review_changes
+            .iter()
+            .filter(|change| change.after_dst.is_none())
+            .count();
         let report = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "resolved_entries": translations.len(),
             "unresolved_clusters": unresolved,
             "rejected_clusters": rejected,
+            "final_review_batches": review_batches,
+            "final_review_failures": review_failures,
+            "final_review_rejected": review_rejected,
+            "final_review_changes": review_changes,
             "issues": generation_issues,
         });
         atomic_write(
@@ -770,11 +785,12 @@ pub async fn generate_glossary(
             &progress,
             GlossaryProgressEvent::Log {
                 message: format!(
-                    "术语生成报告: {}（resolved={}，unresolved={}，rejected={}）",
+                    "术语生成报告: {}（resolved={}，unresolved={}，rejected={}，review_changes={}）",
                     report_path.display(),
                     translations.len(),
                     unresolved,
-                    rejected
+                    rejected,
+                    review_change_count
                 ),
             },
         );
