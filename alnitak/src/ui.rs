@@ -1,16 +1,17 @@
 use std::time::Instant;
 
+use bellatrix::NerBackend;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonGroup, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
     input::Input,
     progress::Progress,
     radio::{Radio, RadioGroup},
     spinner::Spinner,
-    v_flex, ActiveTheme, Disableable as _, Icon, IconName, Sizable as _,
+    v_flex, ActiveTheme, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
 };
 
 use crate::app::OrionApp;
@@ -223,6 +224,25 @@ impl OrionApp {
                                         || self.input_path.is_none(),
                                 )
                                 .on_click(cx.listener(Self::generate_glossary)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("推理"),
+                        )
+                        .child(
+                            ButtonGroup::new("ner-backend-switch")
+                                .children(NerBackend::ALL.iter().map(|backend| {
+                                    Button::new(backend.label())
+                                        .label(backend.label())
+                                        .selected(self.ner_backend == *backend)
+                                }))
+                                .compact()
+                                .outline()
+                                .xsmall()
+                                .disabled(is_running || is_glossary_generating)
+                                .on_click(cx.listener(Self::on_ner_backend_changed)),
                         )
                         .child(
                             div()

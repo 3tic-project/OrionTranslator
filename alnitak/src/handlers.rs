@@ -147,6 +147,29 @@ impl OrionApp {
         cx.notify();
     }
 
+    pub fn on_ner_backend_changed(
+        &mut self,
+        selected_indices: &Vec<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selected_ix) = selected_indices.first() else {
+            return;
+        };
+        let next = bellatrix::NerBackend::from_index(*selected_ix);
+        if next == self.ner_backend {
+            return;
+        }
+
+        self.ner_backend = next;
+        self.credential_store.ner_backend = next;
+        if let Err(error) = crate::credentials::save_store(&self.credential_store) {
+            self.add_log(&format!("保存 NER 推理后端失败: {error}"));
+        }
+        self.add_log(&format!("NER 推理后端已切换为 {}", next.label()));
+        cx.notify();
+    }
+
     pub fn pick_input_file(
         &mut self,
         _: &ClickEvent,
@@ -1034,6 +1057,7 @@ impl OrionApp {
         self.add_log("开始生成术语表...");
         self.add_log(&format!("输入文件: {}", input_path.display()));
         self.add_log(&format!("LLM模型: {} @ {}", model_name, llm_url));
+        self.add_log(&format!("NER 推理后端: {}", self.ner_backend.label()));
         cx.notify();
 
         // 4. Run glossary generation. Do not issue a duplicate blocking translation probe here:
@@ -1122,7 +1146,9 @@ impl OrionApp {
             lines: Vec::new(),            // will be populated in background thread
             ruby_annotations: Vec::new(), // will be populated for EPUB
             model_dir,
-            ner_batch_size: 16,
+            // 0 selects the tuned defaults from modernbert-ner (CPU 24 / GPU 128).
+            ner_batch_size: 0,
+            ner_backend: self.ner_backend,
             min_count: 2,
             llm_url: llm_url.clone(),
             llm_api_key: api_key,
@@ -1204,17 +1230,20 @@ impl OrionApp {
             .ok()
             .and_then(|e| e.parent().map(|p| p.to_path_buf()));
 
-        let mut candidates: Vec<String> = vec![
+        let mut candidates: Vec<String> = std::env::var("MODERNBERT_NER_MODEL")
+            .ok()
+            .into_iter()
+            .collect();
+        candidates.extend([
             // Relative to CWD — local project copy (preferred)
             "ner_model".to_string(),
             "../ner_model".to_string(),
             // Workspace-relative paths (alnilam keeps ner_model)
             "alnilam/ner_model".to_string(),
             "../alnilam/ner_model".to_string(),
-            // Legacy paths
-            "rigel/model".to_string(),
-            "../rigel/model".to_string(),
-        ];
+            "models/modernbert_ja_30m_combined_ja".to_string(),
+            "../models/modernbert_ja_30m_combined_ja".to_string(),
+        ]);
 
         // Relative to executable
         if let Some(ref exe) = exe_dir {
@@ -1240,7 +1269,7 @@ impl OrionApp {
             }
         }
 
-        let required_files = ["model.safetensors", "config.json", "vocab.txt"];
+        let required_files = ["model.safetensors", "config.json", "tokenizer.json"];
 
         for candidate in &candidates {
             if candidate.is_empty() {
@@ -1281,7 +1310,7 @@ impl OrionApp {
                 }
             ));
         }
-        msg.push_str("\n  请将 NER 模型文件 (model.safetensors, config.json, vocab.txt, system.dic.zst) 放入 ner_model/ 目录");
+        msg.push_str("\n  请将 ModernBERT NER 模型文件 (model.safetensors, config.json, tokenizer.json) 放入 ner_model/ 目录，或设置 MODERNBERT_NER_MODEL");
         Err(msg)
     }
 }

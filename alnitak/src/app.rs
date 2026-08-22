@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bellatrix::NerBackend;
 use gpui::*;
 use gpui_component::input::InputState;
 
@@ -37,6 +38,7 @@ pub struct OrionApp {
     pub output_bilingual: bool,
     pub output_mono: bool,
     pub model_preset: ModelPreset,
+    pub ner_backend: NerBackend,
     /// 三个预设的 URL / 模型 / API Key 内存镜像，启动时从磁盘加载。
     pub credential_store: CredentialStore,
 
@@ -75,6 +77,7 @@ impl OrionApp {
 
         let credential_store = credentials::load_store();
         let default_preset = credential_store.active_preset();
+        let ner_backend = credential_store.ner_backend;
         let creds = credential_store
             .get(default_preset)
             .clone()
@@ -166,6 +169,7 @@ impl OrionApp {
             output_bilingual: true,
             output_mono: false,
             model_preset: default_preset,
+            ner_backend,
             credential_store,
             status: TranslationStatus::Idle,
             progress: 0.0,

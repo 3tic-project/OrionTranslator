@@ -70,3 +70,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Unicode
 unicode-width = "0.2"
+mimalloc = { version = "0.1.52", default-features = false }

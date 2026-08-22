@@ -6,6 +6,11 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+// The NER CPU engine creates sizeable temporary buffers on several workers.
+// Keep the allocator behavior aligned with the standalone modernbert-ner CLI.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Orion EPUB/TXT 日译中一站式翻译工具
 #[derive(Parser, Debug)]
 #[command(name = "alnilam", about = "EPUB/TXT 日译中一站式翻译工具")]
@@ -181,12 +186,12 @@ enum Commands {
         /// 输入 EPUB/TXT 文件路径
         file: PathBuf,
 
-        /// NER 模型目录（包含 model.safetensors, config.json, vocab.txt 等）
+        /// ModernBERT NER 模型目录（包含 model.safetensors, config.json, tokenizer.json）
         #[arg(long, default_value = "./ner_model")]
         model_dir: String,
 
-        /// NER 批处理大小
-        #[arg(long, default_value_t = 16)]
+        /// NER 批处理大小（0 = 按后端自动优化：CPU 24 / GPU 128）
+        #[arg(long, default_value_t = 0)]
         ner_batch_size: usize,
 
         /// 最小出现次数
@@ -472,6 +477,7 @@ async fn run_subcommand(cmd: Commands) -> Result<()> {
                 ruby_annotations,
                 model_dir,
                 ner_batch_size,
+                ner_backend: bellatrix::NerBackend::Auto,
                 min_count,
                 llm_url,
                 llm_api_key: api_key,

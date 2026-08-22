@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::{anyhow, Context, Result};
+use bellatrix::NerBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::types::ModelPreset;
@@ -66,6 +67,8 @@ pub struct CredentialStore {
     #[serde(default = "default_active_preset")]
     pub active_preset: String,
     #[serde(default)]
+    pub ner_backend: NerBackend,
+    #[serde(default)]
     pub deepseek: PresetCredentials,
     #[serde(default)]
     pub volcengine: PresetCredentials,
@@ -82,6 +85,7 @@ impl Default for CredentialStore {
         Self {
             version: STORE_VERSION,
             active_preset: default_active_preset(),
+            ner_backend: NerBackend::Auto,
             deepseek: PresetCredentials::from_preset_defaults(ModelPreset::DeepSeek),
             volcengine: PresetCredentials::from_preset_defaults(ModelPreset::Volcengine),
             orion: PresetCredentials::from_preset_defaults(ModelPreset::Orion),
@@ -357,6 +361,7 @@ mod tests {
         store.volcengine.llm_url = "https://ark.cn-beijing.volces.com/api/v3".into();
         store.volcengine.api_key = "volc-key".into();
         store.set_active_preset(ModelPreset::Volcengine);
+        store.ner_backend = NerBackend::Gpu;
 
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -373,6 +378,7 @@ mod tests {
         assert_eq!(loaded.deepseek.api_key, "sk-secret-key");
         assert_eq!(loaded.volcengine.api_key, "volc-key");
         assert_eq!(loaded.active_preset(), ModelPreset::Volcengine);
+        assert_eq!(loaded.ner_backend, NerBackend::Gpu);
         let _ = fs::remove_file(path);
     }
 

@@ -25,7 +25,7 @@ cd OrionTranslator
 cargo build --release -p alnitak
 ./target/release/alnitak
 ```
-从 https://huggingface.co/3tic/Orion-NER-110M-v1 下载 NER 模型文件，在主程序同目录下创建 `ner_model` 文件夹并放入模型文件。
+准备 `modernbert_ja_30m_combined_ja` 模型，在主程序同目录下创建 `ner_model` 文件夹并放入模型文件。
 
 最后的结构应如下所示：
 
@@ -34,8 +34,7 @@ cargo build --release -p alnitak
 ├── ner_model/              # NER 模型文件夹
 │   ├── model.safetensors
 │   ├── config.json
-│   ├── vocab.txt
-│   ├── system.dic.zst 
+│   ├── tokenizer.json
 │   └── ……     
 ```
 
@@ -63,7 +62,7 @@ cargo build --release -p alnitak
 **4. 加载术语表（可选）**
 
 若已有 `*_glossary.json`，可在「术语表路径」填入文件路径以提升人名一致性。
-若无术语表，可先点击 **生成术语表** 自动识别并翻译人名，完成后路径会自动填入。（需要GPU支持vulkan/metal）
+若无术语表，可先在术语表识别区域选择 **CPU / GPU / Auto**，再点击 **生成术语表** 自动识别并翻译人名；Auto 会用当前文档的短基准自动选择更快后端，GPU 不可用时回退 CPU。完成后路径会自动填入。
 
 **5. 开始翻译**
 
@@ -242,6 +241,7 @@ OrionTranslator/
 | 模块 | Crate 名 | 类型 | 说明 |
 |------|----------|------|------|
 | [betelgeuse](betelgeuse/) | `betelgeuse` | lib | EPUB/TXT 文本提取 |
+| [modernbert-ner](modernbert-ner/) | `modernbert-ner` | lib+bin | ModernBERT-JA CPU/WGPU NER 推理 |
 | [bellatrix](bellatrix/) | `bellatrix` | lib | 嵌入式 NER 推理 + 术语表生成 |
 | [rigel](rigel/) | `rigel` | bin | HTTP NER 服务（独立部署） |
 | [mintaka](mintaka/) | `mintaka` | bin | CLI NER 工具 |
@@ -253,8 +253,8 @@ OrionTranslator/
 ### 环境要求
 
 - **Rust** stable 1.85+
-- **GPU**：支持 wgpu 的显卡（Metal/Vulkan/DX12）
-- **NER 模型文件**（术语表功能）：`model.safetensors`、`config.json`、`vocab.txt`、`system.dic.zst`
+- **GPU**（可选）：支持 wgpu 的显卡（Metal/Vulkan/DX12）；CPU 后端无需 GPU
+- **NER 模型文件**（术语表功能）：`model.safetensors`、`config.json`、`tokenizer.json`
 - **LLM API**：任何 OpenAI-compatible Chat Completions 接口
 
 ### 构建

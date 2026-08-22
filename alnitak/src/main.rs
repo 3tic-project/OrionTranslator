@@ -14,6 +14,11 @@ use gpui_component_assets::Assets;
 use app::OrionApp;
 use types::Quit;
 
+// The NER CPU engine creates sizeable temporary buffers on several workers.
+// Keep the allocator behavior aligned with the standalone modernbert-ner CLI.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ============================================================================
 // Render Implementation
 // ============================================================================
