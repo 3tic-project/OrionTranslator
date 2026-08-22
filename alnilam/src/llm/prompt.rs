@@ -31,12 +31,26 @@ pub fn build_input_jsonl(texts: &[String]) -> String {
 ///   - glossary:         无上文 + 有术语表
 ///   - context:          有上文 + 无术语表
 ///   - glossary_context: 有上文 + 有术语表
-fn pick_instruction(has_context: bool, has_glossary: bool) -> &'static str {
+fn pick_instruction(has_context: bool, has_glossary: bool) -> String {
+    pick_instruction_kind(has_context, has_glossary, "文本")
+}
+
+/// `kind` defaults to 文本 (SFT 四域统一，不按字幕/歌词换词).
+pub fn pick_instruction_kind(has_context: bool, has_glossary: bool, kind: &str) -> String {
+    let kind = if kind.trim().is_empty() { "文本" } else { kind };
     match (has_context, has_glossary) {
-        (false, false) => "将以下文本翻译为简体中文，使用JSONLINE格式输出翻译结果，只需输出翻译结果，不要额外解释：\n",
-        (false, true)  => "参考术语表中的译法，将以下文本翻译为简体中文，使用JSONLINE格式输出翻译结果，只需输出翻译结果：\n",
-        (true,  false) => "参考上文信息，将以下文本翻译为简体中文，使用JSONLINE格式输出翻译结果，只需输出翻译结果：\n",
-        (true,  true)  => "参考上文和术语表，将以下文本翻译为简体中文，使用JSONLINE格式输出翻译结果，只需输出翻译结果：\n",
+        (false, false) => format!(
+            "将以下{kind}翻译为简体中文，使用JSONLINE格式输出翻译结果，只需输出翻译结果，不要额外解释：\n"
+        ),
+        (false, true) => format!(
+            "参考术语表中的译法，将以下{kind}翻译为简体中文，使用JSONLINE格式输出翻译结果，只需输出翻译结果：\n"
+        ),
+        (true, false) => format!(
+            "参考上文信息，将以下{kind}翻译为简体中文，使用JSONLINE格式输出翻译结果，只需输出翻译结果：\n"
+        ),
+        (true, true) => format!(
+            "参考上文和术语表，将以下{kind}翻译为简体中文，使用JSONLINE格式输出翻译结果，只需输出翻译结果：\n"
+        ),
     }
 }
 
@@ -71,7 +85,7 @@ pub fn build_prompt_with_context(
     }
 
     // Layer 3: 指令
-    content.push_str(pick_instruction(has_context, has_glossary));
+    content.push_str(&pick_instruction(has_context, has_glossary));
 
     // Layer 4: 待翻译 JSONL
     content.push_str(&input_jsonl);
@@ -106,7 +120,7 @@ pub fn build_single_prompt_with_context(
     }
 
     // Layer 3: 指令
-    content.push_str(pick_instruction(has_context, has_glossary));
+    content.push_str(&pick_instruction(has_context, has_glossary));
 
     // Layer 4: 待翻译 JSONL
     content.push_str(&input_jsonl);
