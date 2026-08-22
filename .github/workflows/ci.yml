@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core-tests:
+    name: Core tests (CPU only)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting (NER and desktop crates)
+        # alnilam contains pre-existing rustfmt debt outside this change.
+        run: cargo fmt -p modernbert-ner -p bellatrix -p alnitak -- --check
+      - name: ModernBERT CPU unit tests
+        run: cargo test -p modernbert-ner --no-default-features --lib
+      - name: Bellatrix CPU unit tests
+        run: cargo test -p bellatrix --no-default-features --lib
+      - name: Translation pipeline tests
+        run: cargo test -p alnilam --lib
+
+  desktop-check:
+    name: Desktop compile check (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p alnitak
+
+  model-contract:
+    name: Pinned model contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Hugging Face CLI
+        run: python -m pip install "huggingface_hub>=0.34,<2"
+      - name: Fetch and verify Orion-NER-30M-v1
+        run: ./scripts/fetch_ner_model.sh
+      - name: Load checkpoint and verify packed CPU inference
+        run: cargo test -p modernbert-ner --no-default-features --test e2e_cpu

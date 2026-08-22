@@ -1,0 +1,73 @@
+name: Package desktop releases
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package-macos:
+    name: macOS DMG with default NER model
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Hugging Face CLI
+        run: python -m pip install "huggingface_hub>=0.34,<2"
+      - name: Fetch pinned model
+        run: ./scripts/fetch_ner_model.sh
+      - name: Build DMG
+        run: ./scripts/build_macos.sh
+      - name: Check package exists
+        run: test -n "$(find dist -maxdepth 1 -name '*-macOS.dmg' -print -quit)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OrionTranslator-macOS-Full
+          path: dist/*-macOS.dmg
+          if-no-files-found: error
+          compression-level: 0
+
+  package-windows:
+    name: Windows ZIPs with verified full package
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Hugging Face CLI
+        run: python -m pip install "huggingface_hub>=0.34,<2"
+      - name: Fetch pinned model
+        run: ./scripts/fetch_ner_model.sh
+      - name: Build ZIP packages
+        run: ./scripts/build_windows.sh
+      - name: Verify full archive contains the model contract
+        run: |
+          full_zip="$(find dist -maxdepth 1 -name '*-Windows-x86_64-Full.zip' -print -quit)"
+          test -n "${full_zip}"
+          unzip -l "${full_zip}" | grep -q 'ner_model/model.safetensors'
+          unzip -l "${full_zip}" | grep -q 'ner_model/config.json'
+          unzip -l "${full_zip}" | grep -q 'ner_model/tokenizer.json'
+          unzip -l "${full_zip}" | grep -q 'ner_model/MODEL_PROVENANCE.txt'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OrionTranslator-Windows
+          path: dist/*-Windows-x86_64-*.zip
+          if-no-files-found: error
+          compression-level: 0

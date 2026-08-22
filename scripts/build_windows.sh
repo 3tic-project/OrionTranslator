@@ -39,6 +39,19 @@ NER_MODEL_SRC="${PROJECT_ROOT}/alnilam/ner_model"
 # copy when available; otherwise download it from Hugging Face.
 "${SCRIPT_DIR}/fetch_ner_model.sh" "${NER_MODEL_SRC}"
 
+create_zip() {
+    local source_dir="$1"
+    local output_zip="$2"
+    if command -v zip >/dev/null 2>&1; then
+        (cd "${source_dir}" && zip -r -9 "${output_zip}" .)
+    elif command -v 7z >/dev/null 2>&1; then
+        (cd "${source_dir}" && 7z a -tzip -mx=9 "${output_zip}" .)
+    else
+        echo "❌ 需要 zip 或 7z 创建 Windows 发布包" >&2
+        return 1
+    fi
+}
+
 # ── 检测目标平台 ──────────────────────────────────────────────
 OS="$(uname -s)"
 case "${OS}" in
@@ -106,7 +119,7 @@ echo "📂 拷贝 Orion-NER-30M-v1…"
 cp -R "${NER_MODEL_SRC}" "${FULL_STAGE}/ner_model"
 "${SCRIPT_DIR}/fetch_ner_model.sh" --verify-only "${FULL_STAGE}/ner_model"
 FULL_ZIP="${DIST_DIR}/${BASE_NAME}-Full.zip"
-(cd "${FULL_STAGE}" && zip -r -9 "${FULL_ZIP}" .)
+create_zip "${FULL_STAGE}" "${FULL_ZIP}"
 echo "✅ 完整版: ${FULL_ZIP} ($(du -h "${FULL_ZIP}" | cut -f1))"
 
 # ── 更新版 (仅主程序) ─────────────────────────────────────────
@@ -115,7 +128,7 @@ LITE_STAGE="${BUILD_DIR}/lite"
 mkdir -p "${LITE_STAGE}"
 cp "${BINARY_SRC}" "${LITE_STAGE}/${BINARY_NAME}${EXE_SUFFIX}"
 LITE_ZIP="${DIST_DIR}/${BASE_NAME}-Update.zip"
-(cd "${LITE_STAGE}" && zip -r -9 "${LITE_ZIP}" .)
+create_zip "${LITE_STAGE}" "${LITE_ZIP}"
 echo "✅ 更新版: ${LITE_ZIP} ($(du -h "${LITE_ZIP}" | cut -f1))"
 
 # ── 清理临时文件 ──────────────────────────────────────────────

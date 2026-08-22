@@ -33,6 +33,8 @@ cargo build --release -p alnitak
 
 模型放在 `alnilam/ner_model`，发布包中位于主程序旁或 macOS App 的 Resources 目录。
 
+模型仓库 revision 与四个分发文件的 SHA-256 固定在 `scripts/ner_model.conf`。`scripts/build_macos.sh` 和 `scripts/build_windows.sh` 会先下载/复验模型再打包；GitHub Actions 的 `Package desktop releases` 可手动运行，也会在 `v*` tag 上生成包含默认模型的 DMG 和 Windows Full ZIP。
+
 最后的结构应如下所示：
 
 ```
